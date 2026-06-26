@@ -142,6 +142,7 @@ class AccountTabs(WrappingTabWidget):
         l.setContentsMargins(0, 8, 0, 0)
         self.f_ip = CopyableField()
         self.f_browser = CopyableField()
+        self.f_browser.set_placeholder("Chrome/Firefox/...")
         self.f_os = CopyableField()
         l.addWidget(heading_label("IP адрес:"))
         l.addWidget(self.f_ip)

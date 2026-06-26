@@ -81,6 +81,7 @@ class CopyableField(QWidget):
 
     def set_text(self, text): self.input.setText(text)
     def get_text(self): return self.input.text()
+    def set_placeholder(self, text): self.input.setPlaceholderText(text)
 
     def set_editable(self, editable):
         self.input.setReadOnly(not editable)

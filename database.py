@@ -962,6 +962,43 @@ class Database:
                 )
         self._mark_dirty()
 
+    # ----- Сбор данных для экспорта -----
+
+    def export_subtree(self, node_type=None, node_id=None):
+        """Собирает дерево с полными карточками аккаунтов для экспорта.
+
+        node_type=None — вся база. Иначе возвращается только ветка указанного
+        узла (папка/сервис/аккаунт). У каждого узла type=='account' добавлены
+        ключи 'card' (как load_account) и 'links' (как get_links). Метод только
+        читает БД (не помечает её грязной)."""
+        full = self.get_tree_structure()  # ручной порядок, без корзины
+        if node_type is None:
+            roots = full
+        else:
+            found = self._find_node(full, node_type, node_id)
+            roots = [found] if found else []
+        for root in roots:
+            self._attach_cards(root)
+        return roots
+
+    def _find_node(self, nodes, node_type, node_id):
+        """Рекурсивный поиск узла по (type, id) в структуре дерева."""
+        for n in nodes:
+            if n["type"] == node_type and n["id"] == node_id:
+                return n
+            child = self._find_node(n.get("children", []), node_type, node_id)
+            if child:
+                return child
+        return None
+
+    def _attach_cards(self, node):
+        """Вкладывает полную карточку и связи в узлы-аккаунты (рекурсивно)."""
+        if node["type"] == "account":
+            node["card"] = self.load_account(node["id"])
+            node["links"] = self.get_links(node["id"])
+        for child in node.get("children", []):
+            self._attach_cards(child)
+
 # Тестовая функция
 def test_database():
     db = Database("test_hranilka.db")

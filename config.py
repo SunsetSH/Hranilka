@@ -40,6 +40,7 @@ class Config:
             "warn_on_exit_unsaved": True,
             "encryption_enabled": False,
             "argon2_preset": "balanced",
+            "shortcuts": {},
         }
         self.load()
     

@@ -27,7 +27,7 @@ class AccountData:
         self.one_time_codes = []
         self.gallery = []  # [{"data": bytes, "desc": str}]
         self.ip = ""
-        self.browser = "Chrome/Firefox/..."
+        self.browser = ""
         self.os = platform.system()
         self.extra_info = ""
         self.linked_accounts = []

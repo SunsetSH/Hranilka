@@ -15,12 +15,13 @@ from config import Config
 from database import Database
 from paths import BASE_DIR
 from models import AccountData
-from dialogs import SettingsDialog, RecycleBinDialog
+from dialogs import SettingsDialog, RecycleBinDialog, ExportDialog
 from tabs import AccountTabs
 from titlebar import TitleBar, ResizableContainer
 import theme
 import pd_generator
 import util
+import shortcuts
 
 
 class AccountTree(QTreeWidget):
@@ -306,8 +307,6 @@ class MainWindow(QMainWindow):
         self.title_bar.bin_requested.connect(self.open_bin)
         self.setMenuWidget(self.title_bar)
 
-        QShortcut(QKeySequence("Ctrl+,"), self, activated=self.open_settings)
-
         central_widget = ResizableContainer(self)
         self.setCentralWidget(central_widget)
         layout = QVBoxLayout(central_widget)
@@ -452,6 +451,10 @@ class MainWindow(QMainWindow):
         self.tabs.gen_pass_btn.clicked.connect(self.generate_password)
         self.tabs.gen_pd_btn.clicked.connect(self.generate_personal_data)
 
+        # Горячие клавиши (после создания дерева и поля поиска — они нужны как
+        # цели для контекстных шорткатов Del/Esc)
+        self._setup_shortcuts()
+
     def apply_appearance(self):
         """Только визуальная часть (шрифт, стили). Лёгкая — подходит для живого
         предпросмотра настроек, не трогает геометрию/таймеры/БД."""
@@ -578,18 +581,21 @@ class MainWindow(QMainWindow):
                 menu.addAction("Убрать из избранного" if fav else "В избранное",
                                lambda: self._set_favorite(selected, not fav))
                 menu.addSeparator()
+                menu.addAction("Экспорт…", lambda: self.open_export(node))
                 menu.addAction("Удалить", lambda: self.delete_items(selected))
             elif t == "service":
                 menu.addAction("Переименовать", lambda: self.rename_item(item))
                 self._add_move_to_folder_menu(menu, selected)
                 self._add_delete_menu(menu, selected, with_keep=True)
                 menu.addSeparator()
+                menu.addAction("Экспорт…", lambda: self.open_export(node))
                 menu.addAction("Раскрыть всё", lambda: self.set_expanded(item, True))
                 menu.addAction("Свернуть всё", lambda: self.set_expanded(item, False))
             elif t == "folder":
                 menu.addAction("Переименовать", lambda: self.rename_item(item))
                 self._add_delete_menu(menu, selected, with_keep=True)
                 menu.addSeparator()
+                menu.addAction("Экспорт…", lambda: self.open_export(node))
                 menu.addAction("Раскрыть всё", lambda: self.set_expanded(item, True))
                 menu.addAction("Свернуть всё", lambda: self.set_expanded(item, False))
         else:
@@ -980,6 +986,106 @@ class MainWindow(QMainWindow):
         self.tabs.f_birth.set_date(QDate(bd.year, bd.month, bd.day))
         self.statusBar().showMessage("ПД СГЕНЕРИРОВАНЫ", 2000)
 
+    # ----- Горячие клавиши -----
+
+    # Действия, чьи шорткаты должны срабатывать только когда фокус в дереве —
+    # иначе Del/Backspace перехватывался бы у текстовых полей.
+    _SHORTCUT_TREE_CTX = {"delete_selected"}
+
+    def _setup_shortcuts(self):
+        """Создаёт QShortcut'ы по реестру shortcuts.effective(config).
+        Объекты складываются в self._shortcuts для пере-привязки."""
+        self._shortcuts = {}
+        mapping = shortcuts.effective(self.config)
+        for action_id, seq in mapping.items():
+            if not seq:                      # снятое сочетание — не вешаем
+                continue
+            if action_id in self._SHORTCUT_TREE_CTX:
+                target, ctx = self.tree, Qt.ShortcutContext.WidgetWithChildrenShortcut
+            else:
+                target, ctx = self, Qt.ShortcutContext.WindowShortcut
+            sc = QShortcut(QKeySequence(seq), target)
+            sc.setContext(ctx)
+            sc.activated.connect(lambda aid=action_id: self._run_shortcut(aid))
+            self._shortcuts[action_id] = sc
+
+    def _rebind_shortcuts(self):
+        """Пересоздаёт хоткеи после применения настроек (учитывает добавление и
+        снятие сочетаний)."""
+        for sc in self._shortcuts.values():
+            sc.setEnabled(False)
+            sc.deleteLater()
+        self._setup_shortcuts()
+
+    def _run_shortcut(self, action_id):
+        handlers = {
+            "add_account":     self.add_account,
+            "add_folder":      self.add_folder,
+            "add_service":     self.add_service,
+            "edit_account":    self._sc_edit_account,
+            "save_account":    self._sc_save_account,
+            "cancel_edit":     self._sc_cancel_edit,
+            "gen_password":    self._sc_gen_password,
+            "gen_personal":    self._sc_gen_personal,
+            "delete_selected": self._sc_delete_selected,
+            "focus_search":    self._sc_focus_search,
+            "toggle_expand":   self._sc_toggle_expand,
+            "open_settings":   self.open_settings,
+            "open_bin":        self.open_bin,
+            "export_all":      self.export_all,
+        }
+        fn = handlers.get(action_id)
+        if fn:
+            fn()
+
+    # Обёртки контекстно-зависимых действий: безопасно «ничего не делают»,
+    # если действие сейчас неприменимо.
+    def _sc_edit_account(self):
+        if self._current_account_id and not self.is_editing:
+            self.toggle_edit_mode()
+
+    def _sc_save_account(self):
+        if self.is_editing:
+            self.save_account()
+
+    def _sc_cancel_edit(self):
+        if self.is_editing:
+            self.cancel_edit()
+
+    def _sc_gen_password(self):
+        if self.is_editing:
+            self.generate_password()
+
+    def _sc_gen_personal(self):
+        if self.is_editing:
+            self.generate_personal_data()
+
+    def _sc_delete_selected(self):
+        selected = self.tree.selectedItems()
+        if selected:
+            self.delete_items(selected)
+
+    def _sc_focus_search(self):
+        self.search_box.setFocus()
+        self.search_box.selectAll()
+
+    def _sc_toggle_expand(self):
+        # Раскрыт хотя бы один верхнеуровневый узел → свернуть всё, иначе раскрыть.
+        top = [self.tree.topLevelItem(i) for i in range(self.tree.topLevelItemCount())]
+        if not top:
+            return
+        expand = not any(it.isExpanded() for it in top)
+        for it in top:
+            self.set_expanded(it, expand)
+
+    def export_all(self):
+        """Экспорт всей базы — то же, что кнопка «Экспортировать всё» в настройках."""
+        tree = self.db.export_subtree()
+        if not tree:
+            self.statusBar().showMessage("Нечего экспортировать", 3000)
+            return
+        ExportDialog(self.config, tree, "Вся база", self).exec()
+
     # ----- Связанные аккаунты -----
 
     def on_link_navigate(self, account_id):
@@ -1016,7 +1122,7 @@ class MainWindow(QMainWindow):
         if days is None:
             return
         if days <= 0:
-            self.statusBar().showMessage("Пора сменить пароль для этого аккаунта!", 5000)
+            self.statusBar().showMessage("ПОРА СМЕНИТЬ ПАРОЛЬ ДЛЯ ЭТОГО АККАУНТА!", 5000)
         elif days <= 7:
             self.statusBar().showMessage(f"Смена пароля через {days} дн.", 4000)
 
@@ -1026,11 +1132,25 @@ class MainWindow(QMainWindow):
         dialog.set_db(self.db)
         dialog.appearance_changed.connect(self.apply_appearance)  # лёгкий предпросмотр
         dialog.settings_applied.connect(self.apply_config)        # полное применение
+        dialog.settings_applied.connect(self._rebind_shortcuts)   # пере-привязка хоткеев
+        # Восстановление из бэкапа перечитывает БД сразу, окно настроек остаётся открытым.
+        dialog.restore_requested.connect(self._reload_database)
         dialog.exec()
         if dialog._delete_all_confirmed:
             self._wipe_all_data()
-        if dialog._restore_done:
-            self._reload_database()
+
+    def open_export(self, node):
+        """Экспорт поддерева (папка/сервис/аккаунт) в выбранный формат.
+        Данные берутся из текущей БД (в шифр. режиме — из памяти)."""
+        if node["type"] == "account":
+            title = self.db.get_account_path(node["id"])
+        else:
+            title = node["name"]
+        tree = self.db.export_subtree(node["type"], node["id"])
+        if not tree:
+            self.statusBar().showMessage("Нечего экспортировать", 3000)
+            return
+        ExportDialog(self.config, tree, title, self).exec()
 
     def _update_bin_button(self):
         """Синхронизирует кнопку корзины в заголовке с числом аккаунтов в
@@ -1173,7 +1293,40 @@ class MainWindow(QMainWindow):
         # активность не учитываем (иначе ввод пароля «продлевал» бы сессию).
         if ev.type() in self._ACTIVITY_EVENTS and not self._unlocking:
             self._last_activity = QDateTime.currentDateTime()
+        if ev.type() == QEvent.Type.KeyPress and not self._unlocking:
+            if self._maybe_handle_cyrillic_shortcut(ev):
+                return True
         return super().eventFilter(obj, ev)
+
+    def _maybe_handle_cyrillic_shortcut(self, ev):
+        """Хоткеи с буквами записаны латиницей, но должны срабатывать и на
+        русской раскладке. Обычные QShortcut ловят только латиницу; здесь по
+        физической клавише (nativeVirtualKey, не зависит от раскладки) находим
+        латинскую букву и запускаем нужное действие. Возвращает True, если
+        сочетание перехвачено."""
+        mods = ev.modifiers()
+        # Интересуют только сочетания с Ctrl/Alt/Meta (одиночные буквы — нет).
+        if not (mods & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier)):
+            return False
+        # Не вмешиваемся, когда открыто модальное окно (настройки, захват
+        # клавиши, диалоги) — там свои обработчики.
+        if QApplication.activeModalWidget() is not None:
+            return False
+        key = ev.key()
+        # Латинская раскладка → штатные QShortcut уже сработают, выходим.
+        if Qt.Key_A <= key <= Qt.Key_Z:
+            return False
+        vk = ev.nativeVirtualKey()       # Windows VK для A–Z = 0x41–0x5A
+        if not (0x41 <= vk <= 0x5A):
+            return False
+        mask = mods & (Qt.ControlModifier | Qt.ShiftModifier
+                       | Qt.AltModifier | Qt.MetaModifier)
+        seq = QKeySequence(int(mask.value) | vk).toString()
+        for action_id, s in shortcuts.effective(self.config).items():
+            if s and QKeySequence(s).toString() == seq:
+                self._run_shortcut(action_id)
+                return True
+        return False
 
     def _check_idle(self):
         mins = self.config.get("idle_lock_mins", 0)

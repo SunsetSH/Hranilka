@@ -3,16 +3,17 @@ from PySide6.QtWidgets import (
     QComboBox, QPushButton, QLabel,
     QCheckBox, QSpinBox, QLineEdit, QListWidget, QListWidgetItem,
     QFileDialog, QWidget, QFrame, QDialog, QApplication,
+    QRadioButton, QButtonGroup, QScrollArea,
 )
 from PySide6.QtCore import Signal, Qt, QTimer
-from PySide6.QtGui import QFont, QIntValidator, QFontDatabase
+from PySide6.QtGui import QFont, QIntValidator, QFontDatabase, QKeySequence
 
 # Курируемый набор «программистских» моноширинных шрифтов в духе 2000-х.
 # Cascadia Code — по умолчанию, удалять нельзя. Показываются только те, что
 # реально установлены в системе (плюс текущий выбранный — на всякий случай).
 CODING_FONTS = [
-    "Cascadia Code", "Cascadia Mono", "Consolas", "Courier New",
-    "Lucida Console", "Lucida Sans Typewriter", "Fixedsys", "Terminal",
+    "Cascadia Code", "Consolas", "Courier New",
+    "Lucida Console", "Lucida Sans Typewriter", "Fixedsys",
     "Source Code Pro", "JetBrains Mono", "Fira Code", "DejaVu Sans Mono",
     "Liberation Mono",
 ]
@@ -24,17 +25,22 @@ from flowlayout import WrappingTabWidget
 import backup as bk
 import crypto_store as cs
 import util
+import export
+import shortcuts
 
 
 class SettingsDialog(ThemedDialog):
     settings_applied = Signal()      # финальное «Применить» (полная переинициализация)
     appearance_changed = Signal()    # живой предпросмотр шрифта/темы/цвета (только стили)
+    restore_requested = Signal()     # выполнено восстановление из бэкапа (перечитать БД)
 
     def __init__(self, config, parent=None):
         super().__init__(config, parent)
         self.setWindowTitle("Настройки")
         self.setModal(True)
-        self.setMinimumSize(640, 560)
+        # Ширину держим, чтобы строки шорткатов помещались; высоту не форсируем —
+        # реальный минимум задаёт самая высокая вкладка (а её мы ужали).
+        self.setMinimumSize(720, 400)
         self._db_path = "hranilka.db"
         self._db = None
         self._delete_all_confirmed = False
@@ -195,7 +201,7 @@ class SettingsDialog(ThemedDialog):
         self.idle_mins = QLineEdit(str(self.config.get("idle_lock_mins", 0)))
         self.idle_mins.setValidator(QIntValidator(0, 120, self))
         ilf.addRow("Скрыть данные при простое:", self.idle_mins)
-        ilf.addRow("", QLabel("в минутах, 0 — не блокировать"))
+        ilf.addRow("", QLabel("в минутах, 0 — не скрывать"))
         lay.addWidget(idle_group)
 
         self._build_encryption_groups(lay)
@@ -586,6 +592,13 @@ class SettingsDialog(ThemedDialog):
         lay.addStretch()
         return w
 
+    def _do_export_all(self):
+        if not self._db:
+            return
+        tree = self._db.export_subtree()
+        dlg = ExportDialog(self.config, tree, "Вся база", self)
+        dlg.exec()
+
     # ─── Вкладка: Данные ────────────────────────────────────────────────────
 
     def _page_data(self):
@@ -600,8 +613,7 @@ class SettingsDialog(ThemedDialog):
             "ВНИМАНИЕ: удаление необратимо.\n\n"
             "На SSD-накопителях физическое уничтожение данных не гарантируется\n"
             "из-за особенностей работы контроллера NAND и механизма TRIM.\n\n"
-            "Все аккаунты, папки, сервисы и вложения будут стёрты.\n"
-            "Также будут удалены все бэкапы в выбранной папке бэкапов."
+            "Все аккаунты, папки, сервисы, вложения и бэкапы будут стёрты."
         )
         warn.setWordWrap(True)
         dl.addWidget(warn)
@@ -622,13 +634,22 @@ class SettingsDialog(ThemedDialog):
         self.recycle_bin_check.setChecked(self.config.get("recycle_bin_enabled", False))
         bl.addWidget(self.recycle_bin_check)
         bin_note = QLabel(
-            "Если включено, удалённые аккаунты перемещаются в корзину, откуда их\n"
-            "можно восстановить. Кнопка корзины появляется рядом с «Настройки».\n"
+            "Если включено, удалённые аккаунты перемещаются в корзину, откуда их можно восстановить. Кнопка корзины появляется рядом с «Настройки».\n"
             "Если выключено, аккаунты удаляются сразу и безвозвратно."
         )
         bin_note.setWordWrap(True)
         bl.addWidget(bin_note)
         lay.addWidget(bin_group)
+
+        exp_group = QGroupBox("Экспорт")
+        el = QVBoxLayout(exp_group)
+        el.addWidget(QLabel(
+            "Выгрузка всей базы в читаемый формат (TXT/CSV/XLSX/HTML/PDF).\n"
+            "Экспорт отдельной папки/сервиса/аккаунта — через ПКМ в дереве."))
+        export_btn = QPushButton("Экспортировать всё…")
+        export_btn.clicked.connect(self._do_export_all)
+        el.addWidget(export_btn)
+        lay.addWidget(exp_group)
 
         lay.addStretch()
         return w
@@ -661,8 +682,128 @@ class SettingsDialog(ThemedDialog):
         cf.addRow(self.clip_clear_exit_check)
         lay.addWidget(clip_group)
 
-        lay.addStretch()
+        # Шорткаты — отдельной секцией внизу вкладки «Поведение»
+        lay.addWidget(self._build_shortcuts_group(), 1)
         return w
+
+    # ─── Секция: Шорткаты (внутри вкладки «Поведение») ───────────────────────
+
+    def _build_shortcuts_group(self):
+        # Рабочая копия сочетаний — правки копятся здесь, в конфиг попадают
+        # только при «Применить и закрыть».
+        self._sc_working = dict(shortcuts.effective(self.config))
+        self._sc_badges = {}        # action_id → QPushButton-бейдж
+
+        group = QGroupBox("Шорткаты (горячие клавиши)")
+        outer_lay = QVBoxLayout(group)
+        outer_lay.setSpacing(8)
+
+        scroll = QScrollArea()
+        self._sc_scroll = scroll
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        # Горизонтальную прокрутку убираем — содержимое подгоняется по ширине.
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        # Компактная высота, чтобы вкладка «Поведение» (а значит и всё окно
+        # настроек) не вырастала — список листается внутри прокрутки. На
+        # растянутом окне блок занимает доступное место по высоте.
+        scroll.setMinimumHeight(72)
+        scroll.setMaximumHeight(200)
+
+        inner = QWidget()
+        self._sc_inner = inner
+        lay = QVBoxLayout(inner)
+        lay.setSpacing(10)
+        lay.setContentsMargins(0, 0, 0, 0)
+
+        # Группировка по категориям в порядке shortcuts.CATEGORIES
+        by_cat = {}
+        for sid, label, _seq, cat in shortcuts.SHORTCUT_DEFS:
+            by_cat.setdefault(cat, []).append((sid, label))
+
+        for cat in shortcuts.CATEGORIES:
+            if cat not in by_cat:
+                continue
+            cat_group = QGroupBox(cat)
+            gl = QVBoxLayout(cat_group)
+            for sid, label in by_cat[cat]:
+                gl.addLayout(self._sc_row(sid, label))
+            lay.addWidget(cat_group)
+
+        lay.addStretch()
+        scroll.setWidget(inner)
+        outer_lay.addWidget(scroll, 1)
+
+        # Кнопка общего сброса + предупреждение темой
+        reset_all = QPushButton("Сбросить все к умолчанию")
+        reset_all.clicked.connect(self._sc_reset_all)
+        outer_lay.addWidget(reset_all)
+
+        warn = QLabel(
+            "Изменения вступают в силу после «Применить и закрыть». "
+            "Сочетания Esc и Del работают в контексте дерева/режима редактирования.")
+        warn.setWordWrap(True)
+        self._sc_warn = warn
+        outer_lay.addWidget(warn)
+
+        self._restyle_shortcuts()       # инлайн-стили (фон/цвет) из текущей темы
+        return group
+
+    def _restyle_shortcuts(self):
+        """Применяет к блоку шорткатов инлайн-стили, зависящие от темы (фон
+        области прокрутки и цвет предупреждения). Вызывается при живом
+        предпросмотре, чтобы блок менялся сразу, как остальные окна."""
+        if not hasattr(self, "_sc_scroll"):
+            return
+        main_bg = self.config.get("main_bg_color", "#F0F0F0")
+        text_color = self.config.get("text_color", "#000000")
+        self._sc_scroll.setStyleSheet(
+            f"QScrollArea {{ background: {main_bg}; border: none; }}")
+        self._sc_scroll.viewport().setStyleSheet(f"background: {main_bg};")
+        self._sc_inner.setStyleSheet("background: transparent;")
+        self._sc_warn.setStyleSheet(f"color: {text_color}; font-weight: bold;")
+
+    def _sc_row(self, sid, label):
+        row = QHBoxLayout()
+        row.addWidget(QLabel(label), 1)
+
+        badge = QPushButton()
+        badge.setEnabled(False)              # бейдж только показывает сочетание
+        badge.setFixedWidth(150)             # одинаковая ширина для всех строк
+        self._sc_badges[sid] = badge
+        self._sc_update_badge(sid)
+        row.addWidget(badge)
+
+        change_btn = QPushButton("Изменить")
+        change_btn.clicked.connect(lambda _=False, s=sid: self._sc_change(s))
+        row.addWidget(change_btn)
+
+        reset_btn = QPushButton("Сброс")
+        reset_btn.clicked.connect(lambda _=False, s=sid: self._sc_reset_one(s))
+        row.addWidget(reset_btn)
+        return row
+
+    def _sc_update_badge(self, sid):
+        seq = self._sc_working.get(sid, "")
+        self._sc_badges[sid].setText(seq if seq else "—")
+
+    def _sc_change(self, sid):
+        dlg = KeyCaptureDialog(self.config, self._sc_working, sid, self)
+        if dlg.exec() == QDialog.Accepted:
+            self._sc_working[sid] = dlg.result_sequence
+            self._sc_update_badge(sid)
+
+    def _sc_reset_one(self, sid):
+        self._sc_working[sid] = shortcuts.DEFAULTS.get(sid, "")
+        self._sc_update_badge(sid)
+
+    def _sc_reset_all(self):
+        if not themed_confirm(self.config, self, "Сброс шорткатов",
+                              "Вернуть все сочетания к значениям по умолчанию?"):
+            return
+        self._sc_working = dict(shortcuts.DEFAULTS)
+        for sid in self._sc_badges:
+            self._sc_update_badge(sid)
 
     # ─── Вспомогательные ────────────────────────────────────────────────────
 
@@ -706,6 +847,7 @@ class SettingsDialog(ThemedDialog):
             "text_color": self.config.get("text_color"),
             "tree_bg_color": self.config.get("tree_bg_color"),
             "main_bg_color": self.config.get("main_bg_color"),
+            "shortcuts": dict(getattr(self, "_sc_working", {})),
         }
 
     def _has_unsaved_changes(self):
@@ -754,6 +896,7 @@ class SettingsDialog(ThemedDialog):
         self.config.set("font", self._orig_font)
         self.config.set("font_size", self._orig_font_size)
         self.setStyleSheet(dialog_stylesheet(self.config))
+        self._restyle_shortcuts()
         self.appearance_changed.emit()
         super().reject()
 
@@ -765,6 +908,7 @@ class SettingsDialog(ThemedDialog):
             self.config.set("main_bg_color", t["main_bg"])
             self.setStyleSheet(dialog_stylesheet(self.config))
             self._refresh_color_btns()
+            self._restyle_shortcuts()
             self.appearance_changed.emit()  # живой предпросмотр в главном окне
 
     def _apply_font_preview(self, *_):
@@ -774,6 +918,7 @@ class SettingsDialog(ThemedDialog):
         self.config.set("font_size", int(self.font_size_combo.currentText() or "13"))
         self._apply_group_fonts()
         self.setStyleSheet(dialog_stylesheet(self.config))
+        self._restyle_shortcuts()
         self.appearance_changed.emit()
 
     def _choose_color(self, key: str):
@@ -782,6 +927,7 @@ class SettingsDialog(ThemedDialog):
         if color.isValid():
             self.config.set(key, color.name())
             self._refresh_color_btns()
+            self._restyle_shortcuts()
 
     def _browse_backup_folder(self):
         folder = QFileDialog.getExistingDirectory(
@@ -830,7 +976,10 @@ class SettingsDialog(ThemedDialog):
         try:
             bk.restore_backup(path, self._db_path)
             self._restore_done = True
-            self.accept()
+            # Перечитать БД в главном окне сразу, не закрывая «Настройки».
+            self.restore_requested.emit()
+            themed_info(self.config, self, "Восстановление",
+                        "База данных восстановлена из бэкапа.")
         except Exception as e:
             themed_info(self.config, self, "Ошибка", f"Не удалось восстановить:\n{e}")
 
@@ -862,8 +1011,78 @@ class SettingsDialog(ThemedDialog):
         self.config.set("clipboard_clear_secs",    int(self.clip_clear_secs.text() or "0"))
         self.config.set("clipboard_clear_on_exit", self.clip_clear_exit_check.isChecked())
         self.config.set("recycle_bin_enabled",     self.recycle_bin_check.isChecked())
+        # Шорткаты: в конфиг кладём только отличия от дефолтов (компактно и
+        # forward-compatible — новые действия унаследуют дефолт).
+        self.config.set("shortcuts", {
+            sid: seq for sid, seq in self._sc_working.items()
+            if seq != shortcuts.DEFAULTS.get(sid)
+        })
         self.config.save()
         self.settings_applied.emit()
+        self.accept()
+
+
+class KeyCaptureDialog(ThemedDialog):
+    """Модальное окно захвата сочетания клавиш. Ловит реальное нажатие через
+    keyPressEvent: Esc — отмена, Backspace — снять сочетание. При конфликте с
+    другим действием назначение блокируется и показывается предупреждение."""
+
+    _MOD_MASK = (Qt.ControlModifier | Qt.ShiftModifier
+                 | Qt.AltModifier | Qt.MetaModifier)
+    _MODIFIER_KEYS = {Qt.Key_Control, Qt.Key_Shift, Qt.Key_Alt, Qt.Key_Meta,
+                      Qt.Key_AltGr, Qt.Key_CapsLock, Qt.Key_NumLock,
+                      Qt.Key_ScrollLock}
+
+    def __init__(self, config, working, sid, parent=None):
+        super().__init__(config, parent)
+        self._working = working
+        self._sid = sid
+        self.result_sequence = working.get(sid, "")
+        self.setWindowTitle("Назначение клавиши")
+        self.setModal(True)
+        self.setMinimumWidth(420)
+
+        lay = self.body
+        lay.addWidget(QLabel(f"Действие: {shortcuts.LABELS.get(sid, sid)}"))
+        self._prompt = QLabel("Нажмите сочетание клавиш…\n"
+                              "Esc — отмена, Backspace — снять сочетание.")
+        self._prompt.setWordWrap(True)
+        lay.addWidget(self._prompt)
+
+    @staticmethod
+    def _norm(seq):
+        return QKeySequence(seq).toString() if seq else ""
+
+    def keyPressEvent(self, e):
+        key = e.key()
+        mods = e.modifiers() & self._MOD_MASK
+        if key == Qt.Key_Escape and mods == Qt.NoModifier:
+            self.reject()
+            return
+        if key == Qt.Key_Backspace and mods == Qt.NoModifier:
+            self.result_sequence = ""
+            self.accept()
+            return
+        if key in self._MODIFIER_KEYS:
+            return                       # одиночный модификатор — ждём дальше
+        # Буквы/цифры записываем латиницей по физической клавише
+        # (nativeVirtualKey не зависит от раскладки: VK A–Z = 0x41–0x5A,
+        # 0–9 = 0x30–0x39). Для остальных клавиш (F1, Del…) берём e.key().
+        vk = e.nativeVirtualKey()
+        key_code = vk if (0x41 <= vk <= 0x5A or 0x30 <= vk <= 0x39) else key
+        candidate = QKeySequence(int(mods.value) | int(key_code)).toString()
+        if not candidate:
+            return
+        # Конфликт: блокируем и подсвечиваем
+        for other_sid, other_seq in self._working.items():
+            if other_sid != self._sid and self._norm(other_seq) == candidate:
+                self._prompt.setText(
+                    f"Сочетание «{candidate}» уже назначено действию "
+                    f"«{shortcuts.LABELS.get(other_sid, other_sid)}». "
+                    f"Выберите другое.")
+                self._prompt.setStyleSheet("color: #C0392B; font-weight: bold;")
+                return
+        self.result_sequence = candidate
         self.accept()
 
 
@@ -1150,3 +1369,133 @@ class UnlockDialog(ThemedDialog):
             self._field.setFocus()
         except cs.CorruptVault as e:
             self._err.setText(f"Файл базы повреждён: {e}")
+
+
+def theme_dict(config):
+    """Словарь цветов/шрифта из настроек — для оформления HTML/PDF-экспорта."""
+    return {
+        "font": config.get("font", "Consolas"),
+        "font_size": config.get("font_size", 14),
+        "text_color": config.get("text_color", "#000000"),
+        "main_bg_color": config.get("main_bg_color", "#F0F0F0"),
+        "tree_bg_color": config.get("tree_bg_color", "#FFFFFF"),
+    }
+
+
+class ExportDialog(ThemedDialog):
+    """Окно экспорта поддерева/всей базы в TXT/CSV/HTML/PDF.
+
+    tree — структура из Database.export_subtree(); title — что экспортируется
+    (путь узла или «Вся база»)."""
+
+    def __init__(self, config, tree, title="Вся база", parent=None):
+        super().__init__(config, parent)
+        self.setWindowTitle("Экспорт")
+        self.setModal(True)
+        self.setMinimumWidth(460)
+        self._tree = tree
+        self._title = title
+
+        lay = self.body
+        what = QLabel(f"Что: {title}")
+        what.setWordWrap(True)
+        lay.addWidget(what)
+
+        fmt_group = QGroupBox("Формат")
+        fl = QVBoxLayout(fmt_group)
+        self._fmt_btns = QButtonGroup(self)
+        formats = [
+            ("html", "HTML — оформленный документ с картинками"),
+            ("pdf", "PDF — для печати в формате А4"),
+            ("xlsx", "XLSX — таблица Excel"),
+            ("csv", "CSV — таблица (текстовая, для переноса)"),
+            ("txt", "TXT — простой текст (блокнот)"),
+        ]
+        for i, (key, label) in enumerate(formats):
+            rb = QRadioButton(label)
+            rb.setProperty("fmt", key)
+            if i == 0:
+                rb.setChecked(True)
+            self._fmt_btns.addButton(rb)
+            fl.addWidget(rb)
+        lay.addWidget(fmt_group)
+
+        opt_group = QGroupBox("Что включить")
+        ol = QVBoxLayout(opt_group)
+        self._chk_basic = QCheckBox("Включить базовые данные, логин и пароль")
+        self._chk_other = QCheckBox("Включить остальные поля")
+        self._chk_gallery = QCheckBox("Включить галерею (изображения и их описания)")
+        for c in (self._chk_basic, self._chk_other, self._chk_gallery):
+            c.setChecked(True)
+            ol.addWidget(c)
+        lay.addWidget(opt_group)
+
+        warn = QLabel(
+            "⚠ Экспорт сохраняет выбранные данные в ОТКРЫТОМ виде в обычный "
+            "файл на диске. Храните файл в надёжном месте.")
+        warn.setWordWrap(True)
+        # Цвет — из темы (как у остального текста), но жирным для акцента.
+        warn.setStyleSheet(f"color: {self.config.get('text_color', '#000000')}; "
+                           "font-weight: bold;")
+        lay.addWidget(warn)
+
+        # Подключаем после создания галочек: обработчик обращается к ним.
+        self._fmt_btns.buttonToggled.connect(self._on_format_changed)
+        self._on_format_changed()  # начальное состояние (галерея для TXT/CSV)
+
+        row = QHBoxLayout()
+        row.addStretch()
+        self._ok = QPushButton("Экспортировать…")
+        self._ok.setDefault(True)
+        self._ok.clicked.connect(self._do_export)
+        cancel = QPushButton("Отмена")
+        cancel.clicked.connect(self.reject)
+        row.addWidget(self._ok)
+        row.addWidget(cancel)
+        lay.addLayout(row)
+
+    def _current_format(self):
+        return self._fmt_btns.checkedButton().property("fmt")
+
+    def _on_format_changed(self, *_):
+        # Картинки помещаются только в HTML/PDF. Для TXT/CSV галочка галереи
+        # становится неактивной (приглушённой) с пояснением.
+        supports_img = self._current_format() in ("html", "pdf")
+        self._chk_gallery.setEnabled(supports_img)
+        if supports_img:
+            self._chk_gallery.setText("Включить галерею (изображения и их описания)")
+        else:
+            selected = self._current_format().upper()
+            self._chk_gallery.setText(
+                f"Включить галерею — недоступно для {selected}")
+
+    def _do_export(self):
+        fmt = self._current_format()
+        func, ext, flt = export.FORMATS[fmt]
+        if not (self._chk_basic.isChecked() or self._chk_other.isChecked()
+                or (self._chk_gallery.isEnabled() and self._chk_gallery.isChecked())):
+            themed_info(self.config, self, "Экспорт",
+                        "Выберите хотя бы один пункт в разделе «Что включить».")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Сохранить экспорт", "hranilka_export" + ext, flt)
+        if not path:
+            return
+        if not path.lower().endswith(ext):
+            path += ext
+        opts = export.Options(
+            include_basic=self._chk_basic.isChecked(),
+            include_other=self._chk_other.isChecked(),
+            include_gallery=self._chk_gallery.isEnabled() and self._chk_gallery.isChecked(),
+            title=self._title,
+            theme=theme_dict(self.config),
+        )
+        try:
+            func(self._tree, opts, path)
+        except Exception as e:
+            themed_info(self.config, self, "Ошибка экспорта",
+                        f"Не удалось выполнить экспорт:\n{e}")
+            return
+        themed_info(self.config, self, "Готово",
+                    f"Экспортировано в файл:\n{path}")
+        self.accept()

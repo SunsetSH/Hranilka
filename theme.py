@@ -42,16 +42,33 @@ def widget_styles(config):
             padding: 5px 15px; font-family: '{font_name}'; font-size: {font_size}px; font-weight: bold; }}
         QPushButton:hover {{ border: 2px inset #808080; background-color: {main_bg}; }}
         QPushButton[tabButton="true"]:checked {{ background-color: {main_bg}; border: 2px inset #808080; }}
-        QCheckBox {{ color: {text_color}; font-family: '{font_name}'; font-size: {font_size}px;
+        QCheckBox, QRadioButton {{ color: {text_color}; font-family: '{font_name}'; font-size: {font_size}px;
             spacing: 8px; background: transparent; }}
-        QCheckBox::indicator {{ width: 14px; height: 14px; border: 2px inset #808080;
-            background-color: {tree_bg}; }}
-        QCheckBox::indicator:checked {{ background-color: {text_color}; }}
-        QCheckBox::indicator:unchecked:hover {{ border: 2px inset #A0A0A0; }}
+        QCheckBox::indicator, QRadioButton::indicator {{ width: 14px; height: 14px;
+            border: 2px inset #808080; background-color: {tree_bg}; }}
+        QCheckBox::indicator:checked, QRadioButton::indicator:checked {{ background-color: {text_color}; }}
+        QCheckBox::indicator:unchecked:hover, QRadioButton::indicator:unchecked:hover {{ border: 2px inset #A0A0A0; }}
+        QCheckBox:disabled, QRadioButton:disabled {{ color: #808080; }}
+        QCheckBox::indicator:disabled, QRadioButton::indicator:disabled {{
+            border: 2px inset #585858; background-color: #3A3A3A; }}
         QMenu {{ background-color: {tree_bg}; color: {text_color}; border: 2px outset #808080; }}
         QMenu::item:selected {{ background-color: {main_bg}; }}
         QMenuBar {{ background-color: {tree_bg}; color: {text_color}; border: 1px solid #808080; }}
-        QStatusBar {{ background-color: {tree_bg}; color: {text_color}; border: 1px solid #808080; }}
+        QStatusBar {{ background-color: {tree_bg}; color: {text_color}; border: 1px solid #808080;
+            font-family: '{font_name}'; font-size: {font_size}px; }}
+        QStatusBar QLabel {{ font-family: '{font_name}'; font-size: {font_size}px; }}
+        QScrollBar:vertical {{ background-color: {main_bg}; width: 16px; margin: 0;
+            border: 1px solid #808080; }}
+        QScrollBar:horizontal {{ background-color: {main_bg}; height: 16px; margin: 0;
+            border: 1px solid #808080; }}
+        QScrollBar::handle:vertical {{ background-color: {tree_bg}; border: 2px outset #808080;
+            min-height: 24px; }}
+        QScrollBar::handle:horizontal {{ background-color: {tree_bg}; border: 2px outset #808080;
+            min-width: 24px; }}
+        QScrollBar::handle:hover {{ border: 2px inset #808080; }}
+        QScrollBar::add-line, QScrollBar::sub-line {{ width: 0; height: 0; border: none;
+            background: none; }}
+        QScrollBar::add-page, QScrollBar::sub-page {{ background-color: {main_bg}; }}
     """
 
 
