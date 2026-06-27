@@ -1,4 +1,5 @@
 import sys
+import atexit
 import logging
 import ctypes
 import ctypes.wintypes
@@ -7,12 +8,14 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QSplitter,
                                QVBoxLayout, QWidget, QHBoxLayout,
                                QPushButton, QMenu, QLineEdit,
                                QComboBox, QAbstractItemView)
-from PySide6.QtCore import Qt, Signal, QDate, QEvent, QTimer, QDateTime, QByteArray
+from PySide6.QtCore import (Qt, Signal, Slot, QObject, QThread, QEventLoop,
+                            QDate, QEvent, QTimer, QDateTime, QByteArray)
 from PySide6.QtGui import QFont, QShortcut, QKeySequence, QColor, QBrush
 import backup as bk
 
 from config import Config
-from database import Database
+from database import Database, FutureSchemaError, VaultConflictError
+import instance_lock
 from paths import BASE_DIR
 from models import AccountData
 from dialogs import SettingsDialog, RecycleBinDialog, ExportDialog
@@ -71,6 +74,38 @@ class AccountTree(QTreeWidget):
         self.order_changed.emit(src_parent)
 
 
+class _VaultWriter(QObject):
+    """Фоновая запись зашифрованного контейнера на диск.
+
+    Живёт в отдельном потоке. Получает ГОТОВЫЙ снимок БД (db_bytes), сделанный
+    в GUI-потоке (там, где живёт соединение SQLite), и выполняет самое тяжёлое —
+    шифрование AES-GCM и атомарную запись на диск — не блокируя интерфейс.
+    Не обращается к соединению SQLite, поэтому потокобезопасен относительно него."""
+
+    done = Signal(bool, str, bool)   # ok, текст_ошибки, признак_конфликта
+    _job = Signal(object, bool)      # внутренний: (db_bytes, force) → в свой поток
+
+    def __init__(self, db):
+        super().__init__()
+        self._db = db
+        # Очередь из одного задания: сигнал доставляется в поток воркера.
+        self._job.connect(self._do, Qt.ConnectionType.QueuedConnection)
+
+    def submit(self, db_bytes, force=False):
+        self._job.emit(db_bytes, force)
+
+    @Slot(object, bool)
+    def _do(self, db_bytes, force):
+        ok, err, conflict = True, "", False
+        try:
+            self._db.seal_and_write(db_bytes, force=force)
+        except VaultConflictError:
+            ok, conflict, err = False, True, "conflict"
+        except Exception as e:                       # noqa: BLE001 — отдаём наверх
+            ok, err = False, str(e)
+        self.done.emit(ok, err, conflict)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -81,14 +116,46 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(760, 480)
 
         self.db = Database(str(BASE_DIR / "hranilka.db"))
+
+        # Межпроцессная блокировка: не даём второму экземпляру открыть тот же
+        # файл-БД (иначе при сохранении они затёрли бы правки друг друга).
+        self._instance_lock = instance_lock.InstanceLock(self.db.db_path)
+        try:
+            self._instance_lock.acquire()
+        except instance_lock.VaultLockedError:
+            theme.themed_info(
+                self.config, None, "Хранилка уже запущена",
+                "Файл базы уже открыт другим экземпляром «Хранилки».\n"
+                "Закройте его перед повторным запуском.",
+            )
+            sys.exit(0)
+        # Снятие блокировки при любом завершении процесса (страховка на случай
+        # путей выхода помимо closeEvent — например, sys.exit ниже).
+        atexit.register(self._instance_lock.release)
+
         # Отложенная запись на диск (шифр. режим): БД помечает себя «грязной»,
         # а мы сбрасываем её один раз за оборот событийного цикла.
         self._db_flush_scheduled = False
         self.db._on_dirty = self._schedule_db_flush
+
+        # Фоновая запись зашифрованного контейнера (тяжёлые AES-GCM+fsync не
+        # должны морозить UI). serialize() остаётся в GUI-потоке, шифрование и
+        # запись — в воркере. Без debounce: планируем singleShot(0), но пока
+        # идёт запись, новые правки копятся и пишутся одним свежим снимком после.
+        self._write_busy = False        # воркер сейчас пишет
+        self._write_pending = False     # во время записи появились новые правки
+        self._writer_idle_loop = None   # локальный event-loop ожидания (close/lock)
+        self._writer = _VaultWriter(self.db)
+        self._writer_thread = QThread(self)
+        self._writer.moveToThread(self._writer_thread)
+        self._writer.done.connect(self._on_vault_written)
+        self._writer_thread.start()
+
         if not self._open_database():
             # Пользователь выбрал «Выход» в окне разблокировки.
+            self._shutdown_writer()
             sys.exit(0)
-        self.db.create_tables()
+        self._create_tables_or_exit()
 
         self.current_account_data = None
         self.current_tree_item = None
@@ -167,6 +234,10 @@ class MainWindow(QMainWindow):
                 event.ignore()
                 return
 
+        # Дождаться завершения фоновой записи, чтобы дальнейшее синхронное
+        # сохранение/бэкап не конкурировали с воркером за один файл.
+        self._wait_writer_idle()
+
         # Авто-бэкап при закрытии (если включён и были изменения)
         if self.config.get("backup_auto_on_close") and self.config.get("backup_folder"):
             had_changes = bool(unsaved) or self._any_db_changes
@@ -196,7 +267,46 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 logging.warning("Не удалось очистить буфер при выходе: %s", e)
 
-        self.db.close()
+        try:
+            self.db.close()
+        except VaultConflictError:
+            # Файл изменён извне — спрашиваем, перезаписать ли своими данными.
+            if theme.themed_confirm(
+                self.config, self, "Файл изменён извне",
+                "Файл базы был изменён другой программой с момента открытия.\n"
+                "Перезаписать его своими данными?",
+            ):
+                try:
+                    self.db.close(force=True)
+                except Exception as e:
+                    logging.warning("Не удалось сохранить БД при закрытии: %s", e)
+                    if not theme.themed_confirm(
+                        self.config, self, "Ошибка сохранения",
+                        f"Не удалось сохранить базу на диск:\n{e}\n\n"
+                        "Выйти, потеряв последние изменения?",
+                    ):
+                        event.ignore()
+                        return
+            elif not theme.themed_confirm(
+                self.config, self, "Выход",
+                "Выйти, не сохранив последние изменения?",
+            ):
+                event.ignore()
+                return
+        except Exception as e:
+            # Сохранение при закрытии не удалось. Не выходим молча с потерей
+            # данных — спрашиваем пользователя.
+            logging.warning("Не удалось сохранить БД при закрытии: %s", e)
+            if not theme.themed_confirm(
+                self.config, self, "Ошибка сохранения",
+                f"Не удалось сохранить базу на диск:\n{e}\n\n"
+                "Выйти, потеряв последние изменения?",
+            ):
+                event.ignore()
+                return
+        # Корректно остановить поток фоновой записи.
+        self._shutdown_writer()
+        self._instance_lock.release()
         super().closeEvent(event)
 
     def toggle_maximize(self):
@@ -472,7 +582,48 @@ class MainWindow(QMainWindow):
             QTreeWidget::item {{ padding: 4px; border: 1px solid transparent; }}
             QTreeWidget::item:hover {{ background-color: {main_bg}; }}
             QTreeWidget::item:selected {{ background-color: {text_color}; color: {tree_bg}; }}
-        """)
+        """ + self._branch_arrow_css(text_color, tree_bg))
+
+    def _branch_arrow_css(self, text_color, tree_bg):
+        """Стрелки сворачивания/разворачивания, перекрашенные под тему.
+
+        Стандартные стрелки рисуются стилем ОС фиксированным цветом и теряются
+        на выделении (фон строки = text_color). Генерируем свои треугольники:
+        в обычном состоянии — цветом текста, на выделении — цветом фона дерева
+        (как инвертируется текст), чтобы стрелка всегда оставалась видимой."""
+        from PySide6.QtGui import QPixmap, QPainter, QPolygon, QColor
+        from PySide6.QtCore import QPoint
+        import tempfile
+        import os as _os
+        if not hasattr(self, "_branch_icon_dir"):
+            self._branch_icon_dir = tempfile.mkdtemp(prefix="hranilka_branch_")
+
+        def make(name, direction, color):
+            pm = QPixmap(16, 16)
+            pm.fill(Qt.transparent)
+            p = QPainter(pm)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            p.setBrush(QColor(color))
+            p.setPen(Qt.PenStyle.NoPen)
+            if direction == "closed":      # ▶
+                p.drawPolygon(QPolygon([QPoint(5, 3), QPoint(11, 8), QPoint(5, 13)]))
+            else:                          # ▼
+                p.drawPolygon(QPolygon([QPoint(3, 5), QPoint(13, 5), QPoint(8, 11)]))
+            p.end()
+            path = _os.path.join(self._branch_icon_dir, name + ".png")
+            pm.save(path, "PNG")
+            return path.replace("\\", "/")
+
+        cn = make("closed_n", "closed", text_color)
+        op = make("open_n", "open", text_color)
+        cs = make("closed_s", "closed", tree_bg)
+        ops = make("open_s", "open", tree_bg)
+        return f"""
+            QTreeWidget::branch:has-children:closed {{ image: url("{cn}"); }}
+            QTreeWidget::branch:has-children:open {{ image: url("{op}"); }}
+            QTreeWidget::branch:has-children:closed:selected {{ image: url("{cs}"); }}
+            QTreeWidget::branch:has-children:open:selected {{ image: url("{ops}"); }}
+        """
 
     def apply_config(self):
         """Полное применение настроек: внешний вид + скриншот-защита, idle-таймер,
@@ -640,7 +791,14 @@ class MainWindow(QMainWindow):
     def _add_move_to_service_menu(self, menu, selected):
         sub = menu.addMenu("Переместить в сервис")
         sub.addAction("Новый сервис…", lambda: self._move_accounts_new_service(selected))
-        services = self.db.get_services()
+        # Текущие сервисы выбранных аккаунтов (по их родителю в дереве): сервис,
+        # в котором уже находятся ВСЕ выбранные, не предлагаем (перенос — no-op).
+        current = set()
+        for it in selected:
+            parent = it.parent()
+            pnode = self._node(parent) if parent else None
+            current.add(pnode["id"] if pnode and pnode["type"] == "service" else None)
+        services = [s for s in self.db.get_services() if current != {s["id"]}]
         if services:
             sub.addSeparator()
             for s in services:
@@ -683,8 +841,17 @@ class MainWindow(QMainWindow):
         to_bin = self.config.get("recycle_bin_enabled", False)
         for node in nodes:
             if node["type"] == "folder":
+                # При полном удалении (не keep) аккаунты внутри тоже исчезают —
+                # чистим их кэш несохранённых правок, иначе остаётся «мусор» и
+                # ложное предупреждение о несохранённых данных.
+                if not keep:
+                    self._forget_account_cache(
+                        self.db.get_descendant_account_ids("folder", node["id"]))
                 (self.db.delete_folder_keep_content if keep else self.db.delete_folder)(node["id"])
             elif node["type"] == "service":
+                if not keep:
+                    self._forget_account_cache(
+                        self.db.get_descendant_account_ids("service", node["id"]))
                 (self.db.delete_service_keep_content if keep else self.db.delete_service)(node["id"])
             else:
                 # Аккаунты при включённой корзине удаляются мягко (в корзину).
@@ -692,8 +859,7 @@ class MainWindow(QMainWindow):
                     self.db.move_account_to_bin(node["id"])
                 else:
                     self.db.delete_account(node["id"])
-                self._edit_cache.pop(node["id"], None)
-                self._dirty_ids.discard(node["id"])
+                self._forget_account_cache([node["id"]])
         self._any_db_changes = True
 
         self.current_tree_item = None
@@ -703,6 +869,12 @@ class MainWindow(QMainWindow):
         self._show_placeholder()
         self._update_bin_button()
         self.statusBar().showMessage("Удалено", 2000)
+
+    def _forget_account_cache(self, account_ids):
+        """Удаляет несохранённые правки/пометки указанных аккаунтов из памяти."""
+        for aid in account_ids:
+            self._edit_cache.pop(aid, None)
+            self._dirty_ids.discard(aid)
 
     def _set_favorite(self, selected, value):
         for node in (self._node(i) for i in selected):
@@ -846,14 +1018,16 @@ class MainWindow(QMainWindow):
         d.name = self.tabs.f_name.get_text()
         d.url = self.tabs.f_url.get_text()
         d.creation_date = self.tabs.f_creation_date.get_date()
-        d.password_changed_date = self.tabs.f_password_date.get_date().date()
+        _pwd = self.tabs.f_password_date.get_date()
+        d.password_changed_date = _pwd.date() if _pwd else None
         d.notes = notes
         d.login = self.tabs.f_login.get_text()
         d.password = new_password
         d.first_name = self.tabs.f_first.get_text()
         d.last_name = self.tabs.f_last.get_text()
         d.middle_name = self.tabs.f_middle.get_text()
-        d.birth_date = self.tabs.f_birth.get_date().date()
+        _bd = self.tabs.f_birth.get_date()
+        d.birth_date = _bd.date() if _bd else None
         d.address = self.tabs.f_address.get_text()
         d.recovery_phrase = self.tabs.f_recovery.get_text()
         d.device_id = self.tabs.f_device_id.get_text()
@@ -1182,6 +1356,21 @@ class MainWindow(QMainWindow):
         except OSError as e:
             logging.warning("Не удалось отложить файл БД: %s", e)
 
+    def _create_tables_or_exit(self):
+        """create_tables() с понятным отказом, если база создана более новой
+        версией программы (схема новее поддерживаемой). «Миграция вниз»
+        повредила бы данные, поэтому корректнее завершить работу."""
+        try:
+            self.db.create_tables()
+        except FutureSchemaError as e:
+            logging.error("Несовместимая версия схемы БД: %s", e)
+            theme.themed_info(
+                self.config, self, "Несовместимая версия базы", str(e),
+            )
+            self._shutdown_writer()
+            self._instance_lock.release()
+            sys.exit(1)
+
     def _open_database(self, parent=None):
         """Открыть БД: зашифрованную — через ввод мастер-пароля/recovery-кода,
         обычную — напрямую. При утере секрета пользователь может восстановить
@@ -1194,7 +1383,7 @@ class MainWindow(QMainWindow):
         while True:
             if not cs.is_encrypted_file(self.db.db_path):
                 self.db.connect()
-                self.db.create_tables()
+                self._create_tables_or_exit()
                 self.config.set("encryption_enabled", False)
                 self.config.save()
                 return True
@@ -1261,10 +1450,88 @@ class MainWindow(QMainWindow):
 
     def _flush_db(self):
         self._db_flush_scheduled = False
+        if not self.db.encrypted:
+            # Обычный режим: данные уже в файле, flush — дешёвый no-op.
+            try:
+                self.db.flush()
+            except Exception as e:
+                logging.warning("Не удалось сохранить БД на диск: %s", e)
+            return
+        if not self.db._dirty:
+            return
+        if self._write_busy:
+            # Воркер занят — запишем свежий снимок сразу после текущей записи.
+            self._write_pending = True
+            return
+        self._start_vault_write()
+
+    def _start_vault_write(self, force=False):
+        """Сделать снимок БД (в GUI-потоке) и отдать воркеру на шифрование+запись."""
         try:
-            self.db.flush()
+            db_bytes = self.db.serialize_db()
         except Exception as e:
-            logging.warning("Не удалось сохранить БД на диск: %s", e)
+            logging.warning("Не удалось сериализовать БД: %s", e)
+            return
+        # Оптимистично считаем изменения «в работе»: новые правки снова поставят
+        # _dirty и запланируют следующий flush. При сбое вернём _dirty=True.
+        self.db._dirty = False
+        self._write_busy = True
+        self._write_pending = False
+        self.statusBar().showMessage("Сохранение…")
+        self._writer.submit(db_bytes, force)
+
+    def _on_vault_written(self, ok, err, conflict):
+        """Завершение фоновой записи (в GUI-потоке)."""
+        self._write_busy = False
+        if ok:
+            self.statusBar().showMessage("Сохранено.", 1500)
+            # Появились правки во время записи — пишем свежий снимок.
+            if self._write_pending or self.db._dirty:
+                self._start_vault_write()
+        else:
+            # Запись не удалась — данные снова считаем несохранёнными.
+            self.db._dirty = True
+            if conflict:
+                if theme.themed_confirm(
+                    self.config, self, "Файл изменён извне",
+                    "Файл базы изменён другой программой с момента открытия.\n"
+                    "Перезаписать его своими данными?",
+                ):
+                    self._start_vault_write(force=True)
+                else:
+                    self.statusBar().showMessage(
+                        "Сохранение отменено: файл изменён извне.", 5000)
+            else:
+                logging.warning("Не удалось сохранить БД на диск: %s", err)
+                self.statusBar().showMessage("ОШИБКА СОХРАНЕНИЯ!", 5000)
+                theme.themed_info(
+                    self.config, self, "Ошибка сохранения",
+                    f"Не удалось сохранить базу на диск:\n{err}\n\n"
+                    "Изменения остаются в памяти. Освободите место/проверьте "
+                    "доступ к файлу и повторите.",
+                )
+        # Разбудить ожидающий close/lock, если воркер освободился.
+        if self._writer_idle_loop is not None and not self._write_busy:
+            self._writer_idle_loop.quit()
+
+    def _wait_writer_idle(self, timeout_ms=15000):
+        """Дождаться завершения текущей фоновой записи (для close/lock).
+        Крутит локальный event-loop, поэтому done доставляется и UI не виснет."""
+        if not self._write_busy:
+            return
+        loop = QEventLoop()
+        self._writer_idle_loop = loop
+        QTimer.singleShot(timeout_ms, loop.quit)   # страховочный таймаут
+        loop.exec()
+        self._writer_idle_loop = None
+
+    def _shutdown_writer(self):
+        """Корректно остановить поток фоновой записи (идемпотентно)."""
+        thread = getattr(self, "_writer_thread", None)
+        if thread is not None and thread.isRunning():
+            self._wait_writer_idle()
+            thread.quit()
+            thread.wait(3000)
 
     # ─── Буфер обмена ────────────────────────────────────────────────────────
 
@@ -1360,8 +1627,39 @@ class MainWindow(QMainWindow):
     def _lock_vault(self):
         """Зашифрованный режим: снять ключ и потребовать повторный ввод пароля.
         Поддерживает тот же путь восстановления («забыли пароль»), что и старт."""
-        # Сохранить и закрыть БД из памяти (ключ обнуляется).
-        self.db.lock()
+        # Дождаться фоновой записи, затем синхронно сохранить и закрыть БД из
+        # памяти (ключ обнуляется). Если сохранение не удалось, lock() пробросит
+        # исключение и НЕ обнулит ключ/БД — прерываем блокировку, чтобы не
+        # потерять несохранённые данные.
+        self._wait_writer_idle()
+        try:
+            self.db.lock()
+        except VaultConflictError:
+            if not theme.themed_confirm(
+                self.config, self, "Файл изменён извне",
+                "Файл базы был изменён другой программой с момента открытия.\n"
+                "Перезаписать его своими данными?",
+            ):
+                return  # блокировку отменяем, данные остаются доступны
+            try:
+                self.db.lock(force=True)
+            except Exception as e:
+                logging.warning("Не удалось сохранить БД перед блокировкой: %s", e)
+                theme.themed_info(
+                    self.config, self, "Ошибка сохранения",
+                    f"Не удалось сохранить базу на диск:\n{e}\n\n"
+                    "Блокировка отменена, данные остались доступны.",
+                )
+                return
+        except Exception as e:
+            logging.warning("Не удалось сохранить БД перед блокировкой: %s", e)
+            theme.themed_info(
+                self.config, self, "Ошибка сохранения",
+                f"Не удалось сохранить базу на диск:\n{e}\n\n"
+                "Блокировка отменена, данные остались доступны. Освободите "
+                "место/проверьте доступ к файлу и повторите.",
+            )
+            return
         self._edit_cache.clear()
         self._dirty_ids.clear()
         self.current_account_data = None

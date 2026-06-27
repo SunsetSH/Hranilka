@@ -151,6 +151,21 @@ def _parse(container: bytes):
     except (IndexError, struct.error):
         raise CorruptVault("Повреждён заголовок контейнера")
 
+    # Заголовок — НЕДОВЕРЕННЫЙ вход. Жёстко валидируем всё ДО запуска Argon2:
+    # иначе подделанный файл может затребовать гигантскую память/число проходов
+    # (t, m_kib, p читаются прямо из файла) и повесить/уронить процесс при
+    # разблокировке ещё до проверки тега GCM. Принимаем только параметры
+    # известных пресетов и точные длины полей.
+    if (t, m_kib, p) not in set(PRESETS.values()):
+        raise CorruptVault("Недопустимые параметры KDF в заголовке")
+    _WRAP_LEN = NONCE_LEN + DEK_LEN + 16  # nonce + обёрнутый DEK + тег GCM
+    if len(salt_pw) != SALT_LEN or len(salt_rec) != SALT_LEN:
+        raise CorruptVault("Повреждён заголовок контейнера")
+    if len(wrap_pw) != _WRAP_LEN or len(wrap_rec) != _WRAP_LEN:
+        raise CorruptVault("Повреждён заголовок контейнера")
+    if len(data_nonce) != NONCE_LEN or len(data_ct) < 16:
+        raise CorruptVault("Повреждён контейнер")
+
     header = {
         "preset": _ID_PRESETS.get(preset_id, DEFAULT_PRESET),
         "params": (t, m_kib, p),

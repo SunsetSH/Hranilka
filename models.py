@@ -10,8 +10,8 @@ class AccountData:
     def __init__(self):
         self.name = "Новый аккаунт"
         self.url = ""
-        self.creation_date = QDateTime.currentDateTime()
-        self.password_changed_date = QDate.currentDate()
+        self.creation_date = QDateTime.currentDateTime()  # момент создания — осмысленный дефолт
+        self.password_changed_date = None                  # «не задано», а не сегодня
         self.password_change_interval_days = None
         self.notes = ""
         self.login = ""
@@ -19,7 +19,7 @@ class AccountData:
         self.first_name = ""
         self.last_name = ""
         self.middle_name = ""
-        self.birth_date = QDate.currentDate()
+        self.birth_date = None                             # «не задано», а не сегодня
         self.address = ""
         self.secret_questions = []  # [{"q": "", "a": ""}]
         self.recovery_phrase = ""
@@ -52,19 +52,22 @@ class AccountData:
 
     @staticmethod
     def _str_to_dt(value):
+        """Строка → QDateTime; None, если значение пусто/некорректно
+        (раньше подменялось текущим моментом — ложные данные)."""
         if value:
             dt = QDateTime.fromString(value, _DT_FORMAT)
             if dt.isValid():
                 return dt
-        return QDateTime.currentDateTime()
+        return None
 
     @staticmethod
     def _str_to_date(value):
+        """Строка → QDate; None, если значение пусто/некорректно."""
         if value:
             d = QDate.fromString(value, _DATE_FORMAT)
             if d.isValid():
                 return d
-        return QDate.currentDate()
+        return None
 
     # ----- Сериализация для слоя БД (примитивы) -----
 

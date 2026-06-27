@@ -68,6 +68,18 @@ def _s(v):
     return "" if v is None else str(v)
 
 
+def _csv_safe(value):
+    """Нейтрализует formula injection в табличных форматах (CSV/XLSX).
+
+    Excel/openpyxl трактуют значение, начинающееся с = + - @ (или с управляющего
+    символа перед ними), как формулу — вплоть до DDE/WEBSERVICE-вызовов при
+    открытии файла. Префиксуем такие значения апострофом: Excel покажет текст
+    как есть и формулу не выполнит. На HTML/TXT не влияет (там не вызывается)."""
+    if value and value[0] in ("=", "+", "-", "@", "\t", "\r", "\n"):
+        return "'" + value
+    return value
+
+
 def _account_rows(card, links, opts, skip_empty=True):
     """Упорядоченный список (подпись, значение) для одной карточки.
 
@@ -229,7 +241,8 @@ def _table_row(node, path_parts, cols, opts):
     row = [" / ".join(path_parts)] + [d.get(l, "") for l in cols]
     if opts.include_other:
         row.append(str(len(_gallery(node))))
-    return row
+    # Нейтрализуем формулы в каждой ячейке (CSV и XLSX используют эту строку).
+    return [_csv_safe(_s(c)) for c in row]
 
 
 # ─── HTML ────────────────────────────────────────────────────────────────────
@@ -376,7 +389,68 @@ def _pdf_html(tree, opts, render_img):
 
 
 def export_pdf(tree, opts, path):
-    # Импорт Qt изолирован здесь, чтобы остальные форматы не тянули Qt.
+    """PDF из того же HTML, что и export_html (отличная вёрстка), отрисованный
+    движком Chromium (QtWebEngine) на страницы A4 — так PDF визуально совпадает
+    с HTML-экспортом. Если QtWebEngine недоступен, откатываемся на отрисовку
+    через QTextDocument (упрощённая вёрстка)."""
+    try:
+        _export_pdf_webengine(tree, opts, path)
+    except Exception:
+        _export_pdf_textdoc(tree, opts, path)
+
+
+def _export_pdf_webengine(tree, opts, path):
+    from PySide6.QtWebEngineCore import QWebEnginePage
+    from PySide6.QtCore import QEventLoop, QMarginsF, QUrl, QTimer
+    from PySide6.QtGui import QPageLayout, QPageSize
+    import tempfile
+    import os as _os
+
+    html = _html_document(tree, opts)   # тот же HTML, что и в export_html
+    # Грузим из временного файла (обходит лимит setHtml ~2 МБ и корректно
+    # подхватывает встроенные картинки data:base64).
+    tmp = tempfile.NamedTemporaryFile(
+        suffix=".html", delete=False, mode="w", encoding="utf-8")
+    tmp.write(html)
+    tmp.close()
+
+    page = QWebEnginePage()
+    loop = QEventLoop()
+    state = {"ok": False, "loaded": False}
+
+    def on_pdf(_fp, ok):
+        state["ok"] = ok
+        loop.quit()
+
+    def on_load(ok):
+        state["loaded"] = ok
+        if not ok:
+            loop.quit()
+            return
+        layout = QPageLayout(
+            QPageSize(QPageSize.PageSizeId.A4),
+            QPageLayout.Orientation.Portrait,
+            QMarginsF(10, 10, 10, 10),          # поля в мм
+        )
+        page.printToPdf(str(path), layout)
+
+    page.loadFinished.connect(on_load)
+    page.pdfPrintingFinished.connect(on_pdf)
+    page.load(QUrl.fromLocalFile(tmp.name))
+    QTimer.singleShot(60000, loop.quit)         # страховочный таймаут
+    try:
+        loop.exec()
+    finally:
+        try:
+            _os.unlink(tmp.name)
+        except OSError:
+            pass
+    if not state["ok"]:
+        raise RuntimeError("QtWebEngine не смог сформировать PDF")
+
+
+def _export_pdf_textdoc(tree, opts, path):
+    # Запасной способ (без QtWebEngine). Импорт Qt изолирован здесь.
     from PySide6.QtGui import (QTextDocument, QPdfWriter, QPageSize, QImage,
                                QFont, QPainter, QColor)
     from PySide6.QtCore import QUrl, QMarginsF, QSizeF, QRectF

@@ -45,15 +45,51 @@ class Config:
         self.load()
     
     def load(self):
-        if CONFIG_FILE.exists():
-            try:
-                with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-                    self.config.update(json.load(f))
-            except (json.JSONDecodeError, OSError) as e:
-                logger.warning(
-                    "Не удалось прочитать %s (%s). Используются настройки по умолчанию.",
-                    CONFIG_FILE, e,
-                )
+        if not CONFIG_FILE.exists():
+            return
+        try:
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                raw = json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning(
+                "Не удалось прочитать %s (%s). Используются настройки по умолчанию.",
+                CONFIG_FILE, e,
+            )
+            return
+        if not isinstance(raw, dict):
+            logger.warning("Повреждён %s (ожидался объект). Используются настройки "
+                           "по умолчанию.", CONFIG_FILE)
+            return
+        self.config.update(self._sanitize(raw))
+
+    def _sanitize(self, raw):
+        """Приводит значения из файла к типам значений по умолчанию.
+
+        config.json — редактируемый пользователем файл; некорректный тип (строка
+        вместо числа и т. п.) раньше попадал прямо в таймеры/арифметику UI и мог
+        уронить запуск. Для известных ключей приводим тип к дефолтному (числа —
+        с отсечением отрицательных), при неудаче берём дефолт. Неизвестные ключи
+        (служебные, напр. _window_geometry) сохраняем как есть."""
+        clean = {}
+        for key, value in raw.items():
+            if key not in self.config:
+                clean[key] = value           # служебные/неизвестные — без изменений
+                continue
+            default = self.config[key]
+            if isinstance(default, bool):    # bool раньше int (bool — подтип int)
+                clean[key] = bool(value)
+            elif isinstance(default, int):
+                try:
+                    clean[key] = max(0, int(value))
+                except (TypeError, ValueError):
+                    clean[key] = default
+            elif isinstance(default, str):
+                clean[key] = value if isinstance(value, str) else default
+            elif isinstance(default, dict):
+                clean[key] = value if isinstance(value, dict) else default
+            else:
+                clean[key] = value
+        return clean
     
     def save(self):
         # Атомарная запись: пишем во временный файл и подменяем им основной,

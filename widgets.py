@@ -2,12 +2,21 @@ import os
 from PySide6.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QLineEdit,
                                QPushButton, QLabel, QDateEdit, QDateTimeEdit,
                                QTextEdit, QFileDialog, QDialog, QMessageBox,
-                               QApplication, QSpinBox)
+                               QApplication, QSpinBox, QMenu)
 from PySide6.QtCore import Signal, Qt, QDate, QByteArray, QBuffer, QIODevice
-from PySide6.QtGui import QPixmap
+from PySide6.QtGui import QPixmap, QImage, QImageReader
 from theme import themed_info, themed_confirm
 
-_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".gif")
+
+def _supported_image_exts():
+    """Расширения изображений, которые умеет читать Qt (вкл. webp, tiff и т.п.,
+    если установлены плагины). Запасной набор — на случай пустого ответа."""
+    exts = {"." + bytes(f).decode("ascii").lower()
+            for f in QImageReader.supportedImageFormats()}
+    return tuple(sorted(exts)) or (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp")
+
+
+_IMAGE_EXTS = _supported_image_exts()
 
 
 def _warn(config, parent, title, text):
@@ -107,6 +116,7 @@ class CopyableDateField(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(5)
         
+        self._is_datetime = is_datetime
         if is_datetime:
             self.date_widget = QDateTimeEdit()
             self.date_widget.setDisplayFormat("yyyy-MM-dd HH:mm")
@@ -120,6 +130,9 @@ class CopyableDateField(QWidget):
         # заменяет значение в активной секции (поведение QDateTimeEdit по умолчанию).
         self.date_widget.setCalendarPopup(True)
         self.date_widget.setReadOnly(True)
+        # «Не задано»: минимально возможное значение показываем как пустое, чтобы
+        # отсутствие даты не подменялось сегодняшним числом (ложные данные).
+        self.date_widget.setSpecialValueText("не задано")
         layout.addWidget(self.date_widget)
         
         self.copy_btn = QPushButton("[КОП]")
@@ -128,26 +141,46 @@ class CopyableDateField(QWidget):
         layout.addWidget(self.copy_btn)
         
     def do_copy(self):
+        if self._is_unset():
+            return
         text = self.date_widget.dateTime().toString(self.format)
         if text:
             QApplication.clipboard().setText(text)
             self.copy_signal.emit()
-            
+
+    def _is_unset(self):
+        """True, если показано «не задано» (значение равно минимальному)."""
+        if self._is_datetime:
+            return self.date_widget.dateTime() == self.date_widget.minimumDateTime()
+        return self.date_widget.date() == self.date_widget.minimumDate()
+
+    def _set_unset(self):
+        if self._is_datetime:
+            self.date_widget.setDateTime(self.date_widget.minimumDateTime())
+        else:
+            self.date_widget.setDate(self.date_widget.minimumDate())
+
     def set_date(self, date):
-        """Принимает QDate, QDateTime или строку"""
+        """Принимает QDate, QDateTime, None или строку. None/пусто → «не задано»."""
         from PySide6.QtCore import QTime, QDateTime
-        if isinstance(date, QDateTime):
+        if date is None:
+            self._set_unset()
+        elif isinstance(date, QDateTime):
             self.date_widget.setDateTime(date)
         elif hasattr(date, 'year'):  # QDate
-            if self.date_widget.__class__.__name__ == 'QDateTimeEdit':
+            if self._is_datetime:
                 self.date_widget.setDateTime(QDateTime(date, QTime(0, 0)))
             else:
                 self.date_widget.setDate(date)
         else:
-            # Если строка или другой формат
-            self.date_widget.setDateTime(QDateTime.currentDateTime())
-            
-    def get_date(self): return self.date_widget.dateTime()
+            # Неизвестный формат — считаем «не задано», а не «сегодня».
+            self._set_unset()
+
+    def get_date(self):
+        """QDateTime или None, если дата не задана."""
+        if self._is_unset():
+            return None
+        return self.date_widget.dateTime()
     def set_editable(self, editable):
         self.date_widget.setReadOnly(not editable)
         self.copy_btn.setVisible(not editable)
@@ -197,8 +230,14 @@ class SecretQuestionsWidget(QWidget):
         self.add_btn = QPushButton("+ ДОБАВИТЬ ВОПРОС")
         self.add_btn.clicked.connect(lambda: self.add_row())
         self.layout.addWidget(self.add_btn)
+        self.empty_label = QLabel("Секретных вопросов нет")
+        self.layout.addWidget(self.empty_label)
         self.layout.addStretch()
-        
+        self._update_empty()
+
+    def _update_empty(self):
+        self.empty_label.setVisible(not self.rows)
+
     def add_row(self, q="", a=""):
         if len(self.rows) >= 5:
             _warn(self.config, self, "Лимит", "Максимум 5 вопросов!")
@@ -224,7 +263,8 @@ class SecretQuestionsWidget(QWidget):
         
         self.layout.insertWidget(self.layout.count() - 2, row_widget)
         self.rows.append((q_edit, a_edit))
-        
+        self._update_empty()
+
     def remove_row(self, row_widget):
         if not _confirm(self.config, self, "Удаление",
                         "Удалить этот секретный вопрос?"):
@@ -235,14 +275,20 @@ class SecretQuestionsWidget(QWidget):
                 break
         self.layout.removeWidget(row_widget)
         row_widget.deleteLater()
-        
-    def get_data(self): return [{"q": q.text(), "a": a.text()} for q, a in self.rows]
+        self._update_empty()
+
+    def get_data(self):
+        # Не сохраняем строку, если оба связанных поля пустые.
+        return [{"q": q.text(), "a": a.text()} for q, a in self.rows
+                if q.text().strip() or a.text().strip()]
+
     def set_data(self, data):
         for row_widget in [q.parent() for q, a in self.rows]:
             self.layout.removeWidget(row_widget)
             row_widget.deleteLater()
         self.rows.clear()
         for item in data: self.add_row(item.get("q", ""), item.get("a", ""))
+        self._update_empty()
     def set_editable(self, editable):
         self.add_btn.setVisible(editable)
         for row_widget in [q.parent() for q, a in self.rows]:
@@ -264,7 +310,13 @@ class CodeListWidget(QWidget):
         self.add_btn = QPushButton("+ ДОБАВИТЬ КОД")
         self.add_btn.clicked.connect(lambda: self.add_code())
         self.layout.addWidget(self.add_btn)
+        self.empty_label = QLabel("Резервных кодов нет")
+        self.layout.addWidget(self.empty_label)
         self.layout.addStretch()
+        self._update_empty()
+
+    def _update_empty(self):
+        self.empty_label.setVisible(not self.rows)
 
     def add_code(self, code_text=""):
         row_widget = QWidget()
@@ -289,7 +341,8 @@ class CodeListWidget(QWidget):
         
         self.layout.insertWidget(self.layout.count() - 2, row_widget)
         self.rows.append((code_edit, row_widget))
-        
+        self._update_empty()
+
     def copy_code(self, text):
         if text:
             QApplication.clipboard().setText(text)
@@ -305,14 +358,19 @@ class CodeListWidget(QWidget):
                 break
         self.layout.removeWidget(row_widget)
         row_widget.deleteLater()
-        
-    def get_data(self): return [edit.text() for edit, _ in self.rows]
+        self._update_empty()
+
+    def get_data(self):
+        # Не сохраняем пустые коды.
+        return [edit.text() for edit, _ in self.rows if edit.text().strip()]
+
     def set_data(self, data):
         for _, widget in self.rows:
             self.layout.removeWidget(widget)
             widget.deleteLater()
         self.rows.clear()
         for code in data: self.add_code(code)
+        self._update_empty()
         
     def set_editable(self, editable):
         self._editable = editable
@@ -367,13 +425,41 @@ class GalleryWidget(QWidget):
         buf.close()
         return bytes(ba)
 
+    # Лимиты для добавляемых изображений (M-13): защищают от исчерпания
+    # памяти/диска и «decompression bomb» (картинка с огромным разрешением).
+    _MAX_IMAGE_BYTES = 15 * 1024 * 1024     # 15 МБ на файл
+    _MAX_IMAGE_PIXELS = 50 * 1_000_000      # 50 Мп после декодирования
+
+    def _accept_image(self, data):
+        """Проверяет добавляемое изображение по размеру и декодируемости.
+        Возвращает True, если картинку можно сохранить. Не применяется к уже
+        сохранённым в БД изображениям (они грузятся напрямую через add_item)."""
+        if not data:
+            return False
+        if len(data) > self._MAX_IMAGE_BYTES:
+            mb = self._MAX_IMAGE_BYTES // (1024 * 1024)
+            _warn(self.config, self, "Слишком большой файл",
+                  f"Изображение больше {mb} МБ и не будет добавлено.")
+            return False
+        pixmap = QPixmap()
+        if not pixmap.loadFromData(data):
+            _warn(self.config, self, "Ошибка",
+                  "Файл не распознан как изображение.")
+            return False
+        if pixmap.width() * pixmap.height() > self._MAX_IMAGE_PIXELS:
+            mp = self._MAX_IMAGE_PIXELS // 1_000_000
+            _warn(self.config, self, "Слишком большое изображение",
+                  f"Разрешение превышает {mp} Мп и не будет добавлено.")
+            return False
+        return True
+
     def upload_image(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Выбрать картинку", "", "Images (*.png *.jpg *.jpeg *.bmp *.gif)"
-        )
+        pattern = " ".join("*" + e for e in _IMAGE_EXTS)
+        flt = f"Изображения ({pattern});;Все файлы (*)"
+        path, _ = QFileDialog.getOpenFileName(self, "Выбрать картинку", "", flt)
         if path:
             data = self._read_file_bytes(path)
-            if data:
+            if data and self._accept_image(data):
                 self.add_item(data)
 
     def paste_image(self):
@@ -399,7 +485,8 @@ class GalleryWidget(QWidget):
                 data = self._read_file_bytes(text)
 
         if data:
-            self.add_item(data)
+            if self._accept_image(data):
+                self.add_item(data)
         else:
             _warn(
                 self.config, self, "Буфер обмена",
@@ -420,6 +507,10 @@ class GalleryWidget(QWidget):
         thumb_label.setPixmap(pixmap.scaled(100, 100, Qt.KeepAspectRatio, Qt.SmoothTransformation))
         thumb_label.setCursor(Qt.PointingHandCursor)
         thumb_label.mousePressEvent = lambda e, b=image_bytes: self.show_full_image(b)
+        # ПКМ по миниатюре — экспорт изображения (в файл / в буфер обмена).
+        thumb_label.setContextMenuPolicy(Qt.CustomContextMenu)
+        thumb_label.customContextMenuRequested.connect(
+            lambda pos, b=image_bytes, lbl=thumb_label: self._show_image_menu(lbl, pos, b))
         h_layout.addWidget(thumb_label)
 
         v_layout = QVBoxLayout()
@@ -470,6 +561,54 @@ class GalleryWidget(QWidget):
             QVBoxLayout(dialog).addWidget(label)
         dialog.exec()
 
+    @staticmethod
+    def _guess_ext(data):
+        """Расширение по сигнатуре байтов изображения (для имени файла экспорта)."""
+        if data[:3] == b"\xff\xd8\xff":
+            return ".jpg"
+        if data[:4] == b"\x89PNG":
+            return ".png"
+        if data[:3] == b"GIF":
+            return ".gif"
+        if data[:2] == b"BM":
+            return ".bmp"
+        if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+            return ".webp"
+        return ".png"
+
+    def _show_image_menu(self, label, pos, image_bytes):
+        menu = QMenu(self)
+        act_file = menu.addAction("Экспорт в файл…")
+        act_clip = menu.addAction("Экспорт в буфер обмена")
+        chosen = menu.exec(label.mapToGlobal(pos))
+        if chosen == act_file:
+            self._export_image_to_file(image_bytes)
+        elif chosen == act_clip:
+            self._export_image_to_clipboard(image_bytes)
+
+    def _export_image_to_file(self, image_bytes):
+        ext = self._guess_ext(image_bytes)
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Сохранить изображение", "image" + ext,
+            f"Изображение (*{ext});;Все файлы (*)")
+        if not path:
+            return
+        try:
+            with open(path, "wb") as f:
+                f.write(image_bytes)
+        except OSError as e:
+            _warn(self.config, self, "Ошибка", f"Не удалось сохранить файл:\n{e}")
+            return
+        _warn(self.config, self, "Готово", f"Изображение сохранено:\n{path}")
+
+    def _export_image_to_clipboard(self, image_bytes):
+        img = QImage()
+        if not img.loadFromData(image_bytes):
+            _warn(self.config, self, "Ошибка", "Не удалось прочитать изображение.")
+            return
+        QApplication.clipboard().setImage(img)
+        _warn(self.config, self, "Готово", "Изображение скопировано в буфер обмена.")
+
     def get_data(self):
         return [{"data": data, "desc": desc.text()} for data, desc, _, _ in self.items]
 
@@ -504,6 +643,8 @@ class IntervalField(QWidget):
         self.spin.setRange(0, 3650)
         self.spin.setSuffix(" дн.")
         self.spin.setSpecialValueText("не задано")  # отображается при значении 0
+        # Чуть шире, чтобы «не задано» не обрезалось (внутренние отступы темы).
+        self.spin.setMinimumWidth(150)
         self.spin.setReadOnly(True)
         self.spin.setButtonSymbols(QSpinBox.NoButtons)
         layout.addWidget(self.spin)
@@ -582,11 +723,6 @@ class LinkedAccountsWidget(QWidget):
 
     def _update_empty(self):
         self.empty_label.setVisible(not self.items)
-
-    def add_link(self, account_id, name):
-        if any(aid == account_id for aid, _, _ in self.items):
-            return
-        self._add_row(account_id, name)
 
     def set_data(self, links):
         for _, _, w in self.items:

@@ -1,5 +1,4 @@
 import sqlite3
-import json
 import os
 from datetime import datetime, date
 from pathlib import Path
@@ -22,11 +21,35 @@ def _days_until_password_change(changed_date_str, interval_days):
 # чтобы _migrate() мог обновить существующие документы пользователей.
 SCHEMA_VERSION = 5
 
+
+class FutureSchemaError(Exception):
+    """База создана более новой версией программы (её схема новее поддерживаемой).
+    Открывать такую базу нельзя: «миграция вниз» повредила бы данные."""
+
+    def __init__(self, found, supported):
+        self.found = found
+        self.supported = supported
+        super().__init__(
+            f"База создана более новой версией Хранилки (схема {found}, "
+            f"поддерживается {supported}). Обновите программу."
+        )
+
+
+class VaultConflictError(Exception):
+    """Файл-БД на диске изменился извне (другой программой, синхронизацией,
+    восстановлением) с момента, как мы его открыли/последний раз сохранили.
+    Перезапись затёрла бы чужие изменения — поэтому требуется решение пользователя."""
+
+
 class Database:
     def __init__(self, db_path="hranilka.db"):
         self.db_path = db_path
         self.conn = None
         self.cursor = None
+        # «Ревизия» файла на диске на момент открытия/последней нашей записи
+        # (st_mtime_ns, размер). Перед перезаписью сверяем — если отличается,
+        # значит файл изменили извне (см. VaultConflictError).
+        self._disk_revision = None
         # Состояние шифрования. Когда encrypted=True, БД живёт в sqlite :memory:,
         # а на диске лежит зашифрованный контейнер (см. crypto_store).
         self.encrypted = False
@@ -53,6 +76,7 @@ class Database:
         self._header = None
         self._dirty = False
         self.conn = sqlite3.connect(self.db_path)
+        self._disk_revision = self._stat_revision()
         self._setup_conn()
 
     def open_encrypted(self, db_bytes: bytes, dek: bytes, header: dict):
@@ -65,37 +89,88 @@ class Database:
         self.conn = sqlite3.connect(":memory:")
         if db_bytes:
             self.conn.deserialize(db_bytes)
+        self._disk_revision = self._stat_revision()
         self._setup_conn()
 
-    def persist(self):
-        """Сбросить текущее состояние БД на диск.
+    def _stat_revision(self):
+        """«Ревизия» файла на диске (st_mtime_ns, размер) или None, если файла нет."""
+        try:
+            st = os.stat(self.db_path)
+            return (st.st_mtime_ns, st.st_size)
+        except OSError:
+            return None
 
-        В обычном режиме — no-op (SQLite уже пишет в файл). В зашифрованном —
-        сериализует in-memory БД, шифрует и атомарно записывает контейнер."""
-        if not self.encrypted or self.conn is None or self._dek is None:
-            return
-        import crypto_store as cs
-        db_bytes = self.conn.serialize()
-        container = cs.seal(db_bytes, self._dek, self._header)
+    def _check_no_external_change(self):
+        """VaultConflictError, если файл на диске изменили извне с момента
+        открытия/последней нашей записи."""
+        if self._disk_revision is None:
+            return  # ещё не сохраняли (новый файл) — конфликта быть не может
+        current = self._stat_revision()
+        if current is not None and current != self._disk_revision:
+            raise VaultConflictError()
+
+    def _write_container(self, container: bytes, force: bool = False):
+        """Атомарно записать готовый контейнер на диск (temp+fsync+replace).
+        Перед заменой сверяет ревизию файла (если не force) и обновляет её после."""
+        if not force:
+            self._check_no_external_change()
         tmp = self.db_path + ".tmp"
         with open(tmp, "wb") as f:
             f.write(container)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, self.db_path)
+        self._disk_revision = self._stat_revision()
+
+    def serialize_db(self) -> bytes:
+        """Сериализовать in-memory БД в байты.
+
+        ОБЯЗАНО выполняться в потоке-владельце соединения SQLite (соединение
+        однопоточное). Это относительно дешёвая операция (копирование в память);
+        тяжёлые шифрование и запись на диск вынесены в seal_and_write()."""
+        return self.conn.serialize()
+
+    def serialize_container(self) -> bytes:
+        """serialize_db() + шифрование в контейнер (без записи). Синхронный путь."""
+        import crypto_store as cs
+        return cs.seal(self.serialize_db(), self._dek, self._header)
+
+    def seal_and_write(self, db_bytes: bytes, force: bool = False):
+        """Зашифровать ГОТОВЫЕ байты БД и атомарно записать контейнер.
+
+        Не обращается к соединению SQLite — безопасно вызывать из рабочего
+        потока (см. фоновую запись в main.py). Шифрование (AES-GCM) и запись —
+        самые тяжёлые части сохранения."""
+        import crypto_store as cs
+        container = cs.seal(db_bytes, self._dek, self._header)
+        self._write_container(container, force=force)
+
+    def persist(self, force: bool = False):
+        """Сбросить текущее состояние БД на диск.
+
+        В обычном режиме — no-op (SQLite уже пишет в файл). В зашифрованном —
+        сериализует in-memory БД, шифрует и атомарно записывает контейнер.
+        VaultConflictError, если файл изменён извне (force=True — перезаписать)."""
+        if not self.encrypted or self.conn is None or self._dek is None:
+            return
+        self._write_container(self.serialize_container(), force=force)
 
     def set_header(self, header: dict):
         """Обновить заголовок контейнера (после смены пароля/recovery) и сохранить."""
         self._header = header
         self.persist()
 
-    def lock(self):
-        """Заблокировать: сохранить, закрыть in-memory БД, забыть ключ."""
+    def lock(self, force: bool = False):
+        """Заблокировать: сохранить, закрыть in-memory БД, забыть ключ.
+
+        Если сохранение не удалось (нет места, отказ ACL, блокировка
+        антивирусом), исключение пробрасывается наверх, а БД и ключ НЕ
+        обнуляются — несохранённые данные остаются доступны для повторной
+        попытки. Раньше ошибка глоталась, и последние изменения терялись тихо.
+        force — перезаписать файл, изменённый извне (см. VaultConflictError)."""
         if self.encrypted:
-            try:
-                self.persist()
-            except Exception:
-                pass
+            self.persist(force=force)   # при сбое — исключение, состояние сохранится
+            self._dirty = False
         if self.conn:
             self.conn.close()
         self.conn = None
@@ -110,11 +185,12 @@ class Database:
         if self.encrypted and self._on_dirty is not None:
             self._on_dirty()
 
-    def flush(self):
+    def flush(self, force: bool = False):
         """Сбросить накопленные изменения на диск (если есть). Вызывается
-        контроллером по таймеру и в финальных точках."""
+        контроллером по таймеру и в финальных точках. force — перезаписать,
+        даже если файл изменён извне (см. VaultConflictError)."""
         if self._dirty:
-            self.persist()
+            self.persist(force=force)
             self._dirty = False
 
     def _commit(self):
@@ -126,32 +202,51 @@ class Database:
     # ─── Управление шифрованием ──────────────────────────────────────────────
 
     def _atomic_write(self, data: bytes):
+        # Используется при включении/выключении шифрования (интерактивно,
+        # состояние файла под контролем) — пишем без проверки конфликта, но
+        # ревизию обновляем, чтобы последующие persist() сверялись корректно.
         tmp = self.db_path + ".tmp"
         with open(tmp, "wb") as f:
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, self.db_path)
+        self._disk_revision = self._stat_revision()
 
     def enable_encryption(self, password: str, preset: str):
         """Зашифровать текущую (обычную) БД. Возвращает recovery-код.
-        После вызова БД работает в зашифрованном режиме (в памяти)."""
+        После вызова БД работает в зашифрованном режиме (в памяти).
+
+        Порядок важен: контейнер сначала собирается и ПРОВЕРЯЕТСЯ (cs.unlock) —
+        и только потом закрывается рабочее соединение. Если запись файла упадёт,
+        переоткрываем обычную БД, чтобы объект не остался с закрытым соединением
+        в несогласованном состоянии (раньше так и было — все CRUD падали)."""
         import crypto_store as cs
         db_bytes = self.conn.serialize()
         container, recovery = cs.create_vault(db_bytes, password, preset)
+        pt, dek, header = cs.unlock(container, password)  # валидируем ДО закрытия
         self.conn.close()
-        self._atomic_write(container)
-        # Переоткрыть как зашифрованную (получаем dek/header из контейнера).
-        pt, dek, header = cs.unlock(container, password)
+        try:
+            self._atomic_write(container)
+        except Exception:
+            self.connect()   # старый файл не тронут — возвращаем рабочий режим
+            raise
         self.open_encrypted(pt, dek, header)
         return recovery
 
     def disable_encryption(self):
         """Расшифровать БД обратно в обычный файл и работать без шифрования."""
         db_bytes = self.conn.serialize()
+        dek, header = self._dek, self._header
         self.conn.close()
-        # Сериализованные байты — это валидный файл SQLite; пишем как есть.
-        self._atomic_write(db_bytes)
+        try:
+            # Сериализованные байты — это валидный файл SQLite; пишем как есть.
+            self._atomic_write(db_bytes)
+        except Exception:
+            # Запись не удалась (на диске остался зашифрованный контейнер) —
+            # возвращаем рабочее зашифрованное состояние из байтов в памяти.
+            self.open_encrypted(db_bytes, dek, header)
+            raise
         self.connect()
 
     def change_master_password(self, new_password: str, preset: str = None):
@@ -302,6 +397,45 @@ class Database:
             )
         """)
 
+        # Перед созданием UNIQUE-индексов убираем возможные дубли (из старых баз
+        # или ручных правок), иначе создание уникального индекса упадёт.
+        # personal_data / recovery_phrases — не более одной строки на аккаунт.
+        self.cursor.execute(
+            "DELETE FROM personal_data WHERE id NOT IN "
+            "(SELECT MIN(id) FROM personal_data GROUP BY account_id)")
+        self.cursor.execute(
+            "DELETE FROM recovery_phrases WHERE id NOT IN "
+            "(SELECT MIN(id) FROM recovery_phrases GROUP BY account_id)")
+        # linked_accounts: убрать самоссылки и неупорядоченные дубли (A,B)/(B,A).
+        self.cursor.execute("DELETE FROM linked_accounts WHERE account_id = linked_account_id")
+        self.cursor.execute(
+            "DELETE FROM linked_accounts WHERE id NOT IN ("
+            " SELECT MIN(id) FROM linked_accounts "
+            " GROUP BY MIN(account_id, linked_account_id), MAX(account_id, linked_account_id))")
+        # Старые НЕуникальные индексы (если успели создаться) заменяем уникальными.
+        self.cursor.execute("DROP INDEX IF EXISTS idx_personal_account")
+        self.cursor.execute("DROP INDEX IF EXISTS idx_phrases_account")
+
+        # Индексы по внешним ключам и частым фильтрам. CREATE INDEX IF NOT EXISTS
+        # идемпотентен, поэтому безопасно выполняется при каждом открытии и
+        # автоматически появляется в уже существующих базах (миграция не нужна).
+        # UNIQUE-индексы заодно дают целостность (M-14): не более одной строки
+        # ПД/фразы на аккаунт и отсутствие дублирующихся связей.
+        for stmt in (
+            "CREATE INDEX IF NOT EXISTS idx_services_folder ON services(folder_id)",
+            "CREATE INDEX IF NOT EXISTS idx_accounts_service ON accounts(service_id)",
+            "CREATE INDEX IF NOT EXISTS idx_accounts_deleted ON accounts(deleted_at)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_personal_account ON personal_data(account_id)",
+            "CREATE INDEX IF NOT EXISTS idx_questions_account ON secret_questions(account_id)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_phrases_account ON recovery_phrases(account_id)",
+            "CREATE INDEX IF NOT EXISTS idx_codes_account ON recovery_codes(account_id)",
+            "CREATE INDEX IF NOT EXISTS idx_gallery_account ON gallery(account_id)",
+            "CREATE INDEX IF NOT EXISTS idx_linked_account ON linked_accounts(account_id)",
+            "CREATE INDEX IF NOT EXISTS idx_linked_linked ON linked_accounts(linked_account_id)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_linked_pair ON linked_accounts(account_id, linked_account_id)",
+        ):
+            self.cursor.execute(stmt)
+
         self._commit()
 
         # Доработка существующих баз до актуальной схемы
@@ -340,6 +474,11 @@ class Database:
         current = self.get_schema_version()
         if current == SCHEMA_VERSION:
             return
+        if current > SCHEMA_VERSION:
+            # База создана более новой версией программы. Молчаливая «миграция»
+            # вниз записала бы устаревшую версию схемы и могла бы необратимо
+            # повредить данные — поэтому отказываемся открывать.
+            raise FutureSchemaError(current, SCHEMA_VERSION)
 
         for table, columns in self._EXPECTED_COLUMNS.items():
             existing = self._get_columns(table)
@@ -460,28 +599,32 @@ class Database:
             (str(version),),
         )
 
-    def close(self, persist=True):
+    def close(self, persist=True, force=False):
         """Закрытие соединения. persist=False — закрыть БЕЗ сохранения на диск
         (нужно при восстановлении бэкапа, чтобы не затереть восстановленный файл
-        текущей in-memory базой)."""
+        текущей in-memory базой). force — перезаписать файл, изменённый извне."""
         if persist and self.encrypted and self.conn is not None and self._dek is not None:
-            try:
-                self.persist()
-                self._dirty = False
-            except Exception:
-                pass
+            # Сбой записи пробрасываем наверх (см. lock): закрытие без
+            # подтверждённого сохранения тихо теряло бы последние изменения.
+            self.persist(force=force)
+            self._dirty = False
         if self.conn:
             self.conn.close()
 
     def wipe_all_data(self):
-        """Удаляет все пользовательские данные, сохраняя структуру таблиц."""
-        self.conn.execute("PRAGMA foreign_keys = OFF")
-        for table in ("gallery", "recovery_codes", "recovery_phrases",
-                       "secret_questions", "personal_data", "linked_accounts",
-                       "accounts", "services", "folders"):
-            self.conn.execute(f"DELETE FROM {table}")
-        self.conn.execute("PRAGMA foreign_keys = ON")
-        self._commit()
+        """Удаляет все пользовательские данные, сохраняя структуру таблиц.
+
+        Удаляем от дочерних таблиц к родительским, поэтому внешние ключи можно
+        не отключать. Раньше код вызывал `PRAGMA foreign_keys = OFF/ON`, но
+        PRAGMA внутри неявной транзакции (её открывают DELETE) игнорируется, и
+        после очистки FK оставались ВЫКЛЮЧЕННЫМИ до перезапуска — все
+        последующие ON DELETE CASCADE/SET NULL переставали работать."""
+        with self.conn:
+            for table in ("gallery", "recovery_codes", "recovery_phrases",
+                           "secret_questions", "personal_data", "linked_accounts",
+                           "accounts", "services", "folders"):
+                self.conn.execute(f"DELETE FROM {table}")
+        self._mark_dirty()
             
     def add_folder(self, name):
         """Добавление папки"""
@@ -565,36 +708,55 @@ class Database:
 
     def get_tree_structure(self, sort_mode="manual", descending=False):
         """Структура дерева. sort_mode: manual | name | created | pwd_due.
-        Верхний уровень: папки, затем сервисы вне папок, затем свободные аккаунты."""
-        result = []
+        Верхний уровень: папки, затем сервисы вне папок, затем свободные аккаунты.
+
+        Один запрос на тип (папки/сервисы/аккаунты) вместо запроса на каждый
+        контейнер — устранение N+1 (на больших базах было десятки SELECT'ов)."""
         order = self._container_order(sort_mode, descending)
+        if sort_mode == "created":
+            acc_order = "created_at " + ("DESC" if descending else "ASC")
+        else:
+            acc_order = "sort_order, account_name"
 
-        # Папки
         self.cursor.execute(f"SELECT * FROM folders ORDER BY {order}")
-        for folder in self.cursor.fetchall():
-            folder_data = {'type': 'folder', 'id': folder['id'], 'name': folder['name'], 'children': []}
-            self.cursor.execute(
-                f"SELECT * FROM services WHERE folder_id = ? ORDER BY {order}", (folder['id'],)
-            )
-            for service in self.cursor.fetchall():
-                folder_data['children'].append({
-                    'type': 'service', 'id': service['id'], 'name': service['name'],
-                    'children': self._fetch_accounts("service_id = ?", (service['id'],), sort_mode, descending),
-                })
-            result.append(folder_data)
+        folders = self.cursor.fetchall()
+        self.cursor.execute(f"SELECT * FROM services ORDER BY {order}")
+        services = self.cursor.fetchall()
+        # Аккаунты в корзине (deleted_at не пуст) в дереве не показываем.
+        self.cursor.execute(
+            f"SELECT * FROM accounts WHERE deleted_at IS NULL ORDER BY {acc_order}"
+        )
+        accounts = self.cursor.fetchall()
 
-        # Сервисы вне папок
-        self.cursor.execute(f"SELECT * FROM services WHERE folder_id IS NULL ORDER BY {order}")
-        for service in self.cursor.fetchall():
+        # Группируем в памяти, сохраняя порядок выборки (важно для режима
+        # "created" и базового sort_order, поверх которых _sorted_accounts
+        # доводит сортировку по имени/просрочке и поднимает избранные).
+        accounts_by_service = {}
+        for a in accounts:
+            accounts_by_service.setdefault(a["service_id"], []).append(a)
+        services_by_folder = {}
+        for s in services:
+            services_by_folder.setdefault(s["folder_id"], []).append(s)
+
+        def acc_nodes(service_id):
+            return self._sorted_accounts(
+                accounts_by_service.get(service_id, []), sort_mode, descending)
+
+        def service_node(s):
+            return {'type': 'service', 'id': s['id'], 'name': s['name'],
+                    'children': acc_nodes(s['id'])}
+
+        result = []
+        for folder in folders:
             result.append({
-                'type': 'service', 'id': service['id'], 'name': service['name'],
-                'children': self._fetch_accounts("service_id = ?", (service['id'],), sort_mode, descending),
+                'type': 'folder', 'id': folder['id'], 'name': folder['name'],
+                'children': [service_node(s)
+                             for s in services_by_folder.get(folder['id'], [])],
             })
-
-        # Свободные аккаунты (без сервиса)
-        for node in self._fetch_accounts("service_id IS NULL", (), sort_mode, descending):
+        for s in services_by_folder.get(None, []):     # сервисы вне папок
+            result.append(service_node(s))
+        for node in acc_nodes(None):                     # свободные аккаунты
             result.append(node)
-
         return result
 
     # ----- Переименование -----
@@ -769,6 +931,18 @@ class Database:
         self.cursor.execute("SELECT id, name FROM services ORDER BY name")
         return [{"id": r["id"], "name": r["name"]} for r in self.cursor.fetchall()]
 
+    def get_descendant_account_ids(self, node_type, node_id):
+        """id всех аккаунтов внутри папки/сервиса (для очистки кэша при удалении)."""
+        if node_type == "service":
+            self.cursor.execute("SELECT id FROM accounts WHERE service_id = ?", (node_id,))
+        elif node_type == "folder":
+            self.cursor.execute(
+                "SELECT id FROM accounts WHERE service_id IN "
+                "(SELECT id FROM services WHERE folder_id = ?)", (node_id,))
+        else:
+            return []
+        return [r["id"] for r in self.cursor.fetchall()]
+
     # ----- Связанные аккаунты (двусторонние) и пути -----
 
     def get_account_path(self, account_id):
@@ -831,12 +1005,16 @@ class Database:
                 "DELETE FROM linked_accounts WHERE account_id = ? OR linked_account_id = ?",
                 (account_id, account_id),
             )
+            seen = set()
             for t in target_ids:
-                if t != account_id:
-                    self.cursor.execute(
-                        "INSERT INTO linked_accounts (account_id, linked_account_id) VALUES (?, ?)",
-                        (account_id, t),
-                    )
+                # Пропускаем самоссылку и повторы во входном списке (дедуп).
+                if t == account_id or t in seen:
+                    continue
+                seen.add(t)
+                self.cursor.execute(
+                    "INSERT INTO linked_accounts (account_id, linked_account_id) VALUES (?, ?)",
+                    (account_id, t),
+                )
         self._mark_dirty()
 
     # ----- Загрузка/сохранение полной карточки аккаунта -----
@@ -977,8 +1155,16 @@ class Database:
         else:
             found = self._find_node(full, node_type, node_id)
             roots = [found] if found else []
+
+        # Bulk-предзагрузка вместо load_account()/get_links() на каждый аккаунт
+        # (устранение N+1: раньше экспорт 100 аккаунтов делал ~728 SELECT).
+        ids = []
         for root in roots:
-            self._attach_cards(root)
+            self._collect_account_ids(root, ids)
+        cards = self._load_cards_bulk(ids)
+        links = self._load_links_bulk(ids)
+        for root in roots:
+            self._attach_cards_preloaded(root, cards, links)
         return roots
 
     def _find_node(self, nodes, node_type, node_id):
@@ -991,33 +1177,156 @@ class Database:
                 return child
         return None
 
-    def _attach_cards(self, node):
-        """Вкладывает полную карточку и связи в узлы-аккаунты (рекурсивно)."""
+    def _collect_account_ids(self, node, out):
+        """Собирает id всех аккаунтов в ветке (рекурсивно)."""
         if node["type"] == "account":
-            node["card"] = self.load_account(node["id"])
-            node["links"] = self.get_links(node["id"])
+            out.append(node["id"])
         for child in node.get("children", []):
-            self._attach_cards(child)
+            self._collect_account_ids(child, out)
 
-# Тестовая функция
-def test_database():
-    db = Database("test_hranilka.db")
-    db.connect()
-    db.create_tables()
-    
-    # Добавляем тестовые данные
-    folder_id = db.add_folder("Личное")
-    service_id = db.add_service("Google", folder_id)
-    db.add_account(service_id, "personal@gmail.com", "user1", "pass123")
-    db.add_account(service_id, "work@gmail.com", "user2", "pass456")
-    
-    # Получаем структуру
-    structure = db.get_tree_structure()
-    print("\n📊 Структура базы данных:")
-    print(json.dumps(structure, indent=2, ensure_ascii=False))
-    
-    db.close()
-    print("\n✅ Тест базы данных завершен!")
+    def _attach_cards_preloaded(self, node, cards, links):
+        """Вкладывает предзагруженные карточку и связи в узлы-аккаунты."""
+        if node["type"] == "account":
+            node["card"] = cards.get(node["id"])
+            node["links"] = links.get(node["id"], [])
+        for child in node.get("children", []):
+            self._attach_cards_preloaded(child, cards, links)
 
-if __name__ == "__main__":
-    test_database()
+    @staticmethod
+    def _chunks(seq, size=900):
+        """Режет список на куски (предел числа параметров в SQLite ~999)."""
+        for i in range(0, len(seq), size):
+            yield seq[i:i + size]
+
+    def _load_cards_bulk(self, account_ids):
+        """{account_id: card} для набора аккаунтов. Card как в load_account()."""
+        cards = {}
+        if not account_ids:
+            return cards
+        field_keys = ("account_name", "url", "login", "password", "creation_date",
+                      "password_changed_date", "password_change_interval_days",
+                      "notes", "ip", "browser", "os", "extra_info")
+        personal_keys = ("first_name", "last_name", "middle_name", "birth_date", "address")
+
+        for chunk in self._chunks(account_ids):
+            ph = ",".join("?" * len(chunk))
+            self.cursor.execute(f"SELECT * FROM accounts WHERE id IN ({ph})", chunk)
+            for r in self.cursor.fetchall():
+                cards[r["id"]] = {
+                    "fields": {k: r[k] for k in field_keys},
+                    "personal": {k: None for k in personal_keys},
+                    "questions": [],
+                    "recovery": {"phrase": "", "device_id": ""},
+                    "codes": [],
+                    "gallery": [],
+                }
+
+        for chunk in self._chunks(account_ids):
+            ph = ",".join("?" * len(chunk))
+            # personal_data: берём первую строку на аккаунт (как fetchone в load_account)
+            self.cursor.execute(
+                f"SELECT * FROM personal_data WHERE account_id IN ({ph}) ORDER BY account_id, id", chunk)
+            seen_personal = set()
+            for r in self.cursor.fetchall():
+                aid = r["account_id"]
+                if aid in cards and aid not in seen_personal:
+                    cards[aid]["personal"] = {k: r[k] for k in personal_keys}
+                    seen_personal.add(aid)
+
+            self.cursor.execute(
+                f"SELECT account_id, question, answer FROM secret_questions "
+                f"WHERE account_id IN ({ph}) ORDER BY account_id, id", chunk)
+            for r in self.cursor.fetchall():
+                c = cards.get(r["account_id"])
+                if c is not None:
+                    c["questions"].append({"q": r["question"], "a": r["answer"]})
+
+            # recovery_phrases: первая на аккаунт (как LIMIT 1 в load_account)
+            self.cursor.execute(
+                f"SELECT account_id, phrase, device_id FROM recovery_phrases "
+                f"WHERE account_id IN ({ph}) ORDER BY account_id, id", chunk)
+            seen_rec = set()
+            for r in self.cursor.fetchall():
+                aid = r["account_id"]
+                if aid in cards and aid not in seen_rec:
+                    cards[aid]["recovery"] = {"phrase": r["phrase"] or "",
+                                              "device_id": r["device_id"] or ""}
+                    seen_rec.add(aid)
+
+            self.cursor.execute(
+                f"SELECT account_id, code FROM recovery_codes "
+                f"WHERE account_id IN ({ph}) ORDER BY account_id, id", chunk)
+            for r in self.cursor.fetchall():
+                c = cards.get(r["account_id"])
+                if c is not None:
+                    c["codes"].append(r["code"])
+
+            self.cursor.execute(
+                f"SELECT account_id, description, image_data FROM gallery "
+                f"WHERE account_id IN ({ph}) ORDER BY account_id, id", chunk)
+            for r in self.cursor.fetchall():
+                c = cards.get(r["account_id"])
+                if c is not None:
+                    c["gallery"].append({
+                        "desc": r["description"] or "",
+                        "data": bytes(r["image_data"]) if r["image_data"] is not None else None,
+                    })
+
+        return cards
+
+    def _name_maps(self):
+        """Карты имён для построения путей без запроса на каждый аккаунт."""
+        self.cursor.execute("SELECT id, account_name, service_id, deleted_at FROM accounts")
+        acc = {r["id"]: (r["account_name"], r["service_id"], r["deleted_at"])
+               for r in self.cursor.fetchall()}
+        self.cursor.execute("SELECT id, name, folder_id FROM services")
+        svc = {r["id"]: (r["name"], r["folder_id"]) for r in self.cursor.fetchall()}
+        self.cursor.execute("SELECT id, name FROM folders")
+        fld = {r["id"]: r["name"] for r in self.cursor.fetchall()}
+        return acc, svc, fld
+
+    @staticmethod
+    def _path_from_maps(account_id, acc, svc, fld):
+        a = acc.get(account_id)
+        if not a:
+            return ""
+        name, service_id, _deleted = a
+        parts = []
+        if service_id and service_id in svc:
+            sname, folder_id = svc[service_id]
+            if folder_id and folder_id in fld:
+                parts.append(fld[folder_id])
+            parts.append(sname)
+        parts.append(name)
+        return " / ".join(parts)
+
+    def _load_links_bulk(self, account_ids):
+        """{account_id: [{"id","name"(путь)}]} — связи в обе стороны, без
+        аккаунтов из корзины, отсортированные по пути (как get_links)."""
+        result = {i: [] for i in account_ids}
+        if not account_ids:
+            return result
+        acc, svc, fld = self._name_maps()
+        others = {i: set() for i in account_ids}
+        for chunk in self._chunks(account_ids):
+            ph = ",".join("?" * len(chunk))
+            self.cursor.execute(
+                f"SELECT account_id, linked_account_id FROM linked_accounts "
+                f"WHERE account_id IN ({ph}) OR linked_account_id IN ({ph})",
+                chunk + chunk)
+            for r in self.cursor.fetchall():
+                a, b = r["account_id"], r["linked_account_id"]
+                if a in others and b != a:
+                    others[a].add(b)
+                if b in others and a != b:
+                    others[b].add(a)
+        for i, oset in others.items():
+            rows = []
+            for o in oset:
+                a = acc.get(o)
+                if not a or a[2]:        # нет записи или аккаунт в корзине
+                    continue
+                rows.append({"id": o, "name": self._path_from_maps(o, acc, svc, fld)})
+            rows.sort(key=lambda r: r["name"].lower())
+            result[i] = rows
+        return result
