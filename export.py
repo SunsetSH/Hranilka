@@ -1,14 +1,14 @@
 """Экспорт данных Хранилки в человекочитаемые/переносимые форматы.
 
 Форматы: TXT (блокнот), CSV (таблица для Excel/переноса), HTML (оформленный
-документ с картинками), PDF (печать/архив). На вход — структура из
+документ с картинками), XLSX (книга Excel). На вход — структура из
 Database.export_subtree(): список узлов дерева, где у каждого узла
 type=='account' есть ключи 'card' (как load_account) и 'links'.
 
 ВНИМАНИЕ: экспорт сохраняет выбранные данные в ОТКРЫТОМ виде. Включение паролей
 и секретов управляется флагами Options.
 
-Модуль не зависит от Qt, кроме export_pdf (импорт Qt изолирован внутри функции).
+Модуль не зависит от Qt (XLSX тянет openpyxl, импорт изолирован внутри функции).
 """
 import base64
 import csv
@@ -23,7 +23,7 @@ PREFIX = {"folder": "[+] ", "service": "[o] ", "account": "(i) "}
 # Группы полей карточки (для галочек «Что включить»).
 # BASIC  — вкладки «База» + «Логин и пароль».
 # OTHER  — все остальные вкладки (ПД, секр. вопросы, фраза, 2FA, технические).
-# Галерея (картинки) выгружается отдельно (include_gallery) — только в HTML/PDF.
+# Галерея (картинки) выгружается отдельно (include_gallery) — только в HTML.
 GROUP_BASIC = [
     "Название аккаунта", "Адрес сайта (URL)", "Дата создания",
     "Логин", "Пароль", "Пароль сменён", "Сменять пароль каждые",
@@ -43,8 +43,8 @@ class Options:
 
     include_basic   — базовые данные, логин и пароль (вкладки «База»/«Логин»).
     include_other   — остальные поля (ПД, секр. вопросы, фраза, 2FA, технические).
-    include_gallery — галерея (изображения и описания); только HTML/PDF.
-    theme — словарь цветов/шрифта для HTML/PDF."""
+    include_gallery — галерея (изображения и описания); только HTML.
+    theme — словарь цветов/шрифта для HTML."""
 
     def __init__(self, include_basic=True, include_other=True,
                  include_gallery=True, title="Вся база", theme=None):
@@ -181,7 +181,7 @@ def export_txt(tree, opts, path):
         # (как часть «остальных полей»).
         gal = _gallery(node)
         if gal and opts.include_other:
-            lines.append(f"{indent}[Галерея: {len(gal)} изобр. — доступно в HTML/PDF]")
+            lines.append(f"{indent}[Галерея: {len(gal)} изобр. — доступно в HTML]")
         lines.append(f"{indent}{'-' * 40}")
 
     def walk(node, depth):
@@ -325,186 +325,6 @@ def export_html(tree, opts, path):
     Path(path).write_text(_html_document(tree, opts), encoding="utf-8")
 
 
-# ─── PDF ─────────────────────────────────────────────────────────────────────
-
-# Картинки в PDF: ограничиваем размер, чтобы на лист A4 помещалось ~5 штук
-# по высоте. Пропорции сохраняются (вписываем в MAXW × MAXH).
-_PDF_IMG_MAXW = 460
-_PDF_IMG_MAXH = 200
-
-
-def _pdf_html(tree, opts, render_img):
-    """HTML для PDF: компактные заголовки относительно кегля из настроек, без
-    фоновых заливок (фон рисуется вручную на всю страницу — см. export_pdf),
-    рамки таблицы цветом текста темы."""
-    th = opts.theme
-    font = th.get("font", "Consolas")
-    fs = int(th.get("font_size", 14))
-    text = th.get("text_color", "#000000")
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
-
-    def val(v):
-        return esc(_s(v)).replace("\n", "<br>")
-
-    p = []
-    p.append("<html><head><meta charset='utf-8'><style>")
-    p.append(f"body{{color:{text};font-family:'{font}',monospace;font-size:{fs}px;}}")
-    p.append(f"h1{{font-size:{fs + 2}px;margin:8px 0 2px 0;}}")
-    p.append(f"h2{{font-size:{fs + 1}px;margin:6px 0 2px 0;}}")
-    p.append(f"h3{{font-size:{fs}px;margin:6px 0 2px 0;}}")
-    p.append("table{border-collapse:collapse;width:100%;margin:2px 0 10px 0;}")
-    p.append(f"td{{border:1px solid {text};padding:3px 6px;vertical-align:top;}}")
-    p.append("td.l{font-weight:bold;}")
-    p.append("</style></head><body>")
-    p.append(f"<div style='font-size:{fs + 4}px;font-weight:bold;'>ХРАНИЛКА — ЭКСПОРТ</div>")
-    p.append(f"<div>{esc(opts.title)} &nbsp; {now}</div>")
-
-    def account(node):
-        p.append(f"<h3>(i) {esc(node['name'])}</h3><table>")
-        for label, value in _account_rows(node["card"], node.get("links"), opts):
-            p.append(f"<tr><td class='l'>{esc(label)}</td><td>{val(value)}</td></tr>")
-        p.append("</table>")
-        if opts.include_gallery:
-            for g in _gallery(node):
-                p.append(render_img(g["data"]))
-                desc = esc(_s(g.get("desc")))
-                if desc:
-                    p.append(f"<div><i>{desc}</i></div>")
-
-    def walk(node):
-        t = node["type"]
-        if t == "folder":
-            p.append(f"<h1>[+] {esc(node['name'])}</h1>")
-        elif t == "service":
-            p.append(f"<h2>[o] {esc(node['name'])}</h2>")
-        elif t == "account":
-            account(node)
-        for child in node.get("children", []):
-            walk(child)
-
-    for node in tree:
-        walk(node)
-    p.append("</body></html>")
-    return "".join(p)
-
-
-def export_pdf(tree, opts, path):
-    """PDF из того же HTML, что и export_html (отличная вёрстка), отрисованный
-    движком Chromium (QtWebEngine) на страницы A4 — так PDF визуально совпадает
-    с HTML-экспортом. Если QtWebEngine недоступен, откатываемся на отрисовку
-    через QTextDocument (упрощённая вёрстка)."""
-    try:
-        _export_pdf_webengine(tree, opts, path)
-    except Exception:
-        _export_pdf_textdoc(tree, opts, path)
-
-
-def _export_pdf_webengine(tree, opts, path):
-    from PySide6.QtWebEngineCore import QWebEnginePage
-    from PySide6.QtCore import QEventLoop, QMarginsF, QUrl, QTimer
-    from PySide6.QtGui import QPageLayout, QPageSize
-    import tempfile
-    import os as _os
-
-    html = _html_document(tree, opts)   # тот же HTML, что и в export_html
-    # Грузим из временного файла (обходит лимит setHtml ~2 МБ и корректно
-    # подхватывает встроенные картинки data:base64).
-    tmp = tempfile.NamedTemporaryFile(
-        suffix=".html", delete=False, mode="w", encoding="utf-8")
-    tmp.write(html)
-    tmp.close()
-
-    page = QWebEnginePage()
-    loop = QEventLoop()
-    state = {"ok": False, "loaded": False}
-
-    def on_pdf(_fp, ok):
-        state["ok"] = ok
-        loop.quit()
-
-    def on_load(ok):
-        state["loaded"] = ok
-        if not ok:
-            loop.quit()
-            return
-        layout = QPageLayout(
-            QPageSize(QPageSize.PageSizeId.A4),
-            QPageLayout.Orientation.Portrait,
-            QMarginsF(10, 10, 10, 10),          # поля в мм
-        )
-        page.printToPdf(str(path), layout)
-
-    page.loadFinished.connect(on_load)
-    page.pdfPrintingFinished.connect(on_pdf)
-    page.load(QUrl.fromLocalFile(tmp.name))
-    QTimer.singleShot(60000, loop.quit)         # страховочный таймаут
-    try:
-        loop.exec()
-    finally:
-        try:
-            _os.unlink(tmp.name)
-        except OSError:
-            pass
-    if not state["ok"]:
-        raise RuntimeError("QtWebEngine не смог сформировать PDF")
-
-
-def _export_pdf_textdoc(tree, opts, path):
-    # Запасной способ (без QtWebEngine). Импорт Qt изолирован здесь.
-    from PySide6.QtGui import (QTextDocument, QPdfWriter, QPageSize, QImage,
-                               QFont, QPainter, QColor)
-    from PySide6.QtCore import QUrl, QMarginsF, QSizeF, QRectF
-
-    th = opts.theme
-    main_bg = th.get("main_bg_color", "#F0F0F0")
-
-    # 96 DPI + нулевые поля страницы: текст нормального кегля (а не крошечного,
-    # как при дефолтных 1200 DPI), а фон темы заполняет весь лист. Отступ от краёв
-    # даёт documentMargin, поэтому белых полос по краям не остаётся.
-    writer = QPdfWriter(str(path))
-    writer.setPageSize(QPageSize(QPageSize.PageSizeId.A4))
-    writer.setResolution(96)
-    writer.setPageMargins(QMarginsF(0, 0, 0, 0))
-    page_w, page_h = writer.width(), writer.height()
-
-    doc = QTextDocument()
-    doc.setDefaultFont(QFont(th.get("font", "Consolas"), int(th.get("font_size", 14))))
-    doc.setDocumentMargin(24)
-    doc.setPageSize(QSizeF(page_w, page_h))
-
-    counter = {"n": 0}
-
-    def render_img(data):
-        url = f"mem://img{counter['n']}"
-        counter["n"] += 1
-        img = QImage()
-        img.loadFromData(data)
-        doc.addResource(QTextDocument.ResourceType.ImageResource, QUrl(url), img)
-        w = img.width() or 1
-        h = img.height() or 1
-        scale = min(_PDF_IMG_MAXW / w, _PDF_IMG_MAXH / h, 1.0)
-        nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
-        return f"<img src='{url}' width='{nw}' height='{nh}'>"
-
-    doc.setHtml(_pdf_html(tree, opts, render_img=render_img))
-
-    # Рисуем сами: на каждой странице сначала заливаем фон темы, затем кладём
-    # соответствующий срез документа. Это даёт сплошной фон на всех страницах.
-    painter = QPainter(writer)
-    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-    pages = max(1, doc.pageCount())
-    for i in range(pages):
-        if i > 0:
-            writer.newPage()
-        painter.fillRect(QRectF(0, 0, page_w, page_h), QColor(main_bg))
-        painter.save()
-        painter.translate(0, -i * page_h)
-        doc.drawContents(painter, QRectF(0, i * page_h, page_w, page_h))
-        painter.restore()
-    painter.end()
-
-
 # ─── XLSX ────────────────────────────────────────────────────────────────────
 
 # Ширина столбца XLSX в символах ≈ (px - 5) / 7. 400 px ≈ 56 символов.
@@ -565,5 +385,4 @@ FORMATS = {
     "csv": (export_csv, ".csv", "CSV таблица (*.csv)"),
     "xlsx": (export_xlsx, ".xlsx", "Книга Excel (*.xlsx)"),
     "html": (export_html, ".html", "HTML документ (*.html)"),
-    "pdf": (export_pdf, ".pdf", "PDF документ (*.pdf)"),
 }

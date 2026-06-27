@@ -1,12 +1,48 @@
 import json
 import logging
 import os
+import re
 
 from paths import BASE_DIR
 
 logger = logging.getLogger(__name__)
 
 CONFIG_FILE = BASE_DIR / "config.json"
+
+_HEX_COLOR_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
+
+# Явная схема валидации значений config.json (M3-04). config.json редактируется
+# пользователем — некорректный тип/диапазон раньше попадал прямо в таймеры,
+# арифметику UI и QByteArray.fromHex и мог уронить запуск. Для каждого
+# потребляемого ключа задаём точные правила; неизвестные ключи игнорируются.
+_COLOR_KEYS = {"text_color", "tree_bg_color", "main_bg_color"}
+# key -> (min, max) для целых значений
+_INT_RANGES = {
+    "font_size": (6, 96),
+    "clipboard_clear_secs": (0, 86400),     # 0..24 ч
+    "idle_lock_mins": (0, 10080),           # 0..7 сут
+    "backup_keep_count": (0, 10000),
+}
+# key -> допустимое множество значений
+_ENUMS = {
+    "argon2_preset": {"fast", "balanced", "paranoid"},
+    "sort_mode": {"manual", "name", "created", "pwd_due"},
+}
+
+
+def _coerce_bool(value, default):
+    """Строгое приведение к bool: bool('false') больше НЕ даёт True (M3-04)."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in ("true", "1", "yes", "on"):
+            return True
+        if v in ("false", "0", "no", "off", ""):
+            return False
+    return default
 
 RETRO_THEMES = {
     "MS-DOS": {"text": "#00FF00", "tree_bg": "#000000", "main_bg": "#000000"},
@@ -41,6 +77,12 @@ class Config:
             "encryption_enabled": False,
             "argon2_preset": "balanced",
             "shortcuts": {},
+            # Ранее «потреблялись», но отсутствовали в defaults и потому
+            # проходили БЕЗ валидации (M3-04). Теперь известны и проверяются.
+            "font_filter_mono": True,
+            "sort_mode": "manual",
+            "sort_desc": False,
+            "_window_geometry": "",        # hex-строка QByteArray (или пусто)
         }
         self.load()
     
@@ -63,33 +105,45 @@ class Config:
         self.config.update(self._sanitize(raw))
 
     def _sanitize(self, raw):
-        """Приводит значения из файла к типам значений по умолчанию.
+        """Валидирует значения из файла по явной схеме (типы, enum, диапазоны).
 
-        config.json — редактируемый пользователем файл; некорректный тип (строка
-        вместо числа и т. п.) раньше попадал прямо в таймеры/арифметику UI и мог
-        уронить запуск. Для известных ключей приводим тип к дефолтному (числа —
-        с отсечением отрицательных), при неудаче берём дефолт. Неизвестные ключи
-        (служебные, напр. _window_geometry) сохраняем как есть."""
+        Известные ключи проверяются и при несоответствии заменяются дефолтом;
+        неизвестные ключи ИГНОРИРУЮТСЯ (не попадают в конфиг) — так мусор/опечатки
+        в config.json не доходят до кода (M3-04)."""
         clean = {}
         for key, value in raw.items():
             if key not in self.config:
-                clean[key] = value           # служебные/неизвестные — без изменений
-                continue
-            default = self.config[key]
-            if isinstance(default, bool):    # bool раньше int (bool — подтип int)
-                clean[key] = bool(value)
-            elif isinstance(default, int):
-                try:
-                    clean[key] = max(0, int(value))
-                except (TypeError, ValueError):
-                    clean[key] = default
-            elif isinstance(default, str):
-                clean[key] = value if isinstance(value, str) else default
-            elif isinstance(default, dict):
-                clean[key] = value if isinstance(value, dict) else default
-            else:
-                clean[key] = value
+                continue                      # неизвестные ключи отбрасываем
+            clean[key] = self._coerce(key, value)
         return clean
+
+    def _coerce(self, key, value):
+        """Приводит одно значение к допустимому для ключа по схеме."""
+        default = self.config[key]
+        if key in _COLOR_KEYS:
+            return value if isinstance(value, str) and _HEX_COLOR_RE.match(value) else default
+        if key == "selected_theme":
+            return value if value in RETRO_THEMES else default
+        if key in _ENUMS:
+            return value if value in _ENUMS[key] else default
+        if key in _INT_RANGES:
+            lo, hi = _INT_RANGES[key]
+            try:
+                return max(lo, min(hi, int(value)))
+            except (TypeError, ValueError):
+                return default
+        if isinstance(default, bool):         # до int: bool — подтип int
+            return _coerce_bool(value, default)
+        if isinstance(default, int):
+            try:
+                return max(0, int(value))
+            except (TypeError, ValueError):
+                return default
+        if isinstance(default, str):
+            return value if isinstance(value, str) else default
+        if isinstance(default, dict):
+            return value if isinstance(value, dict) else default
+        return value
     
     def save(self):
         # Атомарная запись: пишем во временный файл и подменяем им основной,

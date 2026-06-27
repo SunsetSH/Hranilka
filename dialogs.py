@@ -644,7 +644,7 @@ class SettingsDialog(ThemedDialog):
         exp_group = QGroupBox("Экспорт")
         el = QVBoxLayout(exp_group)
         el.addWidget(QLabel(
-            "Выгрузка всей базы в читаемый формат (TXT/CSV/XLSX/HTML/PDF).\n"
+            "Выгрузка всей базы в читаемый формат (TXT/CSV/XLSX/HTML).\n"
             "Экспорт отдельной папки/сервиса/аккаунта — через ПКМ в дереве."))
         export_btn = QPushButton("Экспортировать всё…")
         export_btn.clicked.connect(self._do_export_all)
@@ -951,10 +951,12 @@ class SettingsDialog(ThemedDialog):
         if not folder:
             themed_info(self.config, self, "Ошибка", "Укажите папку для бэкапов.")
             return
-        # Бэкап читает файл с диска — сбросить отложенные изменения (шифр. режим).
-        if self._db is not None:
-            self._db.flush()
         try:
+            # Бэкап читает файл с диска — сбросить отложенные изменения
+            # (шифр. режим). flush внутри try (M3-02): его ошибка теперь тоже
+            # показывается пользователю, а не всплывает необработанной.
+            if self._db is not None:
+                self._db.flush()
             dest = bk.create_backup(self._db_path, folder, self.backup_keep_spin.value())
             self._refresh_backup_list()
             themed_info(self.config, self, "Бэкап создан", f"Файл сохранён:\n{dest.name}")
@@ -1372,7 +1374,7 @@ class UnlockDialog(ThemedDialog):
 
 
 def theme_dict(config):
-    """Словарь цветов/шрифта из настроек — для оформления HTML/PDF-экспорта."""
+    """Словарь цветов/шрифта из настроек — для оформления HTML-экспорта."""
     return {
         "font": config.get("font", "Consolas"),
         "font_size": config.get("font_size", 14),
@@ -1383,7 +1385,7 @@ def theme_dict(config):
 
 
 class ExportDialog(ThemedDialog):
-    """Окно экспорта поддерева/всей базы в TXT/CSV/HTML/PDF.
+    """Окно экспорта поддерева/всей базы в TXT/CSV/HTML/XLSX.
 
     tree — структура из Database.export_subtree(); title — что экспортируется
     (путь узла или «Вся база»)."""
@@ -1406,7 +1408,6 @@ class ExportDialog(ThemedDialog):
         self._fmt_btns = QButtonGroup(self)
         formats = [
             ("html", "HTML — оформленный документ с картинками"),
-            ("pdf", "PDF — для печати в формате А4"),
             ("xlsx", "XLSX — таблица Excel"),
             ("csv", "CSV — таблица (текстовая, для переноса)"),
             ("txt", "TXT — простой текст (блокнот)"),
@@ -1458,9 +1459,9 @@ class ExportDialog(ThemedDialog):
         return self._fmt_btns.checkedButton().property("fmt")
 
     def _on_format_changed(self, *_):
-        # Картинки помещаются только в HTML/PDF. Для TXT/CSV галочка галереи
-        # становится неактивной (приглушённой) с пояснением.
-        supports_img = self._current_format() in ("html", "pdf")
+        # Картинки помещаются только в HTML. Для остальных форматов галочка
+        # галереи становится неактивной (приглушённой) с пояснением.
+        supports_img = self._current_format() in ("html",)
         self._chk_gallery.setEnabled(supports_img)
         if supports_img:
             self._chk_gallery.setText("Включить галерею (изображения и их описания)")

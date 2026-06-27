@@ -243,16 +243,25 @@ class MainWindow(QMainWindow):
             had_changes = bool(unsaved) or self._any_db_changes
             if had_changes:
                 # Бэкап копирует файл с диска — сначала сбросить отложенные
-                # изменения (актуально для шифрованного режима).
-                self.db.flush()
+                # изменения (актуально для шифрованного режима). Ошибку flush
+                # здесь не глотаем «вне try» (M3-02): если сбросить не удалось,
+                # бэкап не делаем (он был бы устаревшим), а сам отказ сохранения
+                # будет показан ниже в self.db.close() с диалогом.
+                flushed = True
                 try:
-                    bk.create_backup(
-                        self.db.db_path,
-                        self.config.get("backup_folder"),
-                        self.config.get("backup_keep_count", 5),
-                    )
+                    self.db.flush()
                 except Exception as e:
-                    logging.warning("Авто-бэкап не удался: %s", e)
+                    flushed = False
+                    logging.warning("Не удалось сбросить изменения перед бэкапом: %s", e)
+                if flushed:
+                    try:
+                        bk.create_backup(
+                            self.db.db_path,
+                            self.config.get("backup_folder"),
+                            self.config.get("backup_keep_count", 5),
+                        )
+                    except Exception as e:
+                        logging.warning("Авто-бэкап не удался: %s", e)
 
         # Сохранение геометрии окна
         if self.config.get("remember_geometry"):
@@ -582,9 +591,9 @@ class MainWindow(QMainWindow):
             QTreeWidget::item {{ padding: 4px; border: 1px solid transparent; }}
             QTreeWidget::item:hover {{ background-color: {main_bg}; }}
             QTreeWidget::item:selected {{ background-color: {text_color}; color: {tree_bg}; }}
-        """ + self._branch_arrow_css(text_color, tree_bg))
+        """ + self._branch_arrow_css(text_color, tree_bg, main_bg))
 
-    def _branch_arrow_css(self, text_color, tree_bg):
+    def _branch_arrow_css(self, text_color, tree_bg, main_bg):
         """Стрелки сворачивания/разворачивания, перекрашенные под тему.
 
         Стандартные стрелки рисуются стилем ОС фиксированным цветом и теряются
@@ -618,7 +627,13 @@ class MainWindow(QMainWindow):
         op = make("open_n", "open", text_color)
         cs = make("closed_s", "closed", tree_bg)
         ops = make("open_s", "open", tree_bg)
+        # Заливка области стрелки берётся из настроек программы (а не из темы ОС):
+        # обычное состояние — фон дерева, выделение — цвет текста (как у строки,
+        # где фон инвертируется), наведение — фон окна.
         return f"""
+            QTreeWidget::branch {{ background-color: {tree_bg}; }}
+            QTreeWidget::branch:hover {{ background-color: {main_bg}; }}
+            QTreeWidget::branch:selected {{ background-color: {text_color}; }}
             QTreeWidget::branch:has-children:closed {{ image: url("{cn}"); }}
             QTreeWidget::branch:has-children:open {{ image: url("{op}"); }}
             QTreeWidget::branch:has-children:closed:selected {{ image: url("{cs}"); }}
@@ -651,9 +666,16 @@ class MainWindow(QMainWindow):
                 self.restoreGeometry(QByteArray.fromHex(bytes(geo_hex, "ascii")))
 
     def populate_tree(self):
-        self.tree.clear()
-        for node in self.db.get_tree_structure(self.sort_mode, self.sort_desc):
-            self._add_tree_node(self.tree, node)
+        # Отключаем перерисовку на время массовой вставки: дерево не
+        # перерисовывается на каждый добавленный узел, а один раз в конце —
+        # заметно быстрее на больших базах (ускорение запуска).
+        self.tree.setUpdatesEnabled(False)
+        try:
+            self.tree.clear()
+            for node in self.db.get_tree_structure(self.sort_mode, self.sort_desc):
+                self._add_tree_node(self.tree, node)
+        finally:
+            self.tree.setUpdatesEnabled(True)
         self._apply_filter()
 
     def _add_tree_node(self, parent, node):
@@ -1378,7 +1400,6 @@ class MainWindow(QMainWindow):
         пользователь выбрал «Выход». Источник истины о шифровании — сигнатура
         файла."""
         import crypto_store as cs
-        import shutil
         from dialogs import UnlockDialog
         while True:
             if not cs.is_encrypted_file(self.db.db_path):
@@ -1406,9 +1427,12 @@ class MainWindow(QMainWindow):
 
             if dlg.recovery_action == "restore" and dlg.restore_path:
                 self._archive_db_file()
+                # Через restore_backup (а не прямой copy2): кандидат проверяется
+                # до и после замены, есть откат при сбое (H3-02). Текущий файл
+                # уже отложен (_archive_db_file), поэтому терять нечего.
                 try:
-                    shutil.copy2(dlg.restore_path, self.db.db_path)
-                except OSError as e:
+                    bk.restore_backup(dlg.restore_path, self.db.db_path)
+                except Exception as e:
                     theme.themed_info(self.config, parent, "Ошибка",
                                       f"Не удалось восстановить бэкап:\n{e}")
                 # Повторяем цикл: восстановленный файл может быть как обычным,

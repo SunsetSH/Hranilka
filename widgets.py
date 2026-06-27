@@ -226,7 +226,8 @@ class SecretQuestionsWidget(QWidget):
         self.layout.setContentsMargins(0, 0, 0, 0)
         self.layout.setSpacing(10)
         self.rows = []
-        
+        self._editable = False
+
         self.add_btn = QPushButton("+ ДОБАВИТЬ ВОПРОС")
         self.add_btn.clicked.connect(lambda: self.add_row())
         self.layout.addWidget(self.add_btn)
@@ -250,11 +251,14 @@ class SecretQuestionsWidget(QWidget):
         
         q_edit = QLineEdit(str(q))
         q_edit.setPlaceholderText("Секретный вопрос...")
+        q_edit.setReadOnly(not self._editable)
         a_edit = QLineEdit(str(a))
         a_edit.setPlaceholderText("Ответ...")
-        
+        a_edit.setReadOnly(not self._editable)
+
         del_btn = QPushButton("[X]")
         del_btn.setFixedWidth(40)
+        del_btn.setVisible(self._editable)
         del_btn.clicked.connect(lambda: self.remove_row(row_widget))
         
         h_layout.addWidget(q_edit)
@@ -290,9 +294,12 @@ class SecretQuestionsWidget(QWidget):
         for item in data: self.add_row(item.get("q", ""), item.get("a", ""))
         self._update_empty()
     def set_editable(self, editable):
+        self._editable = editable
         self.add_btn.setVisible(editable)
-        for row_widget in [q.parent() for q, a in self.rows]:
-            del_btn = row_widget.layout().itemAt(2).widget()
+        for q, a in self.rows:
+            q.setReadOnly(not editable)
+            a.setReadOnly(not editable)
+            del_btn = q.parent().layout().itemAt(2).widget()
             del_btn.setVisible(editable)
 
 class CodeListWidget(QWidget):
@@ -506,7 +513,10 @@ class GalleryWidget(QWidget):
         thumb_label.setStyleSheet("background-color: #333;")
         thumb_label.setPixmap(pixmap.scaled(100, 100, Qt.KeepAspectRatio, Qt.SmoothTransformation))
         thumb_label.setCursor(Qt.PointingHandCursor)
-        thumb_label.mousePressEvent = lambda e, b=image_bytes: self.show_full_image(b)
+        # ЛКМ — увеличенный просмотр; ПКМ оставляем контекстному меню (экспорт),
+        # иначе правый клик тоже открывал бы просмотр и перекрывал меню.
+        thumb_label.mousePressEvent = lambda e, b=image_bytes: (
+            self.show_full_image(b) if e.button() == Qt.LeftButton else None)
         # ПКМ по миниатюре — экспорт изображения (в файл / в буфер обмена).
         thumb_label.setContextMenuPolicy(Qt.CustomContextMenu)
         thumb_label.customContextMenuRequested.connect(

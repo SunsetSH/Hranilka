@@ -19,7 +19,10 @@ def _days_until_password_change(changed_date_str, interval_days):
 
 # Версия схемы базы данных. Увеличивается при изменении структуры таблиц,
 # чтобы _migrate() мог обновить существующие документы пользователей.
-SCHEMA_VERSION = 5
+# v6: единоразовый прогон полной нормализации (дедуп + UNIQUE-индексы) для
+#     старых баз и переход на быстрый старт (см. create_tables: если версия
+#     актуальна — миграция/дедуп пропускаются).
+SCHEMA_VERSION = 6
 
 
 class FutureSchemaError(Exception):
@@ -101,12 +104,22 @@ class Database:
             return None
 
     def _check_no_external_change(self):
-        """VaultConflictError, если файл на диске изменили извне с момента
-        открытия/последней нашей записи."""
-        if self._disk_revision is None:
-            return  # ещё не сохраняли (новый файл) — конфликта быть не может
+        """VaultConflictError, если состояние файла на диске разошлось с тем,
+        что мы видели при открытии/последней записи — включая переходы
+        «существует ↔ отсутствует» (M3-03):
+
+          * файла не было, а теперь появился чужой — перезапись затёрла бы его;
+          * файл был, а теперь удалён извне — нельзя молча создавать заново;
+          * содержимое (mtime/размер) изменилось — кто-то писал параллельно."""
         current = self._stat_revision()
-        if current is not None and current != self._disk_revision:
+        if self._disk_revision is None:
+            # На момент открытия файла не существовало. Любой появившийся файл —
+            # внешний; молча перезаписать его нельзя.
+            if current is not None:
+                raise VaultConflictError()
+            return
+        # Файл существовал. Его удаление или изменение извне — конфликт.
+        if current != self._disk_revision:
             raise VaultConflictError()
 
     def _write_container(self, container: bytes, force: bool = False):
@@ -290,7 +303,23 @@ class Database:
 
     def create_tables(self):
         """Создание всех таблиц согласно ТЗ"""
-        
+
+        # H3-03 + ускорение запуска: версию схемы определяем СНАЧАЛА и read-only,
+        # до любого DDL/DML/commit. (1) Базу более новой версии нельзя изменять
+        # перед отказом в открытии; (2) актуальную базу не нужно повторно
+        # нормализовать/мигрировать — это заметно сокращает работу при старте.
+        existing = self._table_names()
+        if "app_meta" in existing:
+            _ver = self.get_schema_version()
+        elif existing:
+            _ver = 0            # старая база без app_meta — нужна миграция
+        else:
+            _ver = None         # пустая новая база — создаём с нуля
+        if _ver is not None and _ver > SCHEMA_VERSION:
+            raise FutureSchemaError(_ver, SCHEMA_VERSION)
+        if _ver == SCHEMA_VERSION:
+            return              # схема актуальна — делать нечего
+
         # Таблица папок
         self.cursor.execute("""
             CREATE TABLE IF NOT EXISTS folders (
@@ -973,10 +1002,13 @@ class Database:
 
     def get_all_accounts(self):
         """Все аккаунты с путями (для выбора в диалоге связывания).
-        Аккаунты в корзине исключаются."""
-        self.cursor.execute("SELECT id FROM accounts WHERE deleted_at IS NULL")
-        rows = [{"id": r["id"], "name": self.get_account_path(r["id"])}
-                for r in self.cursor.fetchall()]
+        Аккаунты в корзине исключаются.
+
+        Пути строятся из заранее загруженных карт имён (3 запроса всего), а не
+        вызовом get_account_path() на каждый аккаунт (было N+1: до 1+3N запросов)."""
+        acc, svc, fld = self._name_maps()
+        rows = [{"id": aid, "name": self._path_from_maps(aid, acc, svc, fld)}
+                for aid, (_name, _service_id, deleted) in acc.items() if not deleted]
         rows.sort(key=lambda r: r["name"].lower())
         return rows
 
