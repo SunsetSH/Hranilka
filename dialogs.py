@@ -43,6 +43,7 @@ class SettingsDialog(ThemedDialog):
         self.setMinimumSize(720, 400)
         self._db_path = "hranilka.db"
         self._db = None
+        self._run_vault_op = self._default_vault_op
         self._delete_all_confirmed = False
         self._restore_done = False
         # Снимок цветов/шрифта для восстановления при отмене / откате
@@ -64,6 +65,24 @@ class SettingsDialog(ThemedDialog):
         self._db = db
         if hasattr(self, "_refresh_encryption_page"):
             self._refresh_encryption_page()
+
+    def set_vault_runner(self, runner):
+        """Внедрить гейт монопольного доступа к файлу-БД из главного окна.
+
+        Привилегированные операции (вкл/выкл шифрования, смена пароля,
+        бэкап/восстановление) пишут файл синхронно, пока крутится event-loop
+        модального диалога. Через гейт они выполняются, когда фоновый воркер
+        заведомо не пишет (H3-01). runner(fn) -> (ok, result_or_error)."""
+        self._run_vault_op = runner
+
+    @staticmethod
+    def _default_vault_op(fn):
+        """Запасной runner, если гейт не внедрён (диалог вне главного окна):
+        просто выполняет операцию, приводя сигнатуру к (ok, result_or_error)."""
+        try:
+            return True, fn()
+        except Exception as e:                       # noqa: BLE001
+            return False, str(e)
 
     def _setup_ui(self):
         self._tabs = WrappingTabWidget(self)
@@ -299,11 +318,11 @@ class SettingsDialog(ThemedDialog):
         if not pw:
             return
         preset = self._current_preset()
-        try:
-            recovery = self._db.enable_encryption(pw, preset)
-        except Exception as e:
-            themed_info(self.config, self, "Ошибка", f"Не удалось включить шифрование:\n{e}")
+        ok, res = self._run_vault_op(lambda: self._db.enable_encryption(pw, preset))
+        if not ok:
+            themed_info(self.config, self, "Ошибка", f"Не удалось включить шифрование:\n{res}")
             return
+        recovery = res
         self.config.set("encryption_enabled", True)
         self.config.set("argon2_preset", preset)
         self.config.save()
@@ -325,10 +344,9 @@ class SettingsDialog(ThemedDialog):
         if not themed_confirm(self.config, self, "Отключение шифрования",
                               "База будет сохранена в открытом (незашифрованном) виде. Продолжить?"):
             return
-        try:
-            self._db.disable_encryption()
-        except Exception as e:
-            themed_info(self.config, self, "Ошибка", f"Не удалось отключить шифрование:\n{e}")
+        ok, res = self._run_vault_op(self._db.disable_encryption)
+        if not ok:
+            themed_info(self.config, self, "Ошибка", f"Не удалось отключить шифрование:\n{res}")
             return
         self.config.set("encryption_enabled", False)
         self.config.save()
@@ -349,10 +367,9 @@ class SettingsDialog(ThemedDialog):
         new = self._ask_new_password("Новый мастер-пароль")
         if not new:
             return
-        try:
-            self._db.change_master_password(new)
-        except Exception as e:
-            themed_info(self.config, self, "Ошибка", f"Не удалось сменить пароль:\n{e}")
+        ok, res = self._run_vault_op(lambda: self._db.change_master_password(new))
+        if not ok:
+            themed_info(self.config, self, "Ошибка", f"Не удалось сменить пароль:\n{res}")
             return
         themed_info(self.config, self, "Готово", "Мастер-пароль изменён.")
 
@@ -370,12 +387,11 @@ class SettingsDialog(ThemedDialog):
         if not themed_confirm(self.config, self, "Обновление recovery-кода",
                               "Старый recovery-код перестанет действовать. Продолжить?"):
             return
-        try:
-            recovery = self._db.regenerate_recovery_code()
-        except Exception as e:
-            themed_info(self.config, self, "Ошибка", f"Не удалось обновить код:\n{e}")
+        ok, res = self._run_vault_op(self._db.regenerate_recovery_code)
+        if not ok:
+            themed_info(self.config, self, "Ошибка", f"Не удалось обновить код:\n{res}")
             return
-        self._show_recovery(recovery)
+        self._show_recovery(res)
 
     def _ask_secret(self, title: str, prompt: str):
         """Ввод мастер-пароля ИЛИ recovery-кода. Возвращает (secret, is_recovery)
@@ -951,17 +967,16 @@ class SettingsDialog(ThemedDialog):
         if not folder:
             themed_info(self.config, self, "Ошибка", "Укажите папку для бэкапов.")
             return
-        try:
-            # Бэкап читает файл с диска — сбросить отложенные изменения
-            # (шифр. режим). flush внутри try (M3-02): его ошибка теперь тоже
-            # показывается пользователю, а не всплывает необработанной.
-            if self._db is not None:
-                self._db.flush()
-            dest = bk.create_backup(self._db_path, folder, self.backup_keep_spin.value())
-            self._refresh_backup_list()
-            themed_info(self.config, self, "Бэкап создан", f"Файл сохранён:\n{dest.name}")
-        except Exception as e:
-            themed_info(self.config, self, "Ошибка", f"Не удалось создать бэкап:\n{e}")
+        # Бэкап читает файл с диска. Через гейт: в шифр. режиме отложенный снимок
+        # сбрасывается и воркер квисцируется ДО чтения файла, поэтому копия
+        # содержит свежие данные и не конкурирует с фоновой записью (H3-01).
+        ok, res = self._run_vault_op(
+            lambda: bk.create_backup(self._db_path, folder, self.backup_keep_spin.value()))
+        if not ok:
+            themed_info(self.config, self, "Ошибка", f"Не удалось создать бэкап:\n{res}")
+            return
+        self._refresh_backup_list()
+        themed_info(self.config, self, "Бэкап создан", f"Файл сохранён:\n{res.name}")
 
     def _do_restore(self):
         item = self.backup_list.currentItem()
@@ -975,15 +990,17 @@ class SettingsDialog(ThemedDialog):
             f"Восстановить из:\n{_P(path).name}\n\nТекущие данные будут заменены. Продолжить?"
         ):
             return
-        try:
-            bk.restore_backup(path, self._db_path)
-            self._restore_done = True
-            # Перечитать БД в главном окне сразу, не закрывая «Настройки».
-            self.restore_requested.emit()
-            themed_info(self.config, self, "Восстановление",
-                        "База данных восстановлена из бэкапа.")
-        except Exception as e:
-            themed_info(self.config, self, "Ошибка", f"Не удалось восстановить:\n{e}")
+        # Восстановление заменяет файл-БД. Через гейт: фоновый воркер квисцирован
+        # и не перезапишет восстановленный файл устаревшим снимком (H3-01).
+        ok, res = self._run_vault_op(lambda: bk.restore_backup(path, self._db_path))
+        if not ok:
+            themed_info(self.config, self, "Ошибка", f"Не удалось восстановить:\n{res}")
+            return
+        self._restore_done = True
+        # Перечитать БД в главном окне сразу, не закрывая «Настройки».
+        self.restore_requested.emit()
+        themed_info(self.config, self, "Восстановление",
+                    "База данных восстановлена из бэкапа.")
 
     def _delete_all(self):
         if not themed_confirm(

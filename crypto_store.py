@@ -217,8 +217,8 @@ def unlock(container: bytes, secret: str, is_recovery: bool = False):
     return db_bytes, dek, header
 
 
-def change_password(container: bytes, dek: bytes, header: dict,
-                    new_password: str, preset: str = None):
+def change_password(container, dek: bytes, header: dict,
+                    new_password: str, preset: str | None = None):
     """Перезавернуть DEK новым паролем (данные не перешифровываются повторно
     в смысле KDF: меняется только wrap_pw). Возвращает новый header.
 

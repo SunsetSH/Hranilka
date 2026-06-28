@@ -414,6 +414,9 @@ class GalleryWidget(QWidget):
         # Каждый элемент: (image_bytes, desc_edit, del_btn, item_widget)
         self.items = []
         self._editable = False
+        # Провайдер суммарного объёма галереи прочих аккаунтов (см.
+        # set_size_context); None — лимит общего объёма не проверяется.
+        self._other_bytes_provider = None
 
     def _read_file_bytes(self, path):
         try:
@@ -432,15 +435,59 @@ class GalleryWidget(QWidget):
         buf.close()
         return bytes(ba)
 
-    # Лимиты для добавляемых изображений (M-13): защищают от исчерпания
+    # Лимиты для добавляемых изображений (M3-05): защищают от исчерпания
     # памяти/диска и «decompression bomb» (картинка с огромным разрешением).
-    _MAX_IMAGE_BYTES = 15 * 1024 * 1024     # 15 МБ на файл
-    _MAX_IMAGE_PIXELS = 50 * 1_000_000      # 50 Мп после декодирования
+    _MAX_IMAGE_BYTES = 15 * 1024 * 1024         # 15 МБ на файл
+    _MAX_IMAGE_PIXELS = 50 * 1_000_000          # 50 Мп (по метаданным, до декодирования)
+    _MAX_IMAGES_PER_ACCOUNT = 50                # картинок на аккаунт
+    _MAX_TOTAL_BYTES = 500 * 1024 * 1024        # суммарно по всей базе
+
+    def set_size_context(self, other_bytes_provider):
+        """Внедрить провайдер суммарного объёма галереи ОСТАЛЬНЫХ аккаунтов в БД
+        (для лимита общего объёма). None — лимит общего объёма не проверяется
+        (например, когда виджет используется вне главного окна)."""
+        self._other_bytes_provider = other_bytes_provider
+
+    def _local_bytes(self):
+        """Суммарный объём картинок в текущей (редактируемой) карточке."""
+        return sum(len(b) for b, _, _, _ in self.items)
+
+    @staticmethod
+    def _read_image_size(data):
+        """Размер изображения по метаданным БЕЗ полного декодирования.
+        Возвращает (width, height) или None, если файл не распознан как картинка."""
+        buf = QBuffer()
+        buf.setData(QByteArray(data))
+        buf.open(QIODevice.ReadOnly)
+        reader = QImageReader(buf)
+        if not reader.canRead():
+            return None
+        size = reader.size()
+        return (size.width(), size.height()) if size.isValid() else (0, 0)
+
+    @staticmethod
+    def _decode_image(data, bound=None):
+        """Декодировать изображение через QImageReader (учитывает глобальный
+        allocation-limit, см. setAllocationLimit при старте). bound — ограничить
+        сторону при чтении (для миниатюр, экономит память). Возвращает QImage или
+        None при сбое/повреждении/превышении лимита памяти."""
+        buf = QBuffer()
+        buf.setData(QByteArray(data))
+        buf.open(QIODevice.ReadOnly)
+        reader = QImageReader(buf)
+        reader.setAutoTransform(True)
+        if bound is not None and reader.canRead():
+            size = reader.size()
+            if size.isValid() and (size.width() > bound or size.height() > bound):
+                reader.setScaledSize(size.scaled(bound, bound, Qt.KeepAspectRatio))
+        img = reader.read()
+        return img if not img.isNull() else None
 
     def _accept_image(self, data):
-        """Проверяет добавляемое изображение по размеру и декодируемости.
-        Возвращает True, если картинку можно сохранить. Не применяется к уже
-        сохранённым в БД изображениям (они грузятся напрямую через add_item)."""
+        """Проверяет ДОБАВЛЯЕМОЕ изображение: размер файла, разрешение (по
+        метаданным, до декодирования — защита от «бомбы»), число картинок на
+        аккаунт и суммарный объём по базе. Возвращает True, если можно сохранить.
+        К уже сохранённым в БД изображениям не применяется (см. add_item)."""
         if not data:
             return False
         if len(data) > self._MAX_IMAGE_BYTES:
@@ -448,15 +495,35 @@ class GalleryWidget(QWidget):
             _warn(self.config, self, "Слишком большой файл",
                   f"Изображение больше {mb} МБ и не будет добавлено.")
             return False
-        pixmap = QPixmap()
-        if not pixmap.loadFromData(data):
+        # Разрешение определяем ДО декодирования: огромная по пикселям картинка
+        # (decompression bomb) отклоняется, не разворачиваясь в память целиком.
+        size = self._read_image_size(data)
+        if size is None:
             _warn(self.config, self, "Ошибка",
                   "Файл не распознан как изображение.")
             return False
-        if pixmap.width() * pixmap.height() > self._MAX_IMAGE_PIXELS:
+        if size[0] * size[1] > self._MAX_IMAGE_PIXELS:
             mp = self._MAX_IMAGE_PIXELS // 1_000_000
             _warn(self.config, self, "Слишком большое изображение",
                   f"Разрешение превышает {mp} Мп и не будет добавлено.")
+            return False
+        if len(self.items) >= self._MAX_IMAGES_PER_ACCOUNT:
+            _warn(self.config, self, "Слишком много изображений",
+                  f"На один аккаунт допускается не более "
+                  f"{self._MAX_IMAGES_PER_ACCOUNT} изображений.")
+            return False
+        provider = getattr(self, "_other_bytes_provider", None)
+        other = 0
+        if provider is not None:
+            try:
+                other = provider()
+            except Exception:
+                other = 0
+        if other + self._local_bytes() + len(data) > self._MAX_TOTAL_BYTES:
+            gb = self._MAX_TOTAL_BYTES / (1024 * 1024 * 1024)
+            _warn(self.config, self, "Превышен общий объём",
+                  f"Суммарный объём изображений в базе превысит "
+                  f"{gb:.1f} ГБ — изображение не будет добавлено.")
             return False
         return True
 
@@ -505,13 +572,20 @@ class GalleryWidget(QWidget):
         item_widget.setStyleSheet("border: 1px solid #808080; padding: 5px;")
         h_layout = QHBoxLayout(item_widget)
 
-        pixmap = QPixmap()
-        pixmap.loadFromData(image_bytes)
-
+        # Миниатюру декодируем через QImageReader (с allocation-limit). Если
+        # картинка повреждена/превышает лимит памяти — показываем placeholder, но
+        # сами байты НЕ теряем (останутся в self.items и сохранятся в БД).
+        thumb_img = self._decode_image(image_bytes, bound=100)
         thumb_label = QLabel()
         thumb_label.setFixedSize(100, 100)
         thumb_label.setStyleSheet("background-color: #333;")
-        thumb_label.setPixmap(pixmap.scaled(100, 100, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        thumb_label.setAlignment(Qt.AlignCenter)
+        if thumb_img is not None:
+            thumb_label.setPixmap(QPixmap.fromImage(thumb_img).scaled(
+                100, 100, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        else:
+            thumb_label.setText("[ нет\nпревью ]")
+            thumb_label.setStyleSheet("background-color: #333; color: #FFC400;")
         thumb_label.setCursor(Qt.PointingHandCursor)
         # ЛКМ — увеличенный просмотр; ПКМ оставляем контекстному меню (экспорт),
         # иначе правый клик тоже открывал бы просмотр и перекрывал меню.
@@ -554,11 +628,16 @@ class GalleryWidget(QWidget):
         widget.deleteLater()
 
     def show_full_image(self, image_bytes):
-        pixmap = QPixmap()
-        pixmap.loadFromData(image_bytes)
-        scaled = pixmap.scaled(800, 600, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        img = self._decode_image(image_bytes, bound=1600)
         label = QLabel()
-        label.setPixmap(scaled)
+        if img is not None:
+            scaled = QPixmap.fromImage(img).scaled(
+                800, 600, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            label.setPixmap(scaled)
+        else:
+            label.setText("Не удалось отобразить изображение\n"
+                          "(повреждено или превышает лимит памяти).")
+            label.setAlignment(Qt.AlignCenter)
         # Единый стиль программы; откат на обычный QDialog, если config недоступен.
         if self.config is not None:
             from theme import ThemedDialog

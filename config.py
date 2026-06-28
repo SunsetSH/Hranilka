@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import re
+from typing import Any
 
 from paths import BASE_DIR
 
@@ -30,7 +31,7 @@ _ENUMS = {
 }
 
 
-def _coerce_bool(value, default):
+def _coerce_bool(value: Any, default: bool) -> bool:
     """Строгое приведение к bool: bool('false') больше НЕ даёт True (M3-04)."""
     if isinstance(value, bool):
         return value
@@ -56,8 +57,8 @@ RETRO_THEMES = {
 }
 
 class Config:
-    def __init__(self):
-        self.config = {
+    def __init__(self) -> None:
+        self.config: dict[str, Any] = {
             "font": "Cascadia Code",
             "font_size": 14,
             "selected_theme": "Classic IDE",
@@ -86,7 +87,7 @@ class Config:
         }
         self.load()
     
-    def load(self):
+    def load(self) -> None:
         if not CONFIG_FILE.exists():
             return
         try:
@@ -104,7 +105,7 @@ class Config:
             return
         self.config.update(self._sanitize(raw))
 
-    def _sanitize(self, raw):
+    def _sanitize(self, raw: dict[str, Any]) -> dict[str, Any]:
         """Валидирует значения из файла по явной схеме (типы, enum, диапазоны).
 
         Известные ключи проверяются и при несоответствии заменяются дефолтом;
@@ -117,7 +118,7 @@ class Config:
             clean[key] = self._coerce(key, value)
         return clean
 
-    def _coerce(self, key, value):
+    def _coerce(self, key: str, value: Any) -> Any:
         """Приводит одно значение к допустимому для ключа по схеме."""
         default = self.config[key]
         if key in _COLOR_KEYS:
@@ -145,7 +146,7 @@ class Config:
             return value if isinstance(value, dict) else default
         return value
     
-    def save(self):
+    def save(self) -> None:
         # Атомарная запись: пишем во временный файл и подменяем им основной,
         # чтобы обрыв на середине не повредил config.json.
         tmp = str(CONFIG_FILE) + ".tmp"
@@ -155,8 +156,8 @@ class Config:
             os.fsync(f.fileno())
         os.replace(tmp, CONFIG_FILE)
     
-    def get(self, key, default=None):
+    def get(self, key: str, default: Any = None) -> Any:
         return self.config.get(key, default)
-    
-    def set(self, key, value):
+
+    def set(self, key: str, value: Any) -> None:
         self.config[key] = value

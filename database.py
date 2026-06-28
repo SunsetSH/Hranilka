@@ -1,20 +1,11 @@
 import sqlite3
 import os
-from datetime import datetime, date
+import tempfile
+from datetime import datetime
 from pathlib import Path
+from typing import Any
 
-
-def _days_until_password_change(changed_date_str, interval_days):
-    """Сколько дней осталось до смены пароля (может быть отрицательным, если
-    срок уже прошёл). None — если срок не задан или дата некорректна."""
-    if not changed_date_str or not interval_days:
-        return None
-    try:
-        changed = datetime.strptime(str(changed_date_str)[:10], "%Y-%m-%d").date()
-    except (ValueError, TypeError):
-        return None
-    due = changed.toordinal() + int(interval_days)
-    return due - date.today().toordinal()
+from domain import days_until_password_change, canonical_link_pair
 
 
 # Версия схемы базы данных. Увеличивается при изменении структуры таблиц,
@@ -22,7 +13,9 @@ def _days_until_password_change(changed_date_str, interval_days):
 # v6: единоразовый прогон полной нормализации (дедуп + UNIQUE-индексы) для
 #     старых баз и переход на быстрый старт (см. create_tables: если версия
 #     актуальна — миграция/дедуп пропускаются).
-SCHEMA_VERSION = 6
+# v7: канонизация связей — хранить только пары (min,max) и закрепить инвариант
+#     CHECK(account_id < linked_account_id) пересборкой таблицы linked_accounts.
+SCHEMA_VERSION = 7
 
 
 class FutureSchemaError(Exception):
@@ -45,19 +38,21 @@ class VaultConflictError(Exception):
 
 
 class Database:
-    def __init__(self, db_path="hranilka.db"):
+    def __init__(self, db_path: str = "hranilka.db") -> None:
         self.db_path = db_path
-        self.conn = None
-        self.cursor = None
+        # conn/cursor — None вне открытой сессии (до connect()/после lock()); все
+        # публичные методы вызываются при открытой БД (см. relax в mypy.ini).
+        self.conn: sqlite3.Connection | None = None
+        self.cursor: sqlite3.Cursor | None = None
         # «Ревизия» файла на диске на момент открытия/последней нашей записи
         # (st_mtime_ns, размер). Перед перезаписью сверяем — если отличается,
         # значит файл изменили извне (см. VaultConflictError).
-        self._disk_revision = None
+        self._disk_revision: tuple[int, int] | None = None
         # Состояние шифрования. Когда encrypted=True, БД живёт в sqlite :memory:,
         # а на диске лежит зашифрованный контейнер (см. crypto_store).
         self.encrypted = False
-        self._dek = None         # ключ данных (расшифрованный), только в памяти
-        self._header = None      # заголовок контейнера (соли, обёрнутые DEK)
+        self._dek: bytes | None = None       # ключ данных (расшифрованный), только в памяти
+        self._header: dict | None = None     # заголовок контейнера (соли, обёрнутые DEK)
         # Отложенная запись на диск (только шифр. режим): мутаторы помечают БД
         # «грязной», а контроллер сбрасывает её один раз за оборот событийного
         # цикла. _on_dirty — callback контроллера (или None), вызывается при
@@ -72,7 +67,7 @@ class Database:
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.cursor = self.conn.cursor()
 
-    def connect(self):
+    def connect(self) -> None:
         """Открыть обычную (незашифрованную) базу — файл на диске."""
         self.encrypted = False
         self._dek = None
@@ -82,7 +77,7 @@ class Database:
         self._disk_revision = self._stat_revision()
         self._setup_conn()
 
-    def open_encrypted(self, db_bytes: bytes, dek: bytes, header: dict):
+    def open_encrypted(self, db_bytes: bytes, dek: bytes, header: dict) -> None:
         """Открыть расшифрованные байты БД в памяти. Файл остаётся шифрованным;
         изменения сбрасываются на диск через persist()."""
         self.encrypted = True
@@ -91,7 +86,7 @@ class Database:
         self._dirty = False
         self.conn = sqlite3.connect(":memory:")
         if db_bytes:
-            self.conn.deserialize(db_bytes)
+            self.conn.deserialize(db_bytes)  # type: ignore[attr-defined]  # есть в CPython 3.11+
         self._disk_revision = self._stat_revision()
         self._setup_conn()
 
@@ -122,18 +117,38 @@ class Database:
         if current != self._disk_revision:
             raise VaultConflictError()
 
+    def _atomic_replace(self, data: bytes):
+        """Атомарно заменить файл-БД содержимым data через УНИКАЛЬНЫЙ временный
+        файл в том же каталоге (tempfile.mkstemp + fsync + os.replace).
+
+        Уникальное имя temp на каждую запись принципиально (H3-01): при общем
+        фиксированном `db_path + ".tmp"` две одновременные записи (фоновый
+        воркер + синхронная привилегированная операция) затирали бы временный
+        файл друг друга, давая порчу/потерю данных. mkstemp гарантирует, что у
+        каждой записи свой temp. Ревизию диска обновляем после успешной замены."""
+        directory = os.path.dirname(self.db_path) or "."
+        fd, tmp = tempfile.mkstemp(dir=directory, prefix=".hranilka-", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.db_path)
+        except BaseException:
+            # Не оставлять временный файл при любом сбое записи/замены.
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        self._disk_revision = self._stat_revision()
+
     def _write_container(self, container: bytes, force: bool = False):
         """Атомарно записать готовый контейнер на диск (temp+fsync+replace).
         Перед заменой сверяет ревизию файла (если не force) и обновляет её после."""
         if not force:
             self._check_no_external_change()
-        tmp = self.db_path + ".tmp"
-        with open(tmp, "wb") as f:
-            f.write(container)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, self.db_path)
-        self._disk_revision = self._stat_revision()
+        self._atomic_replace(container)
 
     def serialize_db(self) -> bytes:
         """Сериализовать in-memory БД в байты.
@@ -218,15 +233,9 @@ class Database:
         # Используется при включении/выключении шифрования (интерактивно,
         # состояние файла под контролем) — пишем без проверки конфликта, но
         # ревизию обновляем, чтобы последующие persist() сверялись корректно.
-        tmp = self.db_path + ".tmp"
-        with open(tmp, "wb") as f:
-            f.write(data)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, self.db_path)
-        self._disk_revision = self._stat_revision()
+        self._atomic_replace(data)
 
-    def enable_encryption(self, password: str, preset: str):
+    def enable_encryption(self, password: str, preset: str) -> str:
         """Зашифровать текущую (обычную) БД. Возвращает recovery-код.
         После вызова БД работает в зашифрованном режиме (в памяти).
 
@@ -247,7 +256,7 @@ class Database:
         self.open_encrypted(pt, dek, header)
         return recovery
 
-    def disable_encryption(self):
+    def disable_encryption(self) -> None:
         """Расшифровать БД обратно в обычный файл и работать без шифрования."""
         db_bytes = self.conn.serialize()
         dek, header = self._dek, self._header
@@ -262,14 +271,14 @@ class Database:
             raise
         self.connect()
 
-    def change_master_password(self, new_password: str, preset: str = None):
+    def change_master_password(self, new_password: str, preset: str | None = None):
         """Сменить мастер-пароль (перезаворачивание DEK, без перешифровки данных)."""
         import crypto_store as cs
         new_header = cs.change_password(None, self._dek, self._header,
                                         new_password, preset)
         self.set_header(new_header)
 
-    def regenerate_recovery_code(self):
+    def regenerate_recovery_code(self) -> str:
         """Сгенерировать новый recovery-код. Возвращает код (показать один раз)."""
         import crypto_store as cs
         new_header, recovery = cs.regenerate_recovery(self._dek, self._header)
@@ -407,17 +416,11 @@ class Database:
             )
         """)
         
-        # Таблица связанных аккаунтов
-        self.cursor.execute("""
-            CREATE TABLE IF NOT EXISTS linked_accounts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                account_id INTEGER NOT NULL,
-                linked_account_id INTEGER NOT NULL,
-                FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE,
-                FOREIGN KEY (linked_account_id) REFERENCES accounts(id) ON DELETE CASCADE
-            )
-        """)
-        
+        # Таблица связанных аккаунтов (пары канонизированы: account_id < linked,
+        # инвариант закреплён CHECK — см. _linked_accounts_create_sql).
+        self.cursor.execute(
+            self._linked_accounts_create_sql("linked_accounts", if_not_exists=True))
+
         # Таблица служебных метаданных (версия схемы, и т.п.)
         self.cursor.execute("""
             CREATE TABLE IF NOT EXISTS app_meta (
@@ -425,6 +428,11 @@ class Database:
                 value TEXT
             )
         """)
+
+        # Канонизация существующей таблицы связей (v6→v7): нормализация пар к
+        # (min,max), дедуп и добавление CHECK. Выполняется ДО создания индексов
+        # ниже, чтобы uq_linked_pair лёг уже на пересобранную таблицу.
+        self._rebuild_linked_accounts_if_needed()
 
         # Перед созданием UNIQUE-индексов убираем возможные дубли (из старых баз
         # или ручных правок), иначе создание уникального индекса упадёт.
@@ -557,6 +565,62 @@ class Database:
         if "accounts" not in self._table_names():
             self.cursor.execute(self._accounts_create_sql("accounts"))
 
+    @staticmethod
+    def _linked_accounts_create_sql(table_name, if_not_exists=False):
+        """CREATE TABLE для linked_accounts.
+
+        Пары канонизированы: всегда account_id < linked_account_id. Инвариант
+        закреплён CHECK — он же делает невозможным повторное появление обратных
+        дублей (B,A) и самоссылок (A,A) на уровне схемы (M3-06/M3-14)."""
+        ine = "IF NOT EXISTS " if if_not_exists else ""
+        return f"""
+            CREATE TABLE {ine}{table_name} (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id INTEGER NOT NULL,
+                linked_account_id INTEGER NOT NULL,
+                FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE,
+                FOREIGN KEY (linked_account_id) REFERENCES accounts(id) ON DELETE CASCADE,
+                CHECK (account_id < linked_account_id)
+            )
+        """
+
+    def _rebuild_linked_accounts_if_needed(self):
+        """Привести таблицу связей к канонической форме (v6→v7), если ещё нет.
+
+        Старые базы хранили (A,B) и (B,A) как разные строки и без инварианта.
+        Пересобираем таблицу с CHECK, по пути нормализуя порядок к (min,max),
+        убирая самоссылки и дубли. Для уже канонизированной таблицы (CHECK уже
+        присутствует) — no-op, так что повторные запуски ничего не делают."""
+        self.cursor.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type='table' AND name='linked_accounts'")
+        row = self.cursor.fetchone()
+        if not row or not row["sql"]:
+            return
+        if "account_id < linked_account_id" in row["sql"]:
+            return  # инвариант уже закреплён — таблица канонична
+
+        self._commit()  # закрыть возможную открытую транзакцию (иначе PRAGMA игнорируется)
+        self.conn.execute("PRAGMA foreign_keys = OFF")
+        try:
+            with self.conn:
+                self.cursor.execute(
+                    self._linked_accounts_create_sql("linked_accounts_new"))
+                # Нормализуем к (min,max), отбрасываем самоссылки и дубли (A,B)/(B,A).
+                self.cursor.execute(
+                    "INSERT OR IGNORE INTO linked_accounts_new "
+                    "(account_id, linked_account_id) "
+                    "SELECT MIN(account_id, linked_account_id), "
+                    "       MAX(account_id, linked_account_id) "
+                    "FROM linked_accounts WHERE account_id != linked_account_id "
+                    "GROUP BY MIN(account_id, linked_account_id), "
+                    "         MAX(account_id, linked_account_id)")
+                self.cursor.execute("DROP TABLE linked_accounts")
+                self.cursor.execute(
+                    "ALTER TABLE linked_accounts_new RENAME TO linked_accounts")
+        finally:
+            self.conn.execute("PRAGMA foreign_keys = ON")
+
     def _table_names(self):
         self.cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
         return {r["name"] for r in self.cursor.fetchall()}
@@ -655,32 +719,33 @@ class Database:
                 self.conn.execute(f"DELETE FROM {table}")
         self._mark_dirty()
             
-    def add_folder(self, name):
+    def add_folder(self, name: str) -> int:
         """Добавление папки"""
         self.cursor.execute(
             "INSERT INTO folders (name) VALUES (?)",
             (name,)
         )
         self._commit()
-        return self.cursor.lastrowid
+        return int(self.cursor.lastrowid)
     
-    def add_service(self, name, folder_id=None):
+    def add_service(self, name: str, folder_id: int | None = None) -> int:
         """Добавление сервиса"""
         self.cursor.execute(
             "INSERT INTO services (name, folder_id) VALUES (?, ?)",
             (name, folder_id)
         )
         self._commit()
-        return self.cursor.lastrowid
+        return int(self.cursor.lastrowid)
     
-    def add_account(self, service_id, account_name, login=None, password=None):
+    def add_account(self, service_id: int | None, account_name: str,
+                    login: str | None = None, password: str | None = None) -> int:
         """Добавление аккаунта"""
         self.cursor.execute(
             "INSERT INTO accounts (service_id, account_name, login, password, created_at) VALUES (?, ?, ?, ?, ?)",
             (service_id, account_name, login, password, datetime.now())
         )
         self._commit()
-        return self.cursor.lastrowid
+        return int(self.cursor.lastrowid)
     
     def _build_account_node(self, account):
         """Формирует узел аккаунта для дерева, включая дни до смены пароля."""
@@ -692,7 +757,7 @@ class Database:
             'is_favorite': bool(account['is_favorite']),
             'password_changed_date': account['password_changed_date'],
             'password_change_interval_days': account['password_change_interval_days'],
-            'pwd_days_left': _days_until_password_change(
+            'pwd_days_left': days_until_password_change(
                 account['password_changed_date'],
                 account['password_change_interval_days'],
             ),
@@ -760,10 +825,10 @@ class Database:
         # Группируем в памяти, сохраняя порядок выборки (важно для режима
         # "created" и базового sort_order, поверх которых _sorted_accounts
         # доводит сортировку по имени/просрочке и поднимает избранные).
-        accounts_by_service = {}
+        accounts_by_service: dict[Any, list] = {}
         for a in accounts:
             accounts_by_service.setdefault(a["service_id"], []).append(a)
-        services_by_folder = {}
+        services_by_folder: dict[Any, list] = {}
         for s in services:
             services_by_folder.setdefault(s["folder_id"], []).append(s)
 
@@ -1012,7 +1077,22 @@ class Database:
         rows.sort(key=lambda r: r["name"].lower())
         return rows
 
-    def get_links(self, account_id):
+    def gallery_total_bytes(self, exclude_account_id: int | None = None) -> int:
+        """Суммарный объём всех картинок в галерее (в байтах).
+
+        exclude_account_id — исключить указанный аккаунт из суммы: его картинки
+        обычно держатся в памяти редактируемой карточки, и учитывать их повторно
+        при проверке лимита суммарного объёма не нужно (M3-05)."""
+        if exclude_account_id is None:
+            self.cursor.execute(
+                "SELECT COALESCE(SUM(LENGTH(image_data)), 0) AS s FROM gallery")
+        else:
+            self.cursor.execute(
+                "SELECT COALESCE(SUM(LENGTH(image_data)), 0) AS s "
+                "FROM gallery WHERE account_id != ?", (exclude_account_id,))
+        return int(self.cursor.fetchone()["s"])
+
+    def get_links(self, account_id: int) -> list[dict[str, Any]]:
         """Связанные аккаунты (в обе стороны) с путями."""
         self.cursor.execute(
             "SELECT account_id, linked_account_id FROM linked_accounts "
@@ -1030,7 +1110,7 @@ class Database:
         result.sort(key=lambda r: r["name"].lower())
         return result
 
-    def set_links(self, account_id, target_ids):
+    def set_links(self, account_id: int, target_ids: list[int]) -> None:
         """Задаёт связи аккаунта (симметрично). Старые связи этого аккаунта заменяются."""
         with self.conn:
             self.cursor.execute(
@@ -1043,9 +1123,13 @@ class Database:
                 if t == account_id or t in seen:
                     continue
                 seen.add(t)
+                # Каноническая форма: account_id < linked_account_id. Так (A,B) и
+                # (B,A) — одна и та же строка (закреплено CHECK в схеме, M3-06).
+                lo, hi = canonical_link_pair(account_id, t)
                 self.cursor.execute(
-                    "INSERT INTO linked_accounts (account_id, linked_account_id) VALUES (?, ?)",
-                    (account_id, t),
+                    "INSERT OR IGNORE INTO linked_accounts "
+                    "(account_id, linked_account_id) VALUES (?, ?)",
+                    (lo, hi),
                 )
         self._mark_dirty()
 
@@ -1190,7 +1274,7 @@ class Database:
 
         # Bulk-предзагрузка вместо load_account()/get_links() на каждый аккаунт
         # (устранение N+1: раньше экспорт 100 аккаунтов делал ~728 SELECT).
-        ids = []
+        ids: list[int] = []
         for root in roots:
             self._collect_account_ids(root, ids)
         cards = self._load_cards_bulk(ids)
@@ -1232,7 +1316,7 @@ class Database:
 
     def _load_cards_bulk(self, account_ids):
         """{account_id: card} для набора аккаунтов. Card как в load_account()."""
-        cards = {}
+        cards: dict[int, dict[str, Any]] = {}
         if not account_ids:
             return cards
         field_keys = ("account_name", "url", "login", "password", "creation_date",
@@ -1335,11 +1419,11 @@ class Database:
     def _load_links_bulk(self, account_ids):
         """{account_id: [{"id","name"(путь)}]} — связи в обе стороны, без
         аккаунтов из корзины, отсортированные по пути (как get_links)."""
-        result = {i: [] for i in account_ids}
+        result: dict[int, list[dict[str, Any]]] = {i: [] for i in account_ids}
         if not account_ids:
             return result
         acc, svc, fld = self._name_maps()
-        others = {i: set() for i in account_ids}
+        others: dict[int, set[int]] = {i: set() for i in account_ids}
         for chunk in self._chunks(account_ids):
             ph = ",".join("?" * len(chunk))
             self.cursor.execute(

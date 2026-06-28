@@ -1,5 +1,6 @@
 import uuid
 import platform
+from typing import Any, Optional
 from PySide6.QtCore import QDateTime, QDate, QTime
 
 _DT_FORMAT = "yyyy-MM-dd HH:mm:ss"
@@ -7,35 +8,36 @@ _DATE_FORMAT = "yyyy-MM-dd"
 
 
 class AccountData:
-    def __init__(self):
+    def __init__(self) -> None:
         self.name = "Новый аккаунт"
         self.url = ""
-        self.creation_date = QDateTime.currentDateTime()  # момент создания — осмысленный дефолт
-        self.password_changed_date = None                  # «не задано», а не сегодня
-        self.password_change_interval_days = None
+        # даты «не заданы» → None; creation_date по умолчанию — момент создания
+        self.creation_date: Optional[QDateTime] = QDateTime.currentDateTime()
+        self.password_changed_date: Optional[QDate] = None
+        self.password_change_interval_days: Optional[int] = None
         self.notes = ""
         self.login = ""
         self.password = ""
         self.first_name = ""
         self.last_name = ""
         self.middle_name = ""
-        self.birth_date = None                             # «не задано», а не сегодня
+        self.birth_date: Optional[QDate] = None
         self.address = ""
-        self.secret_questions = []  # [{"q": "", "a": ""}]
+        self.secret_questions: list[dict[str, str]] = []  # [{"q": "", "a": ""}]
         self.recovery_phrase = ""
         self.device_id = str(uuid.uuid4())[:8].upper()
-        self.one_time_codes = []
-        self.gallery = []  # [{"data": bytes, "desc": str}]
+        self.one_time_codes: list[str] = []
+        self.gallery: list[dict[str, Any]] = []  # [{"data": bytes, "desc": str}]
         self.ip = ""
         self.browser = ""
         self.os = platform.system()
         self.extra_info = ""
-        self.linked_accounts = []
+        self.linked_accounts: list[int] = []
 
     # ----- Конвертация дат Qt <-> строка для хранения -----
 
     @staticmethod
-    def _dt_to_str(value):
+    def _dt_to_str(value: Any) -> Optional[str]:
         if isinstance(value, QDateTime):
             return value.toString(_DT_FORMAT)
         if isinstance(value, QDate):
@@ -43,7 +45,7 @@ class AccountData:
         return None
 
     @staticmethod
-    def _date_to_str(value):
+    def _date_to_str(value: Any) -> Optional[str]:
         if isinstance(value, QDateTime):
             return value.date().toString(_DATE_FORMAT)
         if isinstance(value, QDate):
@@ -51,7 +53,7 @@ class AccountData:
         return None
 
     @staticmethod
-    def _str_to_dt(value):
+    def _str_to_dt(value: Any) -> Optional[QDateTime]:
         """Строка → QDateTime; None, если значение пусто/некорректно
         (раньше подменялось текущим моментом — ложные данные)."""
         if value:
@@ -61,7 +63,7 @@ class AccountData:
         return None
 
     @staticmethod
-    def _str_to_date(value):
+    def _str_to_date(value: Any) -> Optional[QDate]:
         """Строка → QDate; None, если значение пусто/некорректно."""
         if value:
             d = QDate.fromString(value, _DATE_FORMAT)
@@ -71,7 +73,7 @@ class AccountData:
 
     # ----- Сериализация для слоя БД (примитивы) -----
 
-    def to_storage(self):
+    def to_storage(self) -> dict[str, Any]:
         return {
             "fields": {
                 "account_name": self.name,
@@ -101,7 +103,7 @@ class AccountData:
         }
 
     @classmethod
-    def from_storage(cls, storage):
+    def from_storage(cls, storage: Optional[dict[str, Any]]) -> "AccountData":
         d = cls()
         if not storage:
             return d
