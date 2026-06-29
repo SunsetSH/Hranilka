@@ -375,6 +375,7 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, AccountCardMixin,
         self.setFont(QFont(font_name, font_size))
         # Общий стиль окна (вкл. кнопки-вкладки QPushButton[tabButton], спинбоксы, комбобоксы)
         self.setStyleSheet(theme.main_stylesheet(self.config))
+        self.tabs.apply_scroll_bg(main_bg)
         self.tree.setStyleSheet(f"""
             QTreeWidget {{ border: 2px inset #808080; background-color: {tree_bg}; color: {text_color}; font-family: '{font_name}'; font-size: {font_size}px; }}
             QTreeWidget::item {{ padding: 4px; border: 1px solid transparent; }}
@@ -465,8 +466,10 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, AccountCardMixin,
         dialog.appearance_changed.connect(self.apply_appearance)  # лёгкий предпросмотр
         dialog.settings_applied.connect(self.apply_config)        # полное применение
         dialog.settings_applied.connect(self._rebind_shortcuts)   # пере-привязка хоткеев
-        # Восстановление из бэкапа перечитывает БД сразу, окно настроек остаётся открытым.
-        dialog.restore_requested.connect(self._reload_database)
+        # Восстановление из бэкапа: всю последовательность (закрыть БД → заменить
+        # файл → переоткрыть → обновить UI) выполняет MainWindow, диалог лишь
+        # запрашивает её и показывает результат (см. _restore_from_backup).
+        dialog.set_restore_handler(self._restore_from_backup)
         dialog.exec()
         if dialog._delete_all_confirmed:
             self._wipe_all_data()
@@ -577,16 +580,38 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, AccountCardMixin,
 
             return False  # «Выход»
 
-    def _reload_database(self):
-        """Перечитать БД после восстановления бэкапа (учитывает шифрование).
+    def _restore_from_backup(self, path):
+        """Восстановление из бэкапа (вызывается из «Настроек»). Возвращает
+        (ok, err) для показа в диалоге.
 
-        Закрываем БЕЗ сохранения: иначе текущая in-memory база перезаписала бы
-        только что восстановленный файл. Шифрование определяется по сигнатуре
-        восстановленного файла — пароль спрашивается, только если он зашифрован."""
+        Критично для plaintext-режима (Баг 1, WinError 5): SQLite держит файл
+        hranilka.db открытым, и `os.replace` внутри restore_backup на Windows
+        падает. Поэтому соединение закрываем ДО замены файла. Закрываем БЕЗ
+        сохранения — иначе текущая БД затёрла бы восстановленный файл. После
+        замены переоткрываем БД (восстановленный файл может оказаться
+        зашифрованным — тогда _open_database спросит пароль)."""
+        if not self.vault.wait_idle():
+            return False, ("Фоновое сохранение базы не завершилось вовремя.\n"
+                           "Повторите попытку через несколько секунд.")
         self.db.close(persist=False)
+        try:
+            bk.restore_backup(path, self.db.db_path)
+        except Exception as e:
+            # restore_backup при сбое откатывает файл к прежнему состоянию —
+            # переоткрываем БД как была и сообщаем об ошибке.
+            if not self._open_database(self):
+                self.close()
+                return False, str(e)
+            self._after_db_reopened(None)
+            return False, str(e)
         if not self._open_database(self):
             self.close()
-            return
+            return True, None
+        self._after_db_reopened("База данных восстановлена из бэкапа.")
+        return True, None
+
+    def _after_db_reopened(self, message):
+        """Сброс состояния и UI после переоткрытия БД (восстановление бэкапа)."""
         self._current_account_id = None
         self._edit_cache.clear()
         self._dirty_ids.clear()
@@ -596,7 +621,8 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, AccountCardMixin,
         self._show_placeholder()
         self._reload_tree()
         self._update_bin_button()
-        self.statusBar().showMessage("База данных восстановлена из бэкапа.", 3000)
+        if message:
+            self.statusBar().showMessage(message, 3000)
 
     # ─── Удаление всех данных ────────────────────────────────────────────────
 

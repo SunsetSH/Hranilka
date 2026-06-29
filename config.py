@@ -77,6 +77,7 @@ class Config:
             "warn_on_exit_unsaved": True,
             "encryption_enabled": False,
             "argon2_preset": "balanced",
+            "image_downscale": True,       # сжимать большие изображения при импорте
             "shortcuts": {},
             # Ранее «потреблялись», но отсутствовали в defaults и потому
             # проходили БЕЗ валидации (M3-04). Теперь известны и проверяются.

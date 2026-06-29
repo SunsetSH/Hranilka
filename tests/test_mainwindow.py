@@ -57,3 +57,23 @@ def test_chrome_methods_no_crash(window):
     window._on_field_copied()
     window._apply_screenshot_protect(False)
     window._restore_geometry()
+
+
+def test_restore_plaintext_backup_no_winerror(window, tmp_path):
+    """Баг 1: восстановление обычной (незашифрованной) БД из бэкапа. Соединение
+    закрывается ДО замены файла, поэтому os.replace не падает с WinError 5."""
+    import backup as bk
+    db = window.db
+    fid = db.add_folder("Папка")
+    sid = db.add_service("Сервис", fid)
+    db.add_account(sid, "Acc1")
+    dest = bk.create_backup(db.db_path, str(tmp_path / "backups"))
+
+    db.add_account(sid, "Acc2")            # изменения ПОСЛЕ бэкапа
+    assert len(db.get_all_accounts()) == 2
+
+    ok, err = window._restore_from_backup(str(dest))
+    assert ok, err
+    accts = window.db.get_all_accounts()   # name — это полный путь до аккаунта
+    assert len(accts) == 1                 # вернулись к состоянию бэкапа (Acc2 нет)
+    assert accts[0]["name"].endswith("Acc1")

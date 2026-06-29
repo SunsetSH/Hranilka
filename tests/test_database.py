@@ -1,4 +1,7 @@
 """Схема/миграции, быстрый путь, пути аккаунтов, связи."""
+import os
+import sqlite3
+
 import pytest
 
 from database import Database, SCHEMA_VERSION, FutureSchemaError
@@ -65,6 +68,39 @@ def test_links_canonical_pair_in_schema(db):
     rows = db.cursor.fetchall()
     assert len(rows) == 1
     assert rows[0]["account_id"] < rows[0]["linked_account_id"]
+
+
+def test_secure_delete_enabled(db):
+    """PRAGMA secure_delete включён — удалённые данные затираются (Баг 2)."""
+    row = db.conn.execute("PRAGMA secure_delete").fetchone()
+    assert int(row[0]) == 1
+
+
+def test_vacuum_shrinks_file_after_delete(tmp_path):
+    """VACUUM физически уменьшает файл после удаления крупных BLOB (Баг 2)."""
+    p = str(tmp_path / "v.db")
+    d = Database(p)
+    d.connect()
+    d.create_tables()
+    sid = d.add_service("S")
+    aid = d.add_account(sid, "A")
+    blob = sqlite3.Binary(b"\x00" * (2 * 1024 * 1024))
+    for _ in range(5):
+        d.cursor.execute(
+            "INSERT INTO gallery (account_id, description, image_data) VALUES (?, ?, ?)",
+            (aid, "x", blob))
+    d._commit()
+    size_full = os.path.getsize(p)
+
+    d.cursor.execute("DELETE FROM gallery")
+    d._commit()
+    size_after_delete = os.path.getsize(p)
+    assert size_after_delete >= size_full - 65536   # файл сам не сжался (freelist)
+
+    d.vacuum()
+    size_after_vacuum = os.path.getsize(p)
+    assert size_after_vacuum < size_full            # VACUUM реально уменьшил файл
+    d.close(persist=False)
 
 
 def test_links_check_rejects_noncanonical(db):

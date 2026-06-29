@@ -1180,14 +1180,11 @@ class Database:
         codes = [r["code"] for r in self.cursor.fetchall()]
 
         self.cursor.execute(
-            "SELECT description, image_data FROM gallery WHERE account_id = ? ORDER BY id",
+            "SELECT id, description FROM gallery WHERE account_id = ? ORDER BY id",
             (account_id,),
         )
         gallery = [
-            {
-                "desc": r["description"] or "",
-                "data": bytes(r["image_data"]) if r["image_data"] is not None else None,
-            }
+            {"id": r["id"], "desc": r["description"] or "", "data": None}
             for r in self.cursor.fetchall()
         ]
 
@@ -1199,6 +1196,16 @@ class Database:
             "codes": codes,
             "gallery": gallery,
         }
+
+    def load_gallery_image(self, image_id: int):
+        """Загружает BLOB одного изображения галереи по его id.
+        Используется для ленивой загрузки: при load_account image_data не читается,
+        а запрашивается отдельно только когда виджет хочет показать миниатюру."""
+        self.cursor.execute("SELECT image_data FROM gallery WHERE id = ?", (image_id,))
+        row = self.cursor.fetchone()
+        if row is None or row["image_data"] is None:
+            return None
+        return bytes(row["image_data"])
 
     def save_account(self, account_id, data):
         """Сохраняет полную карточку аккаунта. data — словарь примитивов в

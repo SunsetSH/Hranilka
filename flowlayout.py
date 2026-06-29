@@ -85,9 +85,9 @@ class WrappingTabWidget(QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(4)
 
-        self._bar = QWidget()
+        self._bar = QWidget(self)
         self._bar_layout = FlowLayout(self._bar, margin=0, hspacing=2, vspacing=2)
-        self._stack = QStackedWidget()
+        self._stack = QStackedWidget(self)
 
         outer.addWidget(self._bar)
         outer.addWidget(self._stack, 1)
@@ -95,7 +95,7 @@ class WrappingTabWidget(QWidget):
 
     def addTab(self, widget, title):
         index = self._stack.count()
-        btn = QPushButton(title)
+        btn = QPushButton(title, self._bar)
         btn.setCheckable(True)
         btn.setProperty("tabButton", True)
         btn.setCursor(Qt.PointingHandCursor)

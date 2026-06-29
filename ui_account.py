@@ -149,6 +149,9 @@ class AccountCardMixin:
         self.tabs.f_questions_widget.set_data(d.secret_questions)
         self.tabs.f_codes_widget.set_data(d.one_time_codes)
         self.tabs.f_gallery_widget.set_data(d.gallery)
+        # Ленивая загрузка BLOB: виджет запросит байты конкретного изображения
+        # только когда пользователь кликнет на него или при сохранении.
+        self.tabs.f_gallery_widget.set_image_loader(self.db.load_gallery_image)
         # Лимит суммарного объёма галереи: провайдер берёт из БД объём картинок
         # ОСТАЛЬНЫХ аккаунтов (текущий держится в памяти карточки — не дублируем).
         aid = self._current_account_id

@@ -32,7 +32,6 @@ import shortcuts
 class SettingsDialog(ThemedDialog):
     settings_applied = Signal()      # финальное «Применить» (полная переинициализация)
     appearance_changed = Signal()    # живой предпросмотр шрифта/темы/цвета (только стили)
-    restore_requested = Signal()     # выполнено восстановление из бэкапа (перечитать БД)
 
     def __init__(self, config, parent=None):
         super().__init__(config, parent)
@@ -44,6 +43,7 @@ class SettingsDialog(ThemedDialog):
         self._db_path = "hranilka.db"
         self._db = None
         self._run_vault_op = self._default_vault_op
+        self._restore_handler = self._default_restore_handler
         self._delete_all_confirmed = False
         self._restore_done = False
         # Снимок цветов/шрифта для восстановления при отмене / откате
@@ -83,6 +83,18 @@ class SettingsDialog(ThemedDialog):
             return True, fn()
         except Exception as e:                       # noqa: BLE001
             return False, str(e)
+
+    def set_restore_handler(self, handler):
+        """Внедрить обработчик восстановления из бэкапа (из главного окна).
+
+        Восстановление должно закрыть SQLite-соединение ДО замены файла (иначе
+        на Windows os.replace падает с WinError 5 в plaintext-режиме), поэтому
+        всю последовательность ведёт MainWindow. handler(path) -> (ok, err)."""
+        self._restore_handler = handler
+
+    @staticmethod
+    def _default_restore_handler(path):
+        return False, "Восстановление недоступно вне главного окна."
 
     def _setup_ui(self):
         self._tabs = WrappingTabWidget(self)
@@ -667,8 +679,31 @@ class SettingsDialog(ThemedDialog):
         el.addWidget(export_btn)
         lay.addWidget(exp_group)
 
+        maint_group = QGroupBox("Обслуживание")
+        ml = QVBoxLayout(maint_group)
+        ml.addWidget(QLabel(
+            "После удаления картинок/аккаунтов файл базы сам не уменьшается —\n"
+            "освободившееся место остаётся внутри для повторного использования.\n"
+            "«Сжать базу» физически уменьшает файл (VACUUM)."))
+        vacuum_btn = QPushButton("Сжать базу (VACUUM)")
+        vacuum_btn.clicked.connect(self._do_vacuum)
+        ml.addWidget(vacuum_btn)
+        lay.addWidget(maint_group)
+
         lay.addStretch()
         return w
+
+    def _do_vacuum(self):
+        if self._db is None:
+            return
+        # Монопольно через гейт: VACUUM блокирует БД и не должен конкурировать с
+        # фоновой записью; в шифр. режиме после сжатия перезапишется контейнер.
+        ok, err = self._run_vault_op(self._db.vacuum)
+        if not ok:
+            themed_info(self.config, self, "Ошибка", f"Не удалось сжать базу:\n{err}")
+            return
+        themed_info(self.config, self, "Готово",
+                    "База сжата: свободные страницы освобождены, файл уменьшен.")
 
     # ─── Вкладка: Поведение ──────────────────────────────────────────────────
 
@@ -697,6 +732,18 @@ class SettingsDialog(ThemedDialog):
             self.config.get("clipboard_clear_on_exit", False))
         cf.addRow(self.clip_clear_exit_check)
         lay.addWidget(clip_group)
+
+        img_group = QGroupBox("Изображения")
+        il = QVBoxLayout(img_group)
+        self.image_downscale_check = QCheckBox(
+            "Сжимать большие изображения при добавлении")
+        self.image_downscale_check.setChecked(self.config.get("image_downscale", True))
+        il.addWidget(self.image_downscale_check)
+        il.addWidget(QLabel(
+            "Уменьшает очень большие картинки (длинная сторона > 2560px) до\n"
+            "разумного размера в JPEG — меньше нагрузка и размер базы.\n"
+            "Уже сохранённые изображения не затрагиваются."))
+        lay.addWidget(img_group)
 
         # Шорткаты — отдельной секцией внизу вкладки «Поведение»
         lay.addWidget(self._build_shortcuts_group(), 1)
@@ -990,15 +1037,14 @@ class SettingsDialog(ThemedDialog):
             f"Восстановить из:\n{_P(path).name}\n\nТекущие данные будут заменены. Продолжить?"
         ):
             return
-        # Восстановление заменяет файл-БД. Через гейт: фоновый воркер квисцирован
-        # и не перезапишет восстановленный файл устаревшим снимком (H3-01).
-        ok, res = self._run_vault_op(lambda: bk.restore_backup(path, self._db_path))
+        # Всю последовательность ведёт MainWindow: он закрывает SQLite ДО замены
+        # файла (иначе на Windows os.replace падает с WinError 5 в plaintext —
+        # Баг 1), заменяет файл и переоткрывает БД. Диалог лишь показывает итог.
+        ok, err = self._restore_handler(path)
         if not ok:
-            themed_info(self.config, self, "Ошибка", f"Не удалось восстановить:\n{res}")
+            themed_info(self.config, self, "Ошибка", f"Не удалось восстановить:\n{err}")
             return
         self._restore_done = True
-        # Перечитать БД в главном окне сразу, не закрывая «Настройки».
-        self.restore_requested.emit()
         themed_info(self.config, self, "Восстановление",
                     "База данных восстановлена из бэкапа.")
 
@@ -1030,6 +1076,7 @@ class SettingsDialog(ThemedDialog):
         self.config.set("clipboard_clear_secs",    int(self.clip_clear_secs.text() or "0"))
         self.config.set("clipboard_clear_on_exit", self.clip_clear_exit_check.isChecked())
         self.config.set("recycle_bin_enabled",     self.recycle_bin_check.isChecked())
+        self.config.set("image_downscale",         self.image_downscale_check.isChecked())
         # Шорткаты: в конфиг кладём только отличия от дефолтов (компактно и
         # forward-compatible — новые действия унаследуют дефолт).
         self.config.set("shortcuts", {

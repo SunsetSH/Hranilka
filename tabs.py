@@ -1,4 +1,5 @@
-﻿from PySide6.QtWidgets import QWidget, QVBoxLayout, QPushButton
+﻿from PySide6.QtWidgets import QWidget, QVBoxLayout, QPushButton, QScrollArea
+from PySide6.QtCore import Qt
 from flowlayout import WrappingTabWidget
 from widgets import (CopyableField, CopyableDateField, CopyableTextEdit,
                      SecretQuestionsWidget, CodeListWidget, GalleryWidget,
@@ -22,7 +23,7 @@ class AccountTabs(WrappingTabWidget):
         self.addTab(self.create_tab_tech(), "Технические данные")
 
     def create_tab_baza(self):
-        w = QWidget()
+        w = QWidget(self)
         l = QVBoxLayout(w)
         l.setSpacing(10)
         l.setContentsMargins(0, 8, 0, 0)
@@ -46,7 +47,7 @@ class AccountTabs(WrappingTabWidget):
         return w
 
     def create_tab_login(self):
-        w = QWidget()
+        w = QWidget(self)
         l = QVBoxLayout(w)
         l.setSpacing(10)
         l.setContentsMargins(0, 8, 0, 0)
@@ -69,7 +70,7 @@ class AccountTabs(WrappingTabWidget):
         return w
 
     def create_tab_pd(self):
-        w = QWidget()
+        w = QWidget(self)
         l = QVBoxLayout(w)
         l.setSpacing(10)
         l.setContentsMargins(0, 8, 0, 0)
@@ -95,16 +96,16 @@ class AccountTabs(WrappingTabWidget):
         return w
 
     def create_tab_questions(self):
-        w = QWidget()
+        w = QWidget(self)
         l = QVBoxLayout(w)
         l.setSpacing(10)
         l.setContentsMargins(0, 8, 0, 0)
-        self.f_questions_widget = SecretQuestionsWidget(config=self.config)
+        self.f_questions_widget = SecretQuestionsWidget(config=self.config, parent=w)
         l.addWidget(self.f_questions_widget)
         return w
 
     def create_tab_recovery(self):
-        w = QWidget()
+        w = QWidget(self)
         l = QVBoxLayout(w)
         l.setSpacing(10)
         l.setContentsMargins(0, 8, 0, 0)
@@ -117,26 +118,37 @@ class AccountTabs(WrappingTabWidget):
         l.addStretch()
         return w
 
+    def _scrollable(self, inner):
+        """Обернуть виджет в прокручиваемую область: при большом числе элементов
+        (галерея, коды 2FA) появляется вертикальная прокрутка, а не сжатие строк
+        (Баг 5). Окно при этом не растягивается."""
+        sa = QScrollArea(self)
+        sa.setWidgetResizable(True)
+        sa.setFrameShape(QScrollArea.NoFrame)
+        sa.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        sa.setWidget(inner)
+        return sa
+
+    def apply_scroll_bg(self, main_bg: str) -> None:
+        """Обновить фон прокручиваемых областей вкладок под цвет из настроек."""
+        style = f"QScrollArea {{ background: {main_bg}; border: none; }}"
+        vp_style = f"background: {main_bg};"
+        for sa in (self._sa_codes, self._sa_gallery):
+            sa.setStyleSheet(style)
+            sa.viewport().setStyleSheet(vp_style)
+
     def create_tab_codes(self):
-        w = QWidget()
-        l = QVBoxLayout(w)
-        l.setSpacing(10)
-        l.setContentsMargins(0, 8, 0, 0)
-        self.f_codes_widget = CodeListWidget(config=self.config)
-        l.addWidget(self.f_codes_widget)
-        return w
+        self.f_codes_widget = CodeListWidget(config=self.config, parent=self)
+        self._sa_codes = self._scrollable(self.f_codes_widget)
+        return self._sa_codes
 
     def create_tab_gallery(self):
-        w = QWidget()
-        l = QVBoxLayout(w)
-        l.setSpacing(10)
-        l.setContentsMargins(0, 8, 0, 0)
-        self.f_gallery_widget = GalleryWidget(config=self.config)
-        l.addWidget(self.f_gallery_widget)
-        return w
+        self.f_gallery_widget = GalleryWidget(config=self.config, parent=self)
+        self._sa_gallery = self._scrollable(self.f_gallery_widget)
+        return self._sa_gallery
 
     def create_tab_tech(self):
-        w = QWidget()
+        w = QWidget(self)
         l = QVBoxLayout(w)
         l.setSpacing(10)
         l.setContentsMargins(0, 8, 0, 0)
