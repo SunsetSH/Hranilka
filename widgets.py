@@ -1,4 +1,5 @@
 import os
+from qasync import asyncSlot
 import asyncio
 from PySide6.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QLineEdit,
                                QPushButton, QLabel, QDateEdit, QDateTimeEdit,
@@ -444,13 +445,17 @@ def _read_file(path):
         return f.read()
 
 
-def _prepare_image_bytes(data):
-    """Подготовить загружаемое изображение В ФОНОВОМ ПОТОКЕ: сжать крупное фото
-    (downscale → JPEG), снять размер по метаданным и декодировать миниатюру.
-    Возвращает (data, size|None, thumb_qimage|None)."""
-    smaller = _downscale_image_bytes(data, 2560, 90)
-    if smaller is not None:
-        data = smaller
+def _prepare_image_bytes(data, downscale=True):
+    """Подготовить загружаемое изображение В ФОНОВОМ ПОТОКЕ: при downscale=True
+    сжать крупное фото (downscale → JPEG), снять размер по метаданным и
+    декодировать миниатюру. Возвращает (data, size|None, thumb_qimage|None).
+
+    downscale управляется настройкой image_downscale и применяется одинаково ко
+    всем источникам (диск и буфер обмена) — M6-02."""
+    if downscale:
+        smaller = _downscale_image_bytes(data, 2560, 90)
+        if smaller is not None:
+            data = smaller
     size = GalleryWidget._read_image_size(data)
     thumb = _decode_thumb(data, 100)
     return data, size, thumb
@@ -494,9 +499,24 @@ class GalleryWidget(QWidget):
         self._image_loader = None
         # Поколение предпросмотра: гасит устаревшую async-цепочку при смене карточки.
         self._preload_gen = 0
+        # Активные задачи загрузки файлов в галерею. Пока они не завершены, BLOB
+        # ещё не в элементе (bytes=None) и get_data его пропустит — сохранение до
+        # их завершения потеряло бы картинку (M6-01). Save их дожидается.
+        self._upload_tasks = set()
+
+    def _downscale_enabled(self):
+        """Включено ли сжатие больших изображений при импорте (настройка)."""
+        return bool(self.config.get("image_downscale", True)) if self.config else True
 
     def _read_file_bytes(self, path):
         try:
+            # Проверяем размер ДО чтения (M6-04): путь из буфера обмена тоже не
+            # должен затягивать в память гигабайтный файл до проверки лимита.
+            if os.path.getsize(path) > self._MAX_IMAGE_BYTES:
+                mb = self._MAX_IMAGE_BYTES // (1024 * 1024)
+                _warn(self.config, self, "Слишком большой файл",
+                      f"Файл больше {mb} МБ и не будет загружен.")
+                return None
             with open(path, "rb") as f:
                 return f.read()
         except OSError as e:
@@ -660,7 +680,21 @@ class GalleryWidget(QWidget):
         async-конвейер загрузки. Реальная работа — в _upload_pipeline."""
         self.add_item(None)                  # placeholder «[ фото ]», bytes=None
         item = self.items[-1]
-        util.fire(self._upload_pipeline(item, path))
+        task = util.fire(self._upload_pipeline(item, path))
+        # Под работающим event-loop fire возвращает Task — учитываем его, чтобы
+        # Save мог дождаться (M6-01). Без loop (тесты) конвейер уже отработал.
+        if asyncio.isfuture(task):
+            self._upload_tasks.add(task)
+            task.add_done_callback(self._upload_tasks.discard)
+
+    def has_pending_uploads(self):
+        """Идут ли ещё загрузки файлов в галерею (BLOB не готовы для get_data)."""
+        return bool(self._upload_tasks)
+
+    async def wait_pending_uploads(self):
+        """Дождаться завершения всех активных загрузок файлов (для Save, M6-01)."""
+        if self._upload_tasks:
+            await asyncio.gather(*list(self._upload_tasks), return_exceptions=True)
 
     async def _upload_pipeline(self, item, path):
         """Async-конвейер загрузки картинки с диска. Разные операции — в разных
@@ -677,7 +711,7 @@ class GalleryWidget(QWidget):
             _warn(self.config, self, "Ошибка", f"Не удалось прочитать файл:\n{e}")
             return
         data, size, thumb = await loop.run_in_executor(
-            None, _prepare_image_bytes, data)
+            None, _prepare_image_bytes, data, self._downscale_enabled())
         if item not in self.items:
             return                           # элемент удалили, пока грузился
         if not self._accept_image_checked(data, size):
@@ -736,7 +770,9 @@ class GalleryWidget(QWidget):
         self.items_layout.removeWidget(w)
         w.deleteLater()
 
-    def paste_image(self):
+    @asyncSlot()
+    async def paste_image(self):
+        loop = asyncio.get_running_loop()
         clipboard = QApplication.clipboard()
         mime_data = clipboard.mimeData()
         data = None
@@ -745,7 +781,7 @@ class GalleryWidget(QWidget):
         if mime_data.hasImage():
             image = clipboard.image()
             if not image.isNull():
-                data = self._image_to_png_bytes(image)
+                data = await loop.run_in_executor(None, self._image_to_png_bytes, image)
         # 2. Файл картинки (из Проводника)
         elif mime_data.hasUrls():
             for url in mime_data.urls():
@@ -759,7 +795,11 @@ class GalleryWidget(QWidget):
                 data = self._read_file_bytes(text)
 
         if data:
-            if self._accept_image(data):
+            # Единое поведение с загрузкой с диска: сжимаем (если включено) и
+            # снимаем размер в фоне (M6-02), затем добавляем.
+            data, size, _ = await loop.run_in_executor(
+                None, _prepare_image_bytes, data, self._downscale_enabled())
+            if self._accept_image_checked(data, size):
                 self.add_item(data)
         else:
             _warn(

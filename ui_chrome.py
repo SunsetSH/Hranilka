@@ -129,10 +129,20 @@ class WindowChromeMixin:
             self._lock_screen()
 
     def _lock_screen(self):
+        # H6-05: откладываем авто-блокировку при несохранённых правках ТОЛЬКО в
+        # зашифрованном режиме — там lock обнуляет ключ, и плейн-черновики из
+        # памяти были бы потеряны. Таймер не останавливаем: на следующем интервале
+        # проверка повторится, и как только правок не останется — блокировка пройдёт.
+        if self.db.encrypted and (self.is_editing or self._dirty_ids
+                                  or self._edit_cache):
+            self.statusBar().showMessage(
+                "Авто-блокировка отложена: есть несохранённые изменения.", 4000)
+            return
         self._idle_timer.stop()
-        # Несохранённые правки текущей карточки не теряем при авто-блокировке
-        # (H5-03): стэшим их в кеш до показа заглушки — так же, как при обычном
-        # переключении между аккаунтами (on_item_selected).
+        # В обычном (plaintext) режиме «блокировка» лишь скрывает карточку с экрана:
+        # ключ не теряется, поэтому несохранённые правки безопасно стэшим в кеш и
+        # восстанавливаем при возврате (H5-03). В encrypted сюда попадаем уже без
+        # правок (см. ранний выход выше), так что стэш — no-op.
         if self.is_editing and self._current_account_id is not None:
             self._stash_current_edits(self._current_account_id)
             self._refresh_dirty_markers()
@@ -188,8 +198,9 @@ class WindowChromeMixin:
                 "место/проверьте доступ к файлу и повторите.",
             )
             return
-        self._edit_cache.clear()
-        self._dirty_ids.clear()
+        # Сюда попадаем только без несохранённых правок (см. _lock_screen, H6-05),
+        # поэтому кеш уже пуст — отдельная очистка не нужна. Снимаем лишь карточку
+        # из памяти (гигиена секретов).
         self.current_account_data = None
         self._unlocking = True
         try:

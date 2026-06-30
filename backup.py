@@ -146,14 +146,17 @@ def restore_backup(backup_path: str, db_path: str) -> None:
         try:
             os.replace(tmp, dst)            # атомарная подмена
         except OSError:
+            # Откат атомарно (M6-05): прежняя БД — в durable-копии rollback;
+            # os.replace в пределах каталога не оставит dst частично записанным,
+            # в отличие от прежнего copy2.
             if had_dst and rollback.exists():
-                shutil.copy2(rollback, dst)  # откат к прежнему состоянию
+                os.replace(rollback, dst)
             raise
         # Подтверждаем, что записанный файл открывается. rollback держим до этого
         # момента — если проверка не прошла, откатываемся к прежней БД.
         if not _is_valid_db(dst):
             if had_dst and rollback.exists():
-                shutil.copy2(rollback, dst)
+                os.replace(rollback, dst)
             raise ValueError(
                 "Восстановленный файл не открывается; выполнен откат к прежней базе.")
     finally:

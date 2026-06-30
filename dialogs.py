@@ -697,8 +697,13 @@ class SettingsDialog(ThemedDialog):
         if self._db is None:
             return
         # Монопольно через гейт: VACUUM блокирует БД и не должен конкурировать с
-        # фоновой записью; в шифр. режиме после сжатия перезапишется контейнер.
-        ok, err = self._run_vault_op(self._db.vacuum)
+        # фоновой записью. В шифр. режиме сразу же синхронно сбрасываем сжатый
+        # контейнер на диск (flush) — чтобы «Готово» сообщалось по факту durable
+        # записи, а не до неё (L6-02). Сбой записи вернётся как ошибка.
+        def _vacuum_durable():
+            self._db.vacuum()
+            self._db.flush()        # no-op в обычном режиме; в шифр. — запись на диск
+        ok, err = self._run_vault_op(_vacuum_durable)
         if not ok:
             themed_info(self.config, self, "Ошибка", f"Не удалось сжать базу:\n{err}")
             return

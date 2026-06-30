@@ -21,6 +21,14 @@ from domain import days_until_password_change, canonical_link_pair
 #     CHECK(account_id < linked_account_id) пересборкой таблицы linked_accounts.
 SCHEMA_VERSION = 7
 
+# Обязательные таблицы актуальной схемы. На «быстром пути» create_tables() даже
+# при совпадении версии проверяет их наличие (M6-06): частично повреждённую базу
+# нельзя принимать слепо — недостающие таблицы будут пересозданы.
+_REQUIRED_TABLES = frozenset({
+    "folders", "services", "accounts", "personal_data", "secret_questions",
+    "recovery_phrases", "recovery_codes", "gallery", "linked_accounts", "app_meta",
+})
+
 
 class FutureSchemaError(Exception):
     """База создана более новой версией программы (её схема новее поддерживаемой).
@@ -39,6 +47,12 @@ class VaultConflictError(Exception):
     """Файл-БД на диске изменился извне (другой программой, синхронизацией,
     восстановлением) с момента, как мы его открыли/последний раз сохранили.
     Перезапись затёрла бы чужие изменения — поэтому требуется решение пользователя."""
+
+
+class StaleSessionError(Exception):
+    """Фоновая run_async-операция относится к уже закрытой/сменённой сессии БД
+    (между постановкой в очередь и выполнением произошёл close/lock/restore).
+    Вызыватель должен трактовать это как устаревший результат и не применять его."""
 
 
 class Database:
@@ -75,15 +89,39 @@ class Database:
         self._lock = threading.RLock()
         self._executor: ThreadPoolExecutor | None = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="db-worker")
+        # Поколение сессии БД: растёт при каждой смене соединения (connect/
+        # open_encrypted/lock/close). Фоновая run_async-операция, поставленная до
+        # close/lock/restore, не должна выполниться над уже другим conn (H6-03):
+        # перед вызовом метода под локом сверяем поколение и прерываемся, если оно
+        # сменилось. Так привилегированные операции (lock/restore) безопасны даже
+        # при висящих в очереди фоновых задачах прежней сессии.
+        self._session_gen = 0
+
+    def _bump_session(self):
+        """Отметить смену соединения — погасить фоновые операции прежней сессии."""
+        self._session_gen += 1
 
     async def run_async(self, method, *args, **kwargs):
         """Выполнить синхронный метод БД в фоновом потоке, не блокируя UI-поток.
 
         method — публичный метод этого экземпляра (уже обёрнут локом). Результат
-        возвращается обычным await. Пример: await db.run_async(db.load_account, id)."""
+        возвращается обычным await. Пример: await db.run_async(db.load_account, id).
+
+        Если за время ожидания в очереди сессия БД сменилась (close/lock/restore),
+        метод НЕ выполняется — поднимается StaleSessionError (вызыватель трактует
+        как «результат устарел»)."""
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            self._executor, lambda: method(*args, **kwargs))
+        gen = self._session_gen
+
+        def _call():
+            # Сверка поколения и вызов — под одним локом: close/lock не вклинятся
+            # между проверкой и работой метода (метод берёт тот же реентрантный лок).
+            with self._lock:
+                if self._session_gen != gen:
+                    raise StaleSessionError()
+                return method(*args, **kwargs)
+
+        return await loop.run_in_executor(self._executor, _call)
 
     def shutdown_executor(self):
         """Остановить поток-исполнитель async-операций (идемпотентно). Вызывать на
@@ -115,6 +153,7 @@ class Database:
         self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._disk_revision = self._stat_revision()
         self._setup_conn()
+        self._bump_session()
 
     def open_encrypted(self, db_bytes: bytes, dek: bytes, header: dict) -> None:
         """Открыть расшифрованные байты БД в памяти. Файл остаётся шифрованным;
@@ -128,6 +167,7 @@ class Database:
             self.conn.deserialize(db_bytes)  # type: ignore[attr-defined]  # есть в CPython 3.11+
         self._disk_revision = self._stat_revision()
         self._setup_conn()
+        self._bump_session()
 
     def _stat_revision(self):
         """«Ревизия» файла на диске (st_mtime_ns, размер) или None, если файла нет."""
@@ -255,6 +295,7 @@ class Database:
         self.cursor = None
         self._dek = None
         self._dirty = False
+        self._bump_session()
 
     def _mark_dirty(self):
         """Пометить БД как изменённую и уведомить контроллер (для отложенной
@@ -376,8 +417,13 @@ class Database:
             _ver = None         # пустая новая база — создаём с нуля
         if _ver is not None and _ver > SCHEMA_VERSION:
             raise FutureSchemaError(_ver, SCHEMA_VERSION)
-        if _ver == SCHEMA_VERSION:
-            return              # схема актуальна — делать нечего
+        if _ver == SCHEMA_VERSION and _REQUIRED_TABLES.issubset(existing):
+            return              # схема актуальна и все таблицы на месте — делать нечего
+        # M6-06: даже при «актуальной» версии не доверяем ей слепо — если
+        # обязательной таблицы нет (частично повреждённая база), НЕ возвращаемся
+        # рано, а проходим ниже CREATE TABLE IF NOT EXISTS и восстанавливаем её.
+        # Полный foreign_key_check на горячем пути не запускаем (дорого на больших
+        # базах); целостность связей проверяется отдельной операцией.
 
         # Таблица папок
         self.cursor.execute("""
@@ -753,6 +799,7 @@ class Database:
             self._dirty = False
         if self.conn:
             self.conn.close()
+        self._bump_session()
 
     def wipe_all_data(self):
         """Удаляет все пользовательские данные, сохраняя структуру таблиц.
@@ -1163,25 +1210,30 @@ class Database:
     def set_links(self, account_id: int, target_ids: list[int]) -> None:
         """Задаёт связи аккаунта (симметрично). Старые связи этого аккаунта заменяются."""
         with self.conn:
-            self.cursor.execute(
-                "DELETE FROM linked_accounts WHERE account_id = ? OR linked_account_id = ?",
-                (account_id, account_id),
-            )
-            seen = set()
-            for t in target_ids:
-                # Пропускаем самоссылку и повторы во входном списке (дедуп).
-                if t == account_id or t in seen:
-                    continue
-                seen.add(t)
-                # Каноническая форма: account_id < linked_account_id. Так (A,B) и
-                # (B,A) — одна и та же строка (закреплено CHECK в схеме, M3-06).
-                lo, hi = canonical_link_pair(account_id, t)
-                self.cursor.execute(
-                    "INSERT OR IGNORE INTO linked_accounts "
-                    "(account_id, linked_account_id) VALUES (?, ?)",
-                    (lo, hi),
-                )
+            self._set_links_rows(account_id, target_ids)
         self._mark_dirty()
+
+    def _set_links_rows(self, account_id: int, target_ids: list[int]) -> None:
+        """Тело set_links без управления транзакцией/пометкой dirty — чтобы запись
+        связей можно было выполнить в общей транзакции с save_account (H6-02)."""
+        self.cursor.execute(
+            "DELETE FROM linked_accounts WHERE account_id = ? OR linked_account_id = ?",
+            (account_id, account_id),
+        )
+        seen = set()
+        for t in target_ids:
+            # Пропускаем самоссылку и повторы во входном списке (дедуп).
+            if t == account_id or t in seen:
+                continue
+            seen.add(t)
+            # Каноническая форма: account_id < linked_account_id. Так (A,B) и
+            # (B,A) — одна и та же строка (закреплено CHECK в схеме, M3-06).
+            lo, hi = canonical_link_pair(account_id, t)
+            self.cursor.execute(
+                "INSERT OR IGNORE INTO linked_accounts "
+                "(account_id, linked_account_id) VALUES (?, ?)",
+                (lo, hi),
+            )
 
     # ----- Загрузка/сохранение полной карточки аккаунта -----
     # Работает с примитивами (str/int/bytes); конвертация дат и Qt-типов
@@ -1273,57 +1325,71 @@ class Database:
         """Сохраняет полную карточку аккаунта. data — словарь примитивов в
         формате load_account(). Связанные таблицы перезаписываются целиком."""
         with self.conn:
-            f = data["fields"]
-            self.cursor.execute(
-                """UPDATE accounts SET
-                    account_name = ?, url = ?, login = ?, password = ?, creation_date = ?,
-                    password_changed_date = ?, password_change_interval_days = ?,
-                    notes = ?, ip = ?, browser = ?, os = ?, extra_info = ?
-                   WHERE id = ?""",
-                (f["account_name"], f.get("url"), f["login"], f["password"], f["creation_date"],
-                 f["password_changed_date"], f["password_change_interval_days"],
-                 f["notes"], f["ip"], f["browser"], f["os"], f["extra_info"], account_id),
-            )
-
-            p = data["personal"]
-            self.cursor.execute("DELETE FROM personal_data WHERE account_id = ?", (account_id,))
-            self.cursor.execute(
-                """INSERT INTO personal_data
-                   (account_id, first_name, last_name, middle_name, birth_date, address)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (account_id, p["first_name"], p["last_name"], p["middle_name"],
-                 p["birth_date"], p["address"]),
-            )
-
-            self.cursor.execute("DELETE FROM secret_questions WHERE account_id = ?", (account_id,))
-            for q in data["questions"]:
-                self.cursor.execute(
-                    "INSERT INTO secret_questions (account_id, question, answer) VALUES (?, ?, ?)",
-                    (account_id, q["q"], q["a"]),
-                )
-
-            r = data["recovery"]
-            self.cursor.execute("DELETE FROM recovery_phrases WHERE account_id = ?", (account_id,))
-            self.cursor.execute(
-                "INSERT INTO recovery_phrases (account_id, phrase, device_id) VALUES (?, ?, ?)",
-                (account_id, r["phrase"], r["device_id"]),
-            )
-
-            self.cursor.execute("DELETE FROM recovery_codes WHERE account_id = ?", (account_id,))
-            for code in data["codes"]:
-                self.cursor.execute(
-                    "INSERT INTO recovery_codes (account_id, code) VALUES (?, ?)",
-                    (account_id, code),
-                )
-
-            self.cursor.execute("DELETE FROM gallery WHERE account_id = ?", (account_id,))
-            for g in data["gallery"]:
-                blob = sqlite3.Binary(g["data"]) if g["data"] is not None else None
-                self.cursor.execute(
-                    "INSERT INTO gallery (account_id, description, image_data) VALUES (?, ?, ?)",
-                    (account_id, g["desc"], blob),
-                )
+            self._save_account_rows(account_id, data)
         self._mark_dirty()
+
+    def save_account_with_links(self, account_id, data, target_ids):
+        """Атомарно сохраняет карточку и её связи В ОДНОЙ транзакции (H6-02):
+        раньше save_account и set_links были двумя транзакциями — сбой второй
+        оставлял карточку записанной, а связи нет. Теперь либо обе, либо ни одна."""
+        with self.conn:
+            self._save_account_rows(account_id, data)
+            self._set_links_rows(account_id, target_ids)
+        self._mark_dirty()
+
+    def _save_account_rows(self, account_id, data):
+        """Тело save_account без управления транзакцией/пометкой dirty (для
+        переиспользования в save_account_with_links под общей транзакцией)."""
+        f = data["fields"]
+        self.cursor.execute(
+            """UPDATE accounts SET
+                account_name = ?, url = ?, login = ?, password = ?, creation_date = ?,
+                password_changed_date = ?, password_change_interval_days = ?,
+                notes = ?, ip = ?, browser = ?, os = ?, extra_info = ?
+               WHERE id = ?""",
+            (f["account_name"], f.get("url"), f["login"], f["password"], f["creation_date"],
+             f["password_changed_date"], f["password_change_interval_days"],
+             f["notes"], f["ip"], f["browser"], f["os"], f["extra_info"], account_id),
+        )
+
+        p = data["personal"]
+        self.cursor.execute("DELETE FROM personal_data WHERE account_id = ?", (account_id,))
+        self.cursor.execute(
+            """INSERT INTO personal_data
+               (account_id, first_name, last_name, middle_name, birth_date, address)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (account_id, p["first_name"], p["last_name"], p["middle_name"],
+             p["birth_date"], p["address"]),
+        )
+
+        self.cursor.execute("DELETE FROM secret_questions WHERE account_id = ?", (account_id,))
+        for q in data["questions"]:
+            self.cursor.execute(
+                "INSERT INTO secret_questions (account_id, question, answer) VALUES (?, ?, ?)",
+                (account_id, q["q"], q["a"]),
+            )
+
+        r = data["recovery"]
+        self.cursor.execute("DELETE FROM recovery_phrases WHERE account_id = ?", (account_id,))
+        self.cursor.execute(
+            "INSERT INTO recovery_phrases (account_id, phrase, device_id) VALUES (?, ?, ?)",
+            (account_id, r["phrase"], r["device_id"]),
+        )
+
+        self.cursor.execute("DELETE FROM recovery_codes WHERE account_id = ?", (account_id,))
+        for code in data["codes"]:
+            self.cursor.execute(
+                "INSERT INTO recovery_codes (account_id, code) VALUES (?, ?)",
+                (account_id, code),
+            )
+
+        self.cursor.execute("DELETE FROM gallery WHERE account_id = ?", (account_id,))
+        for g in data["gallery"]:
+            blob = sqlite3.Binary(g["data"]) if g["data"] is not None else None
+            self.cursor.execute(
+                "INSERT INTO gallery (account_id, description, image_data) VALUES (?, ?, ?)",
+                (account_id, g["desc"], blob),
+            )
 
     # ----- Сбор данных для экспорта -----
 

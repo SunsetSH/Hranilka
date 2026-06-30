@@ -218,6 +218,42 @@ async def test_queue_file_load_completes(qapp, tmp_path):
     assert len(gw.get_data()) == 1
 
 
+async def test_pending_uploads_tracked(qapp, tmp_path):
+    """Save должен дождаться незавершённых загрузок (M6-01): пока конвейер не
+    отработал, has_pending_uploads() == True, и bytes ещё None."""
+    img_path = tmp_path / "img.png"
+    img_path.write_bytes(_png_bytes(40, 40))
+    gw = GalleryWidget()
+    gw._queue_file_load(str(img_path))
+    assert gw.has_pending_uploads() is True
+    await gw.wait_pending_uploads()
+    assert gw.has_pending_uploads() is False
+    assert gw.items[0]["bytes"] is not None
+
+
+def test_prepare_respects_downscale_flag(qapp):
+    """Настройка image_downscale реально влияет на конвейер (M6-02): при
+    downscale=False крупное изображение не уменьшается и не перекодируется."""
+    from widgets import _prepare_image_bytes
+    big = _gradient_png(3000, 2000)
+    _, size_on, _ = _prepare_image_bytes(big, downscale=True)
+    data_off, size_off, _ = _prepare_image_bytes(big, downscale=False)
+    assert max(size_on) <= 2560
+    assert max(size_off) == 3000
+    assert len(data_off) == len(big)        # не перекодировано
+
+
+def test_read_file_bytes_rejects_oversized(qapp, tmp_path, monkeypatch):
+    """Путь из буфера обмена тоже не читает гигантский файл в память до проверки
+    лимита (M6-04)."""
+    import os as _os
+    p = tmp_path / "x.png"
+    p.write_bytes(_png_bytes(10, 10))
+    monkeypatch.setattr(_os.path, "getsize", lambda _: 20 * 1024 * 1024)
+    gw = GalleryWidget()
+    assert gw._read_file_bytes(str(p)) is None
+
+
 def test_upload_oversized_stat_check(qapp, tmp_path, monkeypatch):
     """os.stat-проверка отвергает большой файл без чтения (M5-04)."""
     import os as _os

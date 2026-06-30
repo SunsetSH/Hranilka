@@ -78,6 +78,11 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, AccountCardMixin,
         self._edit_cache = {}                # id -> {"storage":..., "links":[...]} несохранённые правки
         self._dirty_ids = set()              # аккаунты с несохранёнными правками
         self._any_db_changes = False         # True если в этой сессии что-то было записано в БД
+        # Поколение карточки: растёт при каждом переключении аккаунта. Async-загрузка
+        # и async-сохранение сверяют свой gen с текущим — устаревший результат не
+        # трогает UI/кеш чужого аккаунта (H6-01/H6-02).
+        self._card_gen = 0
+        self._card_busy = False              # идёт async-загрузка/сохранение карточки
 
         # Таймер авто-очистки буфера обмена
         self._clip_timer = QTimer(self)
@@ -595,25 +600,72 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, AccountCardMixin,
         сохранения — иначе текущая БД затёрла бы восстановленный файл. После
         замены переоткрываем БД (восстановленный файл может оказаться
         зашифрованным — тогда _open_database спросит пароль)."""
+        import os
+        import shutil
         if not self.vault.wait_idle():
             return False, ("Фоновое сохранение базы не завершилось вовремя.\n"
                            "Повторите попытку через несколько секунд.")
         self.db.close(persist=False)
+        db_path = self.db.db_path
+        # Страховочная копия текущей БД. Восстановленный encrypted-файл проверяется
+        # лишь структурно (_is_valid_db), а подлинность (GCM) и пароль — только при
+        # открытии. Если открыть не удалось (повреждён/чужой/отменён ввод пароля) —
+        # rollback удалён бы внутри restore_backup, и рабочая БД пропала бы (H6-04).
+        # Поэтому держим собственную копию и возвращаем прежнюю БД при неудаче.
+        rollback = None
+        if os.path.exists(db_path):
+            rollback = db_path + ".pre-restore"
+            try:
+                shutil.copy2(db_path, rollback)
+            except OSError:
+                rollback = None
         try:
-            bk.restore_backup(path, self.db.db_path)
+            bk.restore_backup(path, db_path)
         except Exception as e:
             # restore_backup при сбое откатывает файл к прежнему состоянию —
             # переоткрываем БД как была и сообщаем об ошибке.
+            self._discard_file(rollback)
             if not self._open_database(self):
                 self.close()
                 return False, str(e)
             self._after_db_reopened(None)
             return False, str(e)
         if not self._open_database(self):
+            # Восстановленный файл не открылся/не аутентифицирован/пароль не введён.
+            # Возвращаем прежнюю БД из страховочной копии — рабочие данные не теряем.
+            if self._rollback_restore(rollback, db_path):
+                return False, ("Восстановленный файл не удалось открыть; "
+                               "возвращена прежняя база.")
             self.close()
-            return True, None
+            return False, "Восстановленный файл не удалось открыть."
+        self._discard_file(rollback)
         self._after_db_reopened("База данных восстановлена из бэкапа.")
         return True, None
+
+    def _discard_file(self, path):
+        """Тихо удалить временный файл (страховочную копию), если он есть."""
+        import os
+        if path and os.path.exists(path):
+            try:
+                os.remove(path)
+            except OSError as e:
+                logging.warning("Не удалось удалить временный файл %s: %s", path, e)
+
+    def _rollback_restore(self, rollback, db_path):
+        """Вернуть прежнюю БД из страховочной копии после неудачного восстановления.
+        Возвращает True, если прежняя база возвращена и открыта."""
+        import os
+        if not rollback or not os.path.exists(rollback):
+            return False
+        try:
+            os.replace(rollback, db_path)
+        except OSError as e:
+            logging.warning("Не удалось вернуть прежнюю БД: %s", e)
+            return False
+        if not self._open_database(self):
+            return False
+        self._after_db_reopened("Восстановление отменено: возвращена прежняя база.")
+        return True
 
     def _after_db_reopened(self, message):
         """Сброс состояния и UI после переоткрытия БД (восстановление бэкапа)."""

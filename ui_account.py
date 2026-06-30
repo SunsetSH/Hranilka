@@ -4,8 +4,11 @@
 редактирования, кеш несохранённых правок, связанные аккаунты, генерация пароля
 и ПД, обновление строки статуса. Состояние разделяется с окном через self —
 поведение идентично прежнему. Подмешивается в MainWindow перед QMainWindow."""
+import logging
+
 from PySide6.QtCore import QDate, QDateTime
 
+from database import StaleSessionError
 from models import AccountData
 import pd_generator
 import util
@@ -23,6 +26,23 @@ class AccountCardMixin:
         self.save_btn.hide()
         self.cancel_btn.hide()
 
+    def _set_card_busy(self, busy):
+        """Блокирует кнопки Edit/Save/Cancel на время async-загрузки/сохранения
+        карточки. Пока идёт загрузка нового аккаунта, форма ещё показывает данные
+        предыдущего — без блокировки пользователь мог бы нажать «Редактировать» и
+        записать чужой снимок (H6-01); блокировка Save исключает и повторный
+        запуск сохранения (H6-02)."""
+        self._card_busy = busy
+        self.edit_btn.setEnabled(not busy)
+        self.save_btn.setEnabled(not busy)
+        self.cancel_btn.setEnabled(not busy)
+
+    def _show_card_error(self, title, exc):
+        """Показать пользователю ошибку async-операции карточки (L6-03): иначе
+        кнопка визуально ничего не делает, а причина уходит только в лог."""
+        logging.error("%s: %s", title, exc, exc_info=exc)
+        theme.themed_info(self.config, self, title, f"{title}:\n{exc}")
+
     def on_item_selected(self, current, previous):
         node = self._node(current)
         new_id = node["id"] if (node and node["type"] == "account") else None
@@ -33,9 +53,15 @@ class AccountCardMixin:
             self._stash_current_edits(self._current_account_id)
             self._refresh_dirty_markers()
 
+        # Новое поколение карточки: любой ещё не завершённый async-результат для
+        # прежнего аккаунта теперь устарел и не должен трогать UI/кеш.
+        self._card_gen += 1
+        gen = self._card_gen
+
         if new_id is None:
             self._current_account_id = None
             self.is_editing = False
+            self._set_card_busy(False)
             self._show_placeholder()
             self._update_status_info()
             return
@@ -45,50 +71,61 @@ class AccountCardMixin:
         self.current_tree_item = current
         self._current_account_id = new_id
         # Чтение карточки/связей/объёма галереи — в фоновом потоке БД (UI не виснет).
-        util.fire(self._load_account_into_ui(new_id))
+        self._set_card_busy(True)
+        util.fire(self._load_account_into_ui(new_id, gen))
 
-    async def _load_account_into_ui(self, new_id):
+    async def _load_account_into_ui(self, new_id, gen):
         """Асинхронно загрузить карточку и заполнить интерфейс. Все обращения к БД
-        идут через db.run_async (фоновый поток). После каждого await проверяем, что
-        пользователь не переключился на другой аккаунт (иначе результат устарел)."""
-        if new_id in self._edit_cache:
-            # Возврат к аккаунту с несохранёнными правками — восстанавливаем из кеша.
-            cached = self._edit_cache[new_id]
-            links = await self.db.run_async(self._resolve_link_names, cached["links"])
-            other_bytes = await self.db.run_async(
-                self.db.gallery_total_bytes, new_id)
-            if self._current_account_id != new_id:
-                return
-            self.current_account_data = AccountData.from_storage(cached["storage"])
-            self.load_data_to_ui(links=links, other_bytes=other_bytes)
-            self.is_editing = True
-            self.tabs.set_all_editable(True)
-            self.edit_btn.hide(); self.save_btn.show(); self.cancel_btn.show()
-        else:
-            storage = await self.db.run_async(self.db.load_account, new_id)
-            if self._current_account_id != new_id:
-                return
-            if storage is None:
-                # Аккаунт исчез между выбором и загрузкой (удалён/перемещён в
-                # корзину) — не падаем на from_storage(None), показываем заглушку.
-                self._current_account_id = None
+        идут через db.run_async (фоновый поток). После каждого await сверяем gen с
+        текущим: если пользователь переключился — результат устарел, выходим, не
+        снимая блокировку (ею владеет более новая загрузка)."""
+        try:
+            if new_id in self._edit_cache:
+                # Возврат к аккаунту с несохранёнными правками — восстанавливаем из кеша.
+                cached = self._edit_cache[new_id]
+                links = await self.db.run_async(self._resolve_link_names, cached["links"])
+                other_bytes = await self.db.run_async(
+                    self.db.gallery_total_bytes, new_id)
+                if gen != self._card_gen:
+                    return
+                self.current_account_data = AccountData.from_storage(cached["storage"])
+                self.load_data_to_ui(links=links, other_bytes=other_bytes)
+                self.is_editing = True
+                self.tabs.set_all_editable(True)
+                self.edit_btn.hide(); self.save_btn.show(); self.cancel_btn.show()
+            else:
+                storage = await self.db.run_async(self.db.load_account, new_id)
+                if gen != self._card_gen:
+                    return
+                if storage is None:
+                    # Аккаунт исчез между выбором и загрузкой (удалён/перемещён в
+                    # корзину) — не падаем на from_storage(None), показываем заглушку.
+                    self._current_account_id = None
+                    self.is_editing = False
+                    self._show_placeholder()
+                    self._update_status_info()
+                    return
+                links = await self.db.run_async(self.db.get_links, new_id)
+                other_bytes = await self.db.run_async(
+                    self.db.gallery_total_bytes, new_id)
+                if gen != self._card_gen:
+                    return
+                self.current_account_data = AccountData.from_storage(storage)
                 self.is_editing = False
-                self._show_placeholder()
-                self._update_status_info()
-                return
-            links = await self.db.run_async(self.db.get_links, new_id)
-            other_bytes = await self.db.run_async(
-                self.db.gallery_total_bytes, new_id)
-            if self._current_account_id != new_id:
-                return
-            self.current_account_data = AccountData.from_storage(storage)
-            self.is_editing = False
-            self.load_data_to_ui(links=links, other_bytes=other_bytes)
-            self.tabs.set_all_editable(False)
-            self.edit_btn.show(); self.save_btn.hide(); self.cancel_btn.hide()
+                self.load_data_to_ui(links=links, other_bytes=other_bytes)
+                self.tabs.set_all_editable(False)
+                self.edit_btn.show(); self.save_btn.hide(); self.cancel_btn.hide()
 
-        self._update_status_info()
-        self._warn_password_due(new_id)
+            self._update_status_info()
+            self._warn_password_due(new_id)
+        except StaleSessionError:
+            return                               # БД закрыта/сменена (lock/restore) — молча
+        except Exception as e:                       # noqa: BLE001 — показать пользователю
+            if gen == self._card_gen:
+                self._show_card_error("Не удалось загрузить аккаунт", e)
+        finally:
+            if gen == self._card_gen:
+                self._set_card_busy(False)
 
     def _resolve_link_names(self, ids):
         """Имена связанных аккаунтов по их id (для отображения). Вызывается в
@@ -203,6 +240,8 @@ class AccountCardMixin:
         self.tabs.f_linked.set_data(links)
 
     def toggle_edit_mode(self):
+        if self._card_busy:
+            return                              # идёт загрузка/сохранение — не входим в правку
         self.is_editing = True
         self.tabs.set_all_editable(True)
         # Переключаем кнопки
@@ -212,63 +251,103 @@ class AccountCardMixin:
         self._update_status_info()
 
     def cancel_edit(self):
-        util.fire(self._cancel_edit_async())
+        if self._card_busy:
+            return
+        self._set_card_busy(True)
+        util.fire(self._cancel_edit_async(self._card_gen))
 
-    async def _cancel_edit_async(self):
+    async def _cancel_edit_async(self, gen):
         # Отмена отбрасывает несохранённые правки этого аккаунта
         aid = self._current_account_id
         self._edit_cache.pop(aid, None)
         self._dirty_ids.discard(aid)
-
         self.is_editing = False
-        storage = await self.db.run_async(self.db.load_account, aid)
-        if self._current_account_id != aid:
-            return                              # пользователь уже переключился
-        if storage is None:
-            # Аккаунт исчез, пока шло редактирование — отменять нечего.
-            self._current_account_id = None
-            self._show_placeholder()
+        try:
+            storage = await self.db.run_async(self.db.load_account, aid)
+            if gen != self._card_gen:
+                return                          # пользователь уже переключился
+            if storage is None:
+                # Аккаунт исчез, пока шло редактирование — отменять нечего.
+                self._current_account_id = None
+                self._show_placeholder()
+                self._update_status_info()
+                self._reload_tree()
+                return
+            links = await self.db.run_async(self.db.get_links, aid)
+            other_bytes = await self.db.run_async(self.db.gallery_total_bytes, aid)
+            if gen != self._card_gen:
+                return
+            self.current_account_data = AccountData.from_storage(storage)
+            self.load_data_to_ui(links=links, other_bytes=other_bytes)
+            self.tabs.set_all_editable(False)
+            self.edit_btn.show()
+            self.save_btn.hide()
+            self.cancel_btn.hide()
             self._update_status_info()
-            self._reload_tree()
-            return
-        links = await self.db.run_async(self.db.get_links, aid)
-        other_bytes = await self.db.run_async(self.db.gallery_total_bytes, aid)
-        if self._current_account_id != aid:
-            return
-        self.current_account_data = AccountData.from_storage(storage)
-        self.load_data_to_ui(links=links, other_bytes=other_bytes)
-        self.tabs.set_all_editable(False)
-        self.edit_btn.show()
-        self.save_btn.hide()
-        self.cancel_btn.hide()
-        self._update_status_info()
-        self._reload_tree()  # убрать метку несохранённых правок
+            self._reload_tree()  # убрать метку несохранённых правок
+        except StaleSessionError:
+            return                               # БД закрыта/сменена — молча
+        except Exception as e:                   # noqa: BLE001
+            if gen == self._card_gen:
+                self._show_card_error("Не удалось отменить правки", e)
+        finally:
+            if gen == self._card_gen:
+                self._set_card_busy(False)
 
     def save_account(self):
-        util.fire(self._save_account_async())
+        if self._card_busy:
+            return                              # повторный Save во время записи запрещён
+        self._set_card_busy(True)
+        util.fire(self._save_account_async(self._card_gen))
 
-    async def _save_account_async(self):
+    async def _save_account_async(self, gen):
         # Сбор данных из полей UI — синхронно (до первого await), снимок
         # согласован. get_data() может дочитать незагруженные BLOB (обычно уже
         # в кеше после предпросмотра).
-        d = self._collect_account_data()
         aid = self._current_account_id
+        if aid is None:
+            self._set_card_busy(False)
+            return
+        # Дождаться незавершённых загрузок картинок: иначе get_data() пропустит
+        # ещё не дочитанные BLOB и Save «потеряет» изображение (M6-01).
+        gallery = self.tabs.f_gallery_widget
+        if gallery.has_pending_uploads():
+            self.statusBar().showMessage("Дождитесь загрузки изображений…", 2000)
+            await gallery.wait_pending_uploads()
+            if gen != self._card_gen or self._current_account_id != aid:
+                return
+        d = self._collect_account_data()
         storage = d.to_storage()
         link_ids = self.tabs.f_linked.get_data()
-        # Запись карточки и связей — в фоновом потоке БД (UI не виснет).
-        await self.db.run_async(self.db.save_account, aid, storage)
-        await self.db.run_async(self.db.set_links, aid, link_ids)
+        # Запись карточки и связей — атомарно, в одной транзакции, в фоновом потоке.
+        try:
+            await self.db.run_async(
+                self.db.save_account_with_links, aid, storage, link_ids)
+        except StaleSessionError:
+            return                               # БД сменена (restore) — запись неактуальна
+        except Exception as e:                   # noqa: BLE001
+            if gen == self._card_gen:
+                # Снимок не потерян: возвращаем его в кеш правок, чтобы пользователь
+                # мог повторить сохранение, и показываем причину.
+                self._edit_cache[aid] = {"storage": storage, "links": link_ids}
+                self._dirty_ids.add(aid)
+                self._refresh_dirty_markers()
+                self._show_card_error("Не удалось сохранить аккаунт", e)
+                self._set_card_busy(False)
+            return
 
-        self._edit_cache.pop(aid, None)
-        self._dirty_ids.discard(aid)
         self._any_db_changes = True
-
-        if self._current_account_id == aid:
+        # Кеш правок чистим ТОЛЬКО если за время await пользователь не переключился
+        # и не перезанёс свежий черновик для aid (иначе потеряли бы новые правки, H6-02).
+        if gen == self._card_gen:
+            self._edit_cache.pop(aid, None)
+            self._dirty_ids.discard(aid)
             self.is_editing = False
             self.tabs.set_all_editable(False)
             self.edit_btn.show()
             self.save_btn.hide()
             self.cancel_btn.hide()
+            self._set_card_busy(False)
         # Перестраиваем дерево, чтобы обновить имя/маркеры (избранное, срок пароля)
         self._reload_tree()
         self.statusBar().showMessage("СОХРАНЕНО!", 2000)
