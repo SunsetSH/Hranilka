@@ -44,26 +44,56 @@ class AccountCardMixin:
         self.tabs.show()
         self.current_tree_item = current
         self._current_account_id = new_id
+        # Чтение карточки/связей/объёма галереи — в фоновом потоке БД (UI не виснет).
+        util.fire(self._load_account_into_ui(new_id))
 
+    async def _load_account_into_ui(self, new_id):
+        """Асинхронно загрузить карточку и заполнить интерфейс. Все обращения к БД
+        идут через db.run_async (фоновый поток). После каждого await проверяем, что
+        пользователь не переключился на другой аккаунт (иначе результат устарел)."""
         if new_id in self._edit_cache:
-            # Возврат к аккаунту с несохранёнными правками — восстанавливаем
+            # Возврат к аккаунту с несохранёнными правками — восстанавливаем из кеша.
             cached = self._edit_cache[new_id]
+            links = await self.db.run_async(self._resolve_link_names, cached["links"])
+            other_bytes = await self.db.run_async(
+                self.db.gallery_total_bytes, new_id)
+            if self._current_account_id != new_id:
+                return
             self.current_account_data = AccountData.from_storage(cached["storage"])
-            self.load_data_to_ui()
-            links = [{"id": i, "name": self.db.get_account_path(i)} for i in cached["links"]]
-            self.tabs.f_linked.set_data(links)
+            self.load_data_to_ui(links=links, other_bytes=other_bytes)
             self.is_editing = True
             self.tabs.set_all_editable(True)
             self.edit_btn.hide(); self.save_btn.show(); self.cancel_btn.show()
         else:
-            self.current_account_data = AccountData.from_storage(self.db.load_account(new_id))
+            storage = await self.db.run_async(self.db.load_account, new_id)
+            if self._current_account_id != new_id:
+                return
+            if storage is None:
+                # Аккаунт исчез между выбором и загрузкой (удалён/перемещён в
+                # корзину) — не падаем на from_storage(None), показываем заглушку.
+                self._current_account_id = None
+                self.is_editing = False
+                self._show_placeholder()
+                self._update_status_info()
+                return
+            links = await self.db.run_async(self.db.get_links, new_id)
+            other_bytes = await self.db.run_async(
+                self.db.gallery_total_bytes, new_id)
+            if self._current_account_id != new_id:
+                return
+            self.current_account_data = AccountData.from_storage(storage)
             self.is_editing = False
-            self.load_data_to_ui()
+            self.load_data_to_ui(links=links, other_bytes=other_bytes)
             self.tabs.set_all_editable(False)
             self.edit_btn.show(); self.save_btn.hide(); self.cancel_btn.hide()
 
         self._update_status_info()
         self._warn_password_due(new_id)
+
+    def _resolve_link_names(self, ids):
+        """Имена связанных аккаунтов по их id (для отображения). Вызывается в
+        фоновом потоке БД через run_async — get_account_path потокобезопасен."""
+        return [{"id": i, "name": self.db.get_account_path(i)} for i in ids]
 
     def _collect_account_data(self):
         """Собирает AccountData из полей UI (без записи в БД)."""
@@ -125,7 +155,7 @@ class AccountCardMixin:
         for it in self._iter_items():
             self._apply_item_style(it, self._node(it))
 
-    def load_data_to_ui(self):
+    def load_data_to_ui(self, links=None, other_bytes=None):
         d = self.current_account_data
         self.tabs.f_name.set_text(d.name)
         self.tabs.f_url.set_text(d.url)
@@ -149,19 +179,28 @@ class AccountCardMixin:
         self.tabs.f_questions_widget.set_data(d.secret_questions)
         self.tabs.f_codes_widget.set_data(d.one_time_codes)
         self.tabs.f_gallery_widget.set_data(d.gallery)
-        # Ленивая загрузка BLOB: виджет запросит байты конкретного изображения
-        # только когда пользователь кликнет на него или при сохранении.
+        # Ленивая загрузка BLOB: виджет читает байты картинки в фоновом потоке
+        # (load_gallery_image потокобезопасен — доступ к БД под RLock).
         self.tabs.f_gallery_widget.set_image_loader(self.db.load_gallery_image)
-        # Лимит суммарного объёма галереи: провайдер берёт из БД объём картинок
-        # ОСТАЛЬНЫХ аккаунтов (текущий держится в памяти карточки — не дублируем).
+        # Лимит суммарного объёма галереи. В горячем пути объём прочих аккаунтов
+        # уже посчитан асинхронно (other_bytes) — провайдер отдаёт готовое число,
+        # без обращения к БД при добавлении картинки. Иначе (холодный путь) —
+        # живой провайдер (синхронный запрос к БД при добавлении).
         aid = self._current_account_id
-        self.tabs.f_gallery_widget.set_size_context(
-            (lambda a=aid: self.db.gallery_total_bytes(exclude_account_id=a))
-            if aid is not None else None)
+        if other_bytes is not None:
+            self.tabs.f_gallery_widget.set_size_context(lambda v=other_bytes: v)
+        elif aid is not None:
+            self.tabs.f_gallery_widget.set_size_context(
+                lambda a=aid: self.db.gallery_total_bytes(exclude_account_id=a))
+        else:
+            self.tabs.f_gallery_widget.set_size_context(None)
 
-        # Связанные аккаунты грузим напрямую из БД (это отношение, не поле аккаунта)
-        node = self._node(self.current_tree_item)
-        self.tabs.f_linked.set_data(self.db.get_links(node["id"]) if node else [])
+        # Связанные аккаунты: в горячем пути переданы готовыми (links), иначе —
+        # синхронный запрос к БД (холодный путь / прямой вызов).
+        if links is None:
+            node = self._node(self.current_tree_item)
+            links = self.db.get_links(node["id"]) if node else []
+        self.tabs.f_linked.set_data(links)
 
     def toggle_edit_mode(self):
         self.is_editing = True
@@ -173,14 +212,31 @@ class AccountCardMixin:
         self._update_status_info()
 
     def cancel_edit(self):
+        util.fire(self._cancel_edit_async())
+
+    async def _cancel_edit_async(self):
         # Отмена отбрасывает несохранённые правки этого аккаунта
         aid = self._current_account_id
         self._edit_cache.pop(aid, None)
         self._dirty_ids.discard(aid)
 
         self.is_editing = False
-        self.current_account_data = AccountData.from_storage(self.db.load_account(aid))
-        self.load_data_to_ui()
+        storage = await self.db.run_async(self.db.load_account, aid)
+        if self._current_account_id != aid:
+            return                              # пользователь уже переключился
+        if storage is None:
+            # Аккаунт исчез, пока шло редактирование — отменять нечего.
+            self._current_account_id = None
+            self._show_placeholder()
+            self._update_status_info()
+            self._reload_tree()
+            return
+        links = await self.db.run_async(self.db.get_links, aid)
+        other_bytes = await self.db.run_async(self.db.gallery_total_bytes, aid)
+        if self._current_account_id != aid:
+            return
+        self.current_account_data = AccountData.from_storage(storage)
+        self.load_data_to_ui(links=links, other_bytes=other_bytes)
         self.tabs.set_all_editable(False)
         self.edit_btn.show()
         self.save_btn.hide()
@@ -189,20 +245,30 @@ class AccountCardMixin:
         self._reload_tree()  # убрать метку несохранённых правок
 
     def save_account(self):
+        util.fire(self._save_account_async())
+
+    async def _save_account_async(self):
+        # Сбор данных из полей UI — синхронно (до первого await), снимок
+        # согласован. get_data() может дочитать незагруженные BLOB (обычно уже
+        # в кеше после предпросмотра).
         d = self._collect_account_data()
         aid = self._current_account_id
-        self.db.save_account(aid, d.to_storage())
-        self.db.set_links(aid, self.tabs.f_linked.get_data())
+        storage = d.to_storage()
+        link_ids = self.tabs.f_linked.get_data()
+        # Запись карточки и связей — в фоновом потоке БД (UI не виснет).
+        await self.db.run_async(self.db.save_account, aid, storage)
+        await self.db.run_async(self.db.set_links, aid, link_ids)
 
         self._edit_cache.pop(aid, None)
         self._dirty_ids.discard(aid)
         self._any_db_changes = True
 
-        self.is_editing = False
-        self.tabs.set_all_editable(False)
-        self.edit_btn.show()
-        self.save_btn.hide()
-        self.cancel_btn.hide()
+        if self._current_account_id == aid:
+            self.is_editing = False
+            self.tabs.set_all_editable(False)
+            self.edit_btn.show()
+            self.save_btn.hide()
+            self.cancel_btn.hide()
         # Перестраиваем дерево, чтобы обновить имя/маркеры (избранное, срок пароля)
         self._reload_tree()
         self.statusBar().showMessage("СОХРАНЕНО!", 2000)

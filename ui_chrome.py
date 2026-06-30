@@ -130,6 +130,12 @@ class WindowChromeMixin:
 
     def _lock_screen(self):
         self._idle_timer.stop()
+        # Несохранённые правки текущей карточки не теряем при авто-блокировке
+        # (H5-03): стэшим их в кеш до показа заглушки — так же, как при обычном
+        # переключении между аккаунтами (on_item_selected).
+        if self.is_editing and self._current_account_id is not None:
+            self._stash_current_edits(self._current_account_id)
+            self._refresh_dirty_markers()
         self._show_placeholder()
         self._current_account_id = None
         self.is_editing = False

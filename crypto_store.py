@@ -25,6 +25,7 @@ import secrets
 
 from argon2.low_level import hash_secret_raw, Type
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.exceptions import InvalidTag
 
 MAGIC = b"HRNKv1"
 VERSION = 1
@@ -80,7 +81,9 @@ def _unwrap(blob: bytes, secret: str, salt: bytes, params) -> bytes:
     nonce, ct = blob[:NONCE_LEN], blob[NONCE_LEN:]
     try:
         return AESGCM(key).decrypt(nonce, ct, None)
-    except Exception:
+    except InvalidTag:
+        # Только провал аутентификации GCM = неверный secret. Прочие исключения
+        # (MemoryError, прерывание) НЕ маскируем под «неверный пароль».
         raise WrongPassword()
 
 
@@ -212,7 +215,7 @@ def unlock(container: bytes, secret: str, is_recovery: bool = False):
         dek = _unwrap(header["wrap_pw"], secret, header["salt_pw"], header["params"])
     try:
         db_bytes = AESGCM(dek).decrypt(data_nonce, data_ct, None)
-    except Exception:
+    except InvalidTag:
         raise WrongPassword()
     return db_bytes, dek, header
 

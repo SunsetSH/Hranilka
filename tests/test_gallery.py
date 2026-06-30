@@ -181,10 +181,11 @@ def test_codes_skip_empty(qapp):
     assert w.get_data() == ["abc"]
 
 
-# ─── Фоновая загрузка файлов (upload_image async) ────────────────────────────
+# ─── Async-загрузка файлов (upload_image: пул потоков через run_in_executor) ──
 
-def test_queue_file_load_placeholder(qapp, tmp_path):
-    """_queue_file_load создаёт placeholder с bytes=None — GUI не блокируется."""
+async def test_queue_file_load_placeholder(qapp, tmp_path):
+    """_queue_file_load создаёт placeholder с bytes=None — GUI не блокируется
+    (async-конвейер ещё не отработал: задача запланирована, но не выполнена)."""
     img_path = tmp_path / "img.png"
     img_path.write_bytes(_png_bytes(40, 40))
 
@@ -198,22 +199,19 @@ def test_queue_file_load_placeholder(qapp, tmp_path):
     assert gw.get_data() == []
 
 
-def test_queue_file_load_completes(qapp, tmp_path):
-    """После завершения фоновой задачи bytes заполняются и get_data возвращает данные."""
-    import time
+async def test_queue_file_load_completes(qapp, tmp_path):
+    """После завершения async-конвейера bytes заполняются и get_data их отдаёт."""
+    import asyncio
     img_path = tmp_path / "img.png"
     img_path.write_bytes(_png_bytes(40, 40))
 
     gw = GalleryWidget()
     gw._queue_file_load(str(img_path))
 
-    # Даём пулу завершить задачу и обработать сигнал.
-    deadline = time.monotonic() + 5.0
-    from PySide6.QtWidgets import QApplication
-    while gw.items and gw.items[0]["bytes"] is None:
-        QApplication.processEvents()
-        if time.monotonic() > deadline:
+    for _ in range(200):                       # даём конвейеру отработать
+        if gw.items and gw.items[0]["bytes"] is not None:
             break
+        await asyncio.sleep(0.01)
 
     assert len(gw.items) == 1
     assert gw.items[0]["bytes"] is not None

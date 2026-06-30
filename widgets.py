@@ -1,4 +1,5 @@
 import os
+import asyncio
 from PySide6.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QLineEdit,
                                QPushButton, QLabel, QDateEdit, QDateTimeEdit,
                                QTextEdit, QFileDialog, QDialog, QMessageBox,
@@ -6,6 +7,7 @@ from PySide6.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QLineEdit,
 from PySide6.QtCore import Signal, Qt, QDate, QByteArray, QBuffer, QIODevice
 from PySide6.QtGui import QPixmap, QImage, QImageReader
 from theme import themed_info, themed_confirm
+import util
 
 
 def _supported_image_exts():
@@ -387,6 +389,73 @@ class CodeListWidget(QWidget):
             del_btn = widget.layout().itemAt(2).widget()
             del_btn.setVisible(editable)
 
+def _downscale_image_bytes(data, max_side, quality):
+    """Уменьшить изображение, если его длинная сторона превышает max_side, и
+    перекодировать в JPEG с заданным quality (Баг 3 — производительность).
+
+    Возвращает новые байты или None, если уменьшать не нужно (картинка в
+    пределах max_side) либо данные не распознаны как изображение. Декодирование
+    идёт через QImageReader.setScaledSize — большой файл не разворачивается в
+    память целиком, что и снимает фриз/нагрузку CPU при импорте крупных фото."""
+    buf = QBuffer()
+    buf.setData(QByteArray(data))
+    buf.open(QIODevice.ReadOnly)
+    reader = QImageReader(buf)
+    reader.setAutoTransform(True)
+    if not reader.canRead():
+        return None
+    size = reader.size()
+    if not size.isValid():
+        return None
+    if size.width() <= max_side and size.height() <= max_side:
+        return None
+    reader.setScaledSize(size.scaled(max_side, max_side, Qt.KeepAspectRatio))
+    img = reader.read()
+    if img.isNull():
+        return None
+    out = QByteArray()
+    obuf = QBuffer(out)
+    obuf.open(QIODevice.WriteOnly)
+    if not img.save(obuf, "JPEG", quality):
+        obuf.close()
+        return None
+    obuf.close()
+    return bytes(out)
+
+
+def _decode_thumb(data, bound):
+    """Декодировать миниатюру (QImage) — пригодно для вызова из рабочего потока.
+
+    QImage можно безопасно создавать вне UI-потока (в отличие от QPixmap), поэтому
+    самую тяжёлую часть — декодирование/масштабирование — выносим в пул потоков, а
+    в UI-поток отдаём уже готовый QImage."""
+    return GalleryWidget._decode_image(data, bound=bound)
+
+
+# ─── Шаги конвейера загрузки картинок (выполняются в пуле потоков) ───────────
+# Эти функции CPU-/IO-bound и НЕ трогают Qt-виджеты, поэтому безопасно гоняются
+# в фоновых потоках через loop.run_in_executor. «Разные потоки — разные операции»:
+# чтение файла/BLOB и тяжёлый декод/сжатие идут вне UI-потока, а рисование
+# (QPixmap) остаётся на UI-потоке (см. _apply_thumb).
+
+def _read_file(path):
+    """Прочитать файл целиком. Для вызова в фоновом потоке (run_in_executor)."""
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def _prepare_image_bytes(data):
+    """Подготовить загружаемое изображение В ФОНОВОМ ПОТОКЕ: сжать крупное фото
+    (downscale → JPEG), снять размер по метаданным и декодировать миниатюру.
+    Возвращает (data, size|None, thumb_qimage|None)."""
+    smaller = _downscale_image_bytes(data, 2560, 90)
+    if smaller is not None:
+        data = smaller
+    size = GalleryWidget._read_image_size(data)
+    thumb = _decode_thumb(data, 100)
+    return data, size, thumb
+
+
 class GalleryWidget(QWidget):
     """Галерея изображений. Хранит сами байты картинок (для записи в BLOB),
     а не пути к файлам — чтобы документ был самодостаточным."""
@@ -423,6 +492,8 @@ class GalleryWidget(QWidget):
         # Колбэк ленивой загрузки BLOB: loader_fn(image_id) -> bytes | None.
         # Устанавливается через set_image_loader() после set_data().
         self._image_loader = None
+        # Поколение предпросмотра: гасит устаревшую async-цепочку при смене карточки.
+        self._preload_gen = 0
 
     def _read_file_bytes(self, path):
         try:
@@ -455,10 +526,12 @@ class GalleryWidget(QWidget):
         self._other_bytes_provider = other_bytes_provider
 
     def set_image_loader(self, loader_fn):
-        """Установить колбэк ленивой загрузки BLOB из БД.
-        loader_fn(image_id: int) -> bytes | None — вызывается когда пользователь
-        кликает на placeholder (просмотр) или при сохранении (get_data)."""
+        """Установить колбэк ленивой загрузки BLOB из БД и запустить фоновый
+        предпросмотр: миниатюры ленивых элементов подгружаются автоматически
+        (последовательно, не блокируя UI), а не только по клику.
+        loader_fn(image_id: int) -> bytes | None."""
         self._image_loader = loader_fn
+        self._start_thumb_preload()
 
     def _local_bytes(self):
         """Суммарный объём картинок в текущей (редактируемой) карточке.
@@ -497,10 +570,16 @@ class GalleryWidget(QWidget):
         return img if not img.isNull() else None
 
     def _accept_image(self, data):
-        """Проверяет ДОБАВЛЯЕМОЕ изображение: размер файла, разрешение (по
-        метаданным, до декодирования — защита от «бомбы»), число картинок на
-        аккаунт и суммарный объём по базе. Возвращает True, если можно сохранить.
-        К уже сохранённым в БД изображениям не применяется (см. add_item)."""
+        """Синхронная проверка добавляемого изображения (для paste и пр.): сама
+        снимает размер по метаданным. В async-загрузке размер уже снят в фоновом
+        потоке — там вызывается _accept_image_checked, чтобы не декодировать на UI."""
+        return self._accept_image_checked(data, self._read_image_size(data))
+
+    def _accept_image_checked(self, data, size):
+        """Проверяет ДОБАВЛЯЕМОЕ изображение при УЖЕ известном размере: размер
+        файла, разрешение (защита от «бомбы»), число картинок на аккаунт и
+        суммарный объём по базе. Возвращает True, если можно сохранить. К уже
+        сохранённым в БД изображениям не применяется (см. add_item)."""
         if not data:
             return False
         if len(data) > self._MAX_IMAGE_BYTES:
@@ -508,9 +587,7 @@ class GalleryWidget(QWidget):
             _warn(self.config, self, "Слишком большой файл",
                   f"Изображение больше {mb} МБ и не будет добавлено.")
             return False
-        # Разрешение определяем ДО декодирования: огромная по пикселям картинка
-        # (decompression bomb) отклоняется, не разворачиваясь в память целиком.
-        size = self._read_image_size(data)
+        # Разрешение проверяем по метаданным (не разворачивая «бомбу» в память).
         if size is None:
             _warn(self.config, self, "Ошибка",
                   "Файл не распознан как изображение.")
@@ -530,8 +607,13 @@ class GalleryWidget(QWidget):
         if provider is not None:
             try:
                 other = provider()
-            except Exception:
-                other = 0
+            except Exception as e:
+                # L5-01: раньше ошибка провайдера глоталась с other=0 — лимит
+                # суммарного объёма молча отключался. Fail-closed: не зная
+                # реального объёма базы, отклоняем добавление.
+                _warn(self.config, self, "Ошибка",
+                      f"Не удалось проверить общий объём галереи:\n{e}")
+                return False
         if other + self._local_bytes() + len(data) > self._MAX_TOTAL_BYTES:
             gb = self._MAX_TOTAL_BYTES / (1024 * 1024 * 1024)
             _warn(self.config, self, "Превышен общий объём",
@@ -544,10 +626,115 @@ class GalleryWidget(QWidget):
         pattern = " ".join("*" + e for e in _IMAGE_EXTS)
         flt = f"Изображения ({pattern});;Все файлы (*)"
         path, _ = QFileDialog.getOpenFileName(self, "Выбрать картинку", "", flt)
-        if path:
-            data = self._read_file_bytes(path)
-            if data and self._accept_image(data):
-                self.add_item(data)
+        if not path:
+            return
+        # Размер проверяем по os.stat ДО чтения (M5-04): файл на гигабайты не
+        # читается в память целиком и не вешает/не роняет UI (OOM).
+        try:
+            file_size = os.path.getsize(path)
+        except OSError as e:
+            _warn(self.config, self, "Ошибка", f"Не удалось прочитать файл:\n{e}")
+            return
+        if file_size > self._MAX_IMAGE_BYTES:
+            mb = self._MAX_IMAGE_BYTES // (1024 * 1024)
+            _warn(self.config, self, "Слишком большой файл",
+                  f"Файл больше {mb} МБ и не будет загружен.")
+            return
+        # Чтение файла — в фоновом потоке: крупное фото не подвешивает UI.
+        self._queue_file_load(path)
+
+    def _apply_thumb(self, lbl, thumb_img):
+        """Поставить готовую миниатюру (QImage) в QLabel — только в UI-потоке
+        (здесь создаётся QPixmap, что вне UI-потока недопустимо)."""
+        if thumb_img is not None and not thumb_img.isNull():
+            lbl.setStyleSheet("background-color: #333;")
+            lbl.setText("")
+            lbl.setPixmap(QPixmap.fromImage(thumb_img).scaled(
+                100, 100, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        else:
+            lbl.setStyleSheet("background-color: #333; color: #FFC400;")
+            lbl.setText("[ нет\nпревью ]")
+
+    def _queue_file_load(self, path):
+        """Сразу добавить placeholder (bytes=None — UI не блокируется) и запустить
+        async-конвейер загрузки. Реальная работа — в _upload_pipeline."""
+        self.add_item(None)                  # placeholder «[ фото ]», bytes=None
+        item = self.items[-1]
+        util.fire(self._upload_pipeline(item, path))
+
+    async def _upload_pipeline(self, item, path):
+        """Async-конвейер загрузки картинки с диска. Разные операции — в разных
+        потоках пула (run_in_executor), UI-поток лишь рисует результат:
+          1) чтение файла           → поток;
+          2) сжатие + декод миниатюры → поток (самый тяжёлый CPU);
+          3) проверка лимитов + рисование → UI-поток (дёшево)."""
+        loop = asyncio.get_running_loop()
+        try:
+            data = await loop.run_in_executor(None, _read_file, path)
+        except OSError as e:
+            if item in self.items:
+                self._remove_item_silent(item)
+            _warn(self.config, self, "Ошибка", f"Не удалось прочитать файл:\n{e}")
+            return
+        data, size, thumb = await loop.run_in_executor(
+            None, _prepare_image_bytes, data)
+        if item not in self.items:
+            return                           # элемент удалили, пока грузился
+        if not self._accept_image_checked(data, size):
+            self._remove_item_silent(item)   # предупреждение уже показал accept
+            return
+        item["bytes"] = data
+        self._apply_thumb(item["thumb"], thumb)
+
+    def _start_thumb_preload(self):
+        """Запустить async-предпросмотр миниатюр ленивых элементов (bytes=None).
+
+        Чтение BLOB и декод выполняются в потоках пула (run_in_executor) — UI не
+        блокируется. Элементы обрабатываются по одному (память ограничена одним
+        изображением «в полёте»); прочитанные байты кэшируем для просмотра/
+        сохранения без повторного чтения. _preload_gen гасит цепочку при смене
+        карточки."""
+        if self._image_loader is None:
+            return
+        self._preload_gen += 1
+        gen = self._preload_gen
+        pending = [it for it in self.items
+                   if it["bytes"] is None and it["image_id"] is not None]
+        util.fire(self._preload_pipeline(pending, gen))
+
+    async def _preload_pipeline(self, items, gen):
+        loop = asyncio.get_running_loop()
+        for item in items:
+            if gen != self._preload_gen:
+                return                       # карточку переключили — цепочка устарела
+            loader = self._image_loader
+            if (item not in self.items or item["bytes"] is not None
+                    or item["image_id"] is None or loader is None):
+                continue
+            # Чтение BLOB — в потоке (load_gallery_image потокобезопасен под RLock БД).
+            data = await loop.run_in_executor(None, loader, item["image_id"])
+            if gen != self._preload_gen or item not in self.items:
+                return
+            if data is None:
+                self._apply_thumb(item["thumb"], None)
+                continue
+            # Декод миниатюры — в потоке.
+            thumb = await loop.run_in_executor(None, _decode_thumb, data, 100)
+            if gen != self._preload_gen or item not in self.items:
+                return
+            item["bytes"] = data             # кэш: просмотр/сохранение без чтения
+            self._apply_thumb(item["thumb"], thumb)
+
+    def _remove_item_silent(self, item):
+        """Убрать элемент галереи без подтверждения (для отклонённой загрузки)."""
+        for i, it in enumerate(self.items):
+            if it is item:
+                self.items.pop(i)
+                break
+        w = item["widget"]
+        w.hide()
+        self.items_layout.removeWidget(w)
+        w.deleteLater()
 
     def paste_image(self):
         clipboard = QApplication.clipboard()
@@ -623,9 +810,6 @@ class GalleryWidget(QWidget):
         # Родитель задаём СРАЗУ: setVisible() на виджете без родителя показывает
         # его как отдельное top-level окно со стандартной рамкой (баг: пустое
         # окно мелькает при добавлении картинки / переключении аккаунта).
-        # Родитель задаём СРАЗУ: setVisible() на виджете без родителя показывает
-        # его как отдельное top-level окно со стандартной рамкой (баг: пустое
-        # окно мелькает при добавлении картинки / переключении аккаунта).
         del_btn = QPushButton("[X]", item_widget)
         del_btn.setFixedWidth(40)
         del_btn.setVisible(self._editable)
@@ -662,9 +846,11 @@ class GalleryWidget(QWidget):
         self.items_layout.removeWidget(widget)
         widget.deleteLater()
 
-    def _load_lazy_bytes(self, item):
-        """Загружает BLOB для ленивого элемента (image_id задан, bytes=None).
-        После загрузки кэширует байты в item и обновляет миниатюру.
+    def _load_lazy_bytes(self, item, update_thumb=True):
+        """Загружает BLOB для ленивого элемента (image_id задан, bytes=None) и
+        кэширует байты в item — для полного просмотра/экспорта/сохранения.
+        update_thumb=False — не перерисовывать миниатюру (на пути get_data при
+        сохранении она уже подгружена предпросмотром; декод тут лишний).
         Возвращает bytes или None (если загрузчик не задан / нет данных)."""
         if item["bytes"] is not None:
             return item["bytes"]
@@ -673,17 +859,8 @@ class GalleryWidget(QWidget):
         data = self._image_loader(item["image_id"])
         if data is not None:
             item["bytes"] = data
-            # Обновить миниатюру после загрузки.
-            lbl = item["thumb"]
-            thumb_img = self._decode_image(data, bound=100)
-            if thumb_img is not None:
-                lbl.setStyleSheet("background-color: #333;")
-                lbl.setText("")
-                lbl.setPixmap(QPixmap.fromImage(thumb_img).scaled(
-                    100, 100, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-            else:
-                lbl.setStyleSheet("background-color: #333; color: #FFC400;")
-                lbl.setText("[ нет\nпревью ]")
+            if update_thumb:
+                self._apply_thumb(item["thumb"], self._decode_image(data, bound=100))
         return data
 
     def _on_thumb_click(self, item):
@@ -778,7 +955,7 @@ class GalleryWidget(QWidget):
         for it in self.items:
             data = it["bytes"]
             if data is None and it["image_id"] is not None:
-                data = self._load_lazy_bytes(it)
+                data = self._load_lazy_bytes(it, update_thumb=False)
             if data is not None:
                 result.append({"data": data, "desc": it["desc"].text()})
         return result

@@ -1,6 +1,8 @@
 import sys
 import atexit
+import asyncio
 import logging
+import qasync
 from PySide6.QtWidgets import (QApplication, QMainWindow, QSplitter, QLabel,
                                QVBoxLayout, QWidget, QHBoxLayout,
                                QPushButton, QLineEdit,
@@ -202,6 +204,9 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, AccountCardMixin,
                 return
         # Корректно остановить поток фоновой записи.
         self.vault.shutdown()
+        # Остановить поток-исполнитель async-операций БД (после vault.shutdown —
+        # к этому моменту фоновых записей/чтений уже нет).
+        self.db.shutdown_executor()
         self._instance_lock.release()
         super().closeEvent(event)
 
@@ -661,6 +666,18 @@ if __name__ == "__main__":
     # объём памяти на одно изображение. 256 МБ вмещают допустимые ~50 Мп (RGBA
     # ≈200 МБ), но отсекают аномально большие картинки из БД/бэкапа.
     QImageReader.setAllocationLimit(256)
+
+    # Гибридный событийный цикл asyncio+Qt (qasync): asyncio-операции (async-доступ
+    # к БД через db.run_async, фоновая загрузка картинок) выполняются в том же
+    # цикле, что и Qt, поэтому UI остаётся отзывчивым. Цикл крутится до aboutToQuit
+    # (закрытие последнего окна / app.quit()).
+    event_loop = qasync.QEventLoop(app)
+    asyncio.set_event_loop(event_loop)
+    app_close_event = asyncio.Event()
+    app.aboutToQuit.connect(app_close_event.set)
+
     window = MainWindow()
     window.show()
-    sys.exit(app.exec())
+
+    with event_loop:
+        event_loop.run_until_complete(app_close_event.wait())

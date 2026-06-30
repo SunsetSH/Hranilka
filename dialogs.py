@@ -519,8 +519,8 @@ class SettingsDialog(ThemedDialog):
         lay.addLayout(row)
 
         def try_ok():
-            if len(e1.text()) < 4:
-                err.setText("Пароль слишком короткий (минимум 4 символа).")
+            if len(e1.text()) < 12:
+                err.setText("Пароль слишком короткий (минимум 12 символов).")
                 return
             if e1.text() != e2.text():
                 err.setText("Пароли не совпадают.")

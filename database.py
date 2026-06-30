@@ -1,6 +1,10 @@
 import sqlite3
 import os
 import tempfile
+import asyncio
+import threading
+import functools
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -59,12 +63,45 @@ class Database:
         # появлении несохранённых изменений в шифрованном режиме.
         self._dirty = False
         self._on_dirty = None
+        # ─── Асинхронный доступ к БД ──────────────────────────────────────────
+        # Соединение SQLite открывается с check_same_thread=False, чтобы тяжёлые
+        # операции (снапшот, чтение BLOB, запись карточки) можно было выполнять в
+        # фоновом потоке-исполнителе через run_async() — UI-поток при этом не
+        # подвисает. Единственный воркер (max_workers=1) сериализует async-операции
+        # между собой, а реентрантный RLock — с синхронными вызовами из UI-потока
+        # (каждый публичный метод обёрнут в этот лок, см. конец файла). Тяжёлый CPU
+        # (AES-GCM, декодирование картинок) выполняется ВНЕ лока (в QThread писателя
+        # и пуле картинок), поэтому лок удерживается лишь на время доступа к conn.
+        self._lock = threading.RLock()
+        self._executor: ThreadPoolExecutor | None = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="db-worker")
+
+    async def run_async(self, method, *args, **kwargs):
+        """Выполнить синхронный метод БД в фоновом потоке, не блокируя UI-поток.
+
+        method — публичный метод этого экземпляра (уже обёрнут локом). Результат
+        возвращается обычным await. Пример: await db.run_async(db.load_account, id)."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._executor, lambda: method(*args, **kwargs))
+
+    def shutdown_executor(self):
+        """Остановить поток-исполнитель async-операций (идемпотентно). Вызывать на
+        выходе из приложения, когда фоновых async-операций уже нет."""
+        ex = getattr(self, "_executor", None)
+        if ex is not None:
+            self._executor = None
+            ex.shutdown(wait=True)
 
     def _setup_conn(self):
         """Общие настройки соединения (row_factory, внешние ключи)."""
         self.conn.row_factory = sqlite3.Row  # Чтобы обращаться к полям по имени
         # Без этого ON DELETE CASCADE/SET NULL не работают в SQLite.
         self.conn.execute("PRAGMA foreign_keys = ON")
+        # Затирать содержимое удаляемых страниц нулями, а не просто помечать их
+        # свободными: иначе удалённые пароли/BLOB остаются читаемыми в файле БД
+        # до следующего VACUUM (Баг 2). В in-memory (шифр.) режиме безвреден.
+        self.conn.execute("PRAGMA secure_delete = ON")
         self.cursor = self.conn.cursor()
 
     def connect(self) -> None:
@@ -73,7 +110,9 @@ class Database:
         self._dek = None
         self._header = None
         self._dirty = False
-        self.conn = sqlite3.connect(self.db_path)
+        # check_same_thread=False: доступ из UI-потока и из воркера run_async
+        # сериализуется RLock'ом (см. __init__), поэтому безопасно.
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._disk_revision = self._stat_revision()
         self._setup_conn()
 
@@ -84,7 +123,7 @@ class Database:
         self._dek = dek
         self._header = header
         self._dirty = False
-        self.conn = sqlite3.connect(":memory:")
+        self.conn = sqlite3.connect(":memory:", check_same_thread=False)
         if db_bytes:
             self.conn.deserialize(db_bytes)  # type: ignore[attr-defined]  # есть в CPython 3.11+
         self._disk_revision = self._stat_revision()
@@ -184,9 +223,20 @@ class Database:
         self._write_container(self.serialize_container(), force=force)
 
     def set_header(self, header: dict):
-        """Обновить заголовок контейнера (после смены пароля/recovery) и сохранить."""
+        """Обновить заголовок контейнера (после смены пароля/recovery) и сохранить.
+
+        Транзакционно (H5-02): новый заголовок применяется к self._header только
+        ПОСЛЕ успешной записи на диск. Если persist() упадёт (нет места, конфликт
+        файла), откатываем self._header к прежнему и пробрасываем исключение —
+        иначе UI показал бы успех, а на диске остался бы старый контейнер,
+        рассогласованный с заголовком в памяти."""
+        old_header = self._header
         self._header = header
-        self.persist()
+        try:
+            self.persist()
+        except BaseException:
+            self._header = old_header
+            raise
 
     def lock(self, force: bool = False):
         """Заблокировать: сохранить, закрыть in-memory БД, забыть ключ.
@@ -1207,6 +1257,18 @@ class Database:
             return None
         return bytes(row["image_data"])
 
+    def vacuum(self):
+        """VACUUM — дефрагментация и физическое сжатие файла БД (освобождает
+        страницы, оставшиеся в freelist после удаления крупных BLOB).
+
+        Должна выполняться ВНЕ транзакции — поэтому сначала фиксируем возможную
+        открытую неявную транзакцию. В шифрованном режиме VACUUM меняет образ
+        in-memory БД, поэтому помечаем её грязной для последующего persist()."""
+        self.conn.commit()           # VACUUM не выполняется внутри транзакции
+        self.conn.execute("VACUUM")
+        if self.encrypted:
+            self._mark_dirty()
+
     def save_account(self, account_id, data):
         """Сохраняет полную карточку аккаунта. data — словарь примитивов в
         формате load_account(). Связанные таблицы перезаписываются целиком."""
@@ -1453,3 +1515,39 @@ class Database:
             rows.sort(key=lambda r: r["name"].lower())
             result[i] = rows
         return result
+
+
+# ─── Авто-сериализация доступа к соединению (потокобезопасность) ──────────────
+# Соединение открывается с check_same_thread=False, чтобы run_async() мог работать
+# с ним из фонового потока. Чтобы синхронные вызовы из UI-потока и async-вызовы из
+# воркера никогда не трогали conn/cursor одновременно, КАЖДЫЙ публичный метод
+# оборачивается в self._lock (RLock — реентрантный: вложенные вызовы между методами
+# на одном потоке не дают дедлок). Делается единым проходом по классу, чтобы не
+# засорять декоратором каждое определение и не забыть новый метод.
+#
+# Исключения (_DB_NO_LOCK) — методы, чья тяжёлая часть это шифрование/файловый I/O,
+# а НЕ доступ к conn. Держать на них лок означало бы блокировать все чтения на всё
+# время записи контейнера. Их conn-часть (serialize_db, conn.close) залочена сама.
+_DB_NO_LOCK = frozenset({
+    "serialize_container",   # вызывает serialize_db (залочен) + AES-GCM (тяжёлый, без лока)
+    "persist",               # serialize_container + запись файла
+    "seal_and_write",        # без conn; выполняется в QThread писателя — лок недопустим
+    "flush",                 # обёртка над persist
+    "run_async",             # сам диспетчер async (корутина); лок берёт вызываемый метод
+    "shutdown_executor",     # управление пулом, не трогает conn
+})
+
+
+def _synchronized(method):
+    @functools.wraps(method)
+    def _wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return _wrapper
+
+
+for _nm, _fn in list(vars(Database).items()):
+    if (isinstance(_fn, type(_synchronized))          # обычная функция-метод (не static/classmethod)
+            and not _nm.startswith("_")
+            and _nm not in _DB_NO_LOCK):
+        setattr(Database, _nm, _synchronized(_fn))

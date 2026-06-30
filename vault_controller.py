@@ -28,7 +28,7 @@ class _VaultWriter(QObject):
     Не обращается к соединению SQLite, поэтому потокобезопасен относительно него."""
 
     done = Signal(bool, str, bool)   # ok, текст_ошибки, признак_конфликта
-    _job = Signal(object, bool)      # внутренний: (db_bytes, force) → в свой поток
+    _job = Signal(bool)              # внутренний: force → в свой поток
 
     def __init__(self, db):
         super().__init__()
@@ -36,13 +36,18 @@ class _VaultWriter(QObject):
         # Очередь из одного задания: сигнал доставляется в поток воркера.
         self._job.connect(self._do, Qt.ConnectionType.QueuedConnection)
 
-    def submit(self, db_bytes, force=False):
-        self._job.emit(db_bytes, force)
+    def submit(self, force=False):
+        self._job.emit(force)
 
-    @Slot(object, bool)
-    def _do(self, db_bytes, force):
+    @Slot(bool)
+    def _do(self, force):
         ok, err, conflict = True, "", False
         try:
+            # Снимок БД (serialize) делаем здесь, в потоке писателя: соединение
+            # потокобезопасно (RLock + check_same_thread=False), поэтому UI-поток
+            # больше не тратит сотни мс на копирование большой базы. Затем —
+            # шифрование AES-GCM и атомарная запись (самое тяжёлое), тоже вне UI.
+            db_bytes = self._db.serialize_db()
             self._db.seal_and_write(db_bytes, force=force)
         except VaultConflictError:
             ok, conflict, err = False, True, "conflict"
@@ -55,6 +60,13 @@ class VaultController(QObject):
     """Владеет фоновым writer'ом, отложенным flush и гейтом монопольного доступа.
 
     window — главное окно (родитель модальных диалогов, источник statusBar)."""
+
+    # Реле «БД стала грязной» → schedule_flush на UI-потоке. Мутаторы БД теперь
+    # могут выполняться в фоновом потоке-исполнителе (db.run_async); их callback
+    # _on_dirty нельзя звать напрямую, т.к. schedule_flush использует
+    # QTimer.singleShot, требующий UI-потока. Сигнал с AutoConnection доставляется
+    # в поток получателя (UI): эмит из воркера — очередью, из UI-потока — напрямую.
+    _dirty_relay = Signal()
 
     def __init__(self, db, window, config):
         super().__init__()
@@ -71,7 +83,9 @@ class VaultController(QObject):
         self._vault_locked = False
 
         # БД помечает себя «грязной» → планируем сброс один раз за оборот цикла.
-        self.db._on_dirty = self.schedule_flush
+        # Через реле-сигнал, чтобы пометка из фонового потока БД попадала на UI.
+        self._dirty_relay.connect(self.schedule_flush)
+        self.db._on_dirty = self._dirty_relay.emit
 
         self._writer = _VaultWriter(self.db)
         self._writer_thread = QThread(self)
@@ -120,19 +134,16 @@ class VaultController(QObject):
         self._start_vault_write()
 
     def _start_vault_write(self, force=False):
-        """Сделать снимок БД (в GUI-потоке) и отдать воркеру на шифрование+запись."""
-        try:
-            db_bytes = self.db.serialize_db()
-        except Exception as e:
-            logging.warning("Не удалось сериализовать БД: %s", e)
-            return
+        """Запустить фоновое сохранение. Снимок БД (serialize), шифрование и запись
+        выполняет поток писателя — UI-поток лишь помечает занятость и ставит задачу,
+        поэтому даже большая база (сотни МБ) больше не подвешивает интерфейс."""
         # Оптимистично считаем изменения «в работе»: новые правки снова поставят
         # _dirty и запланируют следующий flush. При сбое вернём _dirty=True.
         self.db._dirty = False
         self._write_busy = True
         self._write_pending = False
         self._status("Сохранение…")
-        self._writer.submit(db_bytes, force)
+        self._writer.submit(force)
 
     def _on_vault_written(self, ok, err, conflict):
         """Завершение фоновой записи (в GUI-потоке)."""
