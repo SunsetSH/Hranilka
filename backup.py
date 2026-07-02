@@ -4,6 +4,9 @@ import sqlite3
 from pathlib import Path
 from datetime import datetime
 
+import crypto_store
+from util import best_effort_wipe
+
 
 _GLOB = "hranilka_backup_*.db"
 
@@ -82,7 +85,6 @@ def _is_valid_db(path: Path) -> bool:
     Обычный SQLite: помимо `quick_check` проверяем, что это именно база Хранилки
     (есть обязательные таблицы) и что версия схемы не новее поддерживаемой —
     иначе принимали любую корректную SQLite-базу как бэкап приложения."""
-    import crypto_store
     if crypto_store.is_encrypted_file(str(path)):
         try:
             with open(path, "rb") as f:
@@ -97,8 +99,17 @@ def _is_valid_db(path: Path) -> bool:
             row = con.execute("PRAGMA quick_check").fetchone()
             if not row or row[0] != "ok":
                 return False
+            # Ссылочная целостность: битые внешние ключи не должны пройти в рабочую
+            # БД (M65-04). foreign_key_check возвращает по строке на нарушение.
+            if con.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                return False
             names = {r[0] for r in con.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'")}
+            # Идентификационные таблицы Хранилки. Полный набор актуальной схемы
+            # намеренно НЕ требуем: старый (мигрируемый) бэкап мог не иметь части
+            # таблиц — они будут созданы миграцией при открытии после restore.
+            # Целостность структуры/ссылок уже покрыта quick_check +
+            # foreign_key_check выше (M65-04).
             if not {"accounts", "services", "folders"}.issubset(names):
                 return False
             if "app_meta" in names:
@@ -139,6 +150,7 @@ def restore_backup(backup_path: str, db_path: str) -> None:
     tmp = dst.with_name(dst.name + ".restore-tmp")
     rollback = dst.with_name(dst.name + ".rollback")
     had_dst = dst.exists()
+    committed = False
     try:
         _copy_durable(src, tmp)             # стейджим проверенный кандидат рядом
         if had_dst:
@@ -149,20 +161,45 @@ def restore_backup(backup_path: str, db_path: str) -> None:
             # Откат атомарно (M6-05): прежняя БД — в durable-копии rollback;
             # os.replace в пределах каталога не оставит dst частично записанным,
             # в отличие от прежнего copy2.
-            if had_dst and rollback.exists():
-                os.replace(rollback, dst)
+            _rollback_or_preserve(rollback, dst, had_dst)
             raise
         # Подтверждаем, что записанный файл открывается. rollback держим до этого
         # момента — если проверка не прошла, откатываемся к прежней БД.
         if not _is_valid_db(dst):
-            if had_dst and rollback.exists():
-                os.replace(rollback, dst)
+            _rollback_or_preserve(rollback, dst, had_dst)
             raise ValueError(
                 "Восстановленный файл не открывается; выполнен откат к прежней базе.")
+        committed = True
     finally:
-        for p in (tmp, rollback):
-            if p.exists():
-                p.unlink(missing_ok=True)
+        # tmp удаляем всегда. rollback — ТОЛЬКО при подтверждённом успехе (M65-03):
+        # если откат сам не удался, _rollback_or_preserve уже сохранил последнюю
+        # целую копию под recovery-именем, а сам rollback здесь не трогаем.
+        # Обе — полные копии БД (пароли/BLOB), поэтому затираем перед удалением (H-3).
+        if tmp.exists():
+            best_effort_wipe(str(tmp))
+        if committed and rollback.exists():
+            best_effort_wipe(str(rollback))
+
+
+def _rollback_or_preserve(rollback: Path, dst: Path, had_dst: bool) -> None:
+    """Вернуть dst из rollback-копии. Если сам откат (os.replace) не удался —
+    сохранить rollback под recovery-именем и бросить ошибку с путём, чтобы
+    последняя целая копия прежней БД не была уничтожена cleanup-кодом (M65-03)."""
+    if not (had_dst and rollback.exists()):
+        return
+    try:
+        os.replace(rollback, dst)           # успех: rollback потреблён
+    except OSError as e:
+        recovery = dst.with_name(dst.name + ".recovery")
+        try:
+            os.replace(rollback, recovery)
+            location = str(recovery)
+        except OSError:
+            location = str(rollback)         # даже переименовать не смогли — как есть
+        raise RuntimeError(
+            "Не удалось откатить восстановление; текущий файл базы может быть "
+            f"повреждён. Последняя целая копия прежней базы сохранена: {location}"
+        ) from e
 
 
 def delete_all_backups(backup_folder: str) -> int:

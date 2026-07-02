@@ -18,6 +18,21 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 
+@pytest.fixture(scope="session")
+def qapp():
+    """Единственный QApplication на весь прогон (M-16).
+
+    Qt допускает не более одного экземпляра QApplication на процесс. Раньше
+    каждый модуль (галерея, окно, контроллер) заводил свою per-module фикстуру —
+    все они возвращали один и тот же процессный экземпляр, но фикстуры дублировались.
+    Здесь фикстура одна и переиспользуется всеми тестами. Модульные вызовы
+    QImageReader.setAllocationLimit(...) остаются в своих файлах — эффект
+    процессно-глобальный, поэтому важен порядок, а не место фикстуры."""
+    from PySide6.QtWidgets import QApplication
+    app = QApplication.instance() or QApplication([])
+    return app
+
+
 @pytest.fixture
 def tmp_db_path(tmp_path):
     """Путь к несуществующей ещё БД во временном каталоге."""

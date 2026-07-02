@@ -19,6 +19,7 @@ from ui_shortcuts import ShortcutsMixin
 from ui_account import AccountCardMixin
 from ui_tree import AccountTree, TreeMixin
 import instance_lock
+import util
 from paths import BASE_DIR
 from dialogs import SettingsDialog, RecycleBinDialog, ExportDialog
 from tabs import AccountTabs
@@ -170,6 +171,9 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, AccountCardMixin,
             except Exception as e:
                 logging.warning("Не удалось очистить буфер при выходе: %s", e)
 
+        # Гасим незавершённый async карточки/галереи ДО закрытия БД: висящие
+        # загрузки/предпросмотр не должны обращаться к уже закрытому соединению.
+        self._quiesce_card_async()
         try:
             self.db.close()
         except VaultConflictError:
@@ -322,6 +326,10 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, AccountCardMixin,
         self.tabs.f_linked.navigate_requested.connect(self.on_link_navigate)
         self.tabs.f_linked.add_requested.connect(self.on_add_link_requested)
 
+        # Индикатор загрузки картинки в галерею (статус-бар)
+        self.tabs.f_gallery_widget.upload_status_changed.connect(
+            self._on_gallery_upload_status)
+
         # Постоянный индикатор в статус-баре (путь + режим)
         self.status_info = QLabel("")
         self.statusBar().addPermanentWidget(self.status_info)
@@ -375,12 +383,23 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, AccountCardMixin,
 
     def apply_appearance(self):
         """Только визуальная часть (шрифт, стили). Лёгкая — подходит для живого
-        предпросмотра настроек, не трогает геометрию/таймеры/БД."""
+        предпросмотра настроек, не трогает геометрию/таймеры/БД.
+
+        Повторное применение с теми же значениями пропускаем: setStyleSheet на
+        главном окне вызывает полный repolish дерева (сотни элементов) и перегенерацию
+        иконок-стрелок — это давало фриз при «Применить», когда менялись НЕ внешние
+        настройки. Живой предпросмотр по-прежнему работает: там значения меняются,
+        сигнатура отличается и стиль применяется."""
         font_name = self.config.get("font", "Cascadia Code")
         font_size = self.config.get("font_size", 14)
         text_color = self.config.get("text_color", "#FFFFFF")
         tree_bg = self.config.get("tree_bg_color", "#0000AA")
         main_bg = self.config.get("main_bg_color", "#0000AA")
+
+        signature = (font_name, font_size, text_color, tree_bg, main_bg)
+        if getattr(self, "_appearance_sig", None) == signature:
+            return                              # внешний вид не менялся — repolish не нужен
+        self._appearance_sig = signature
 
         self.setFont(QFont(font_name, font_size))
         # Общий стиль окна (вкл. кнопки-вкладки QPushButton[tabButton], спинбоксы, комбобоксы)
@@ -399,15 +418,56 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, AccountCardMixin,
         Стандартные стрелки рисуются стилем ОС фиксированным цветом и теряются
         на выделении (фон строки = text_color). Генерируем свои треугольники:
         в обычном состоянии — цветом текста, на выделении — цветом фона дерева
-        (как инвертируется текст), чтобы стрелка всегда оставалась видимой."""
+        (как инвертируется текст), чтобы стрелка всегда оставалась видимой.
+
+        QSS в этой версии Qt не рендерит image:url() с data:-URI (проверено
+        офскрин-рендером — картинка тихо не показывается, стрелки пропадают).
+        Поэтому пишем PNG-файлы во временный каталог, но только когда цвета
+        реально меняются (кэш по паре text_color/tree_bg, M-17) — не на каждый
+        apply_appearance. Каталог создаётся один раз за запуск и удаляется
+        через atexit."""
+        cache_key = (text_color, tree_bg)
+        cached = getattr(self, "_branch_css_cache", None)
+        if cached is not None and cached[0] == cache_key:
+            body = cached[1]
+        else:
+            body = self._render_branch_arrow_files(text_color, tree_bg)
+            self._branch_css_cache = (cache_key, body)
+        # Заливка области стрелки (background-color) зависит от main_bg (hover),
+        # поэтому её оставляем вне кэша по цветам стрелок — она дешёвая (текст).
+        return f"""
+            QTreeWidget::branch {{ background-color: {tree_bg}; }}
+            QTreeWidget::branch:hover {{ background-color: {main_bg}; }}
+            QTreeWidget::branch:selected {{ background-color: {text_color}; }}
+        """ + body
+
+    def _branch_icon_dir(self):
+        """Временный каталог для PNG стрелок дерева; создаётся один раз за
+        запуск и удаляется целиком при выходе (atexit)."""
+        d = getattr(self, "_branch_icon_dir_path", None)
+        if d is None:
+            import tempfile
+            d = tempfile.mkdtemp(prefix="hranilka-arrows-")
+            self._branch_icon_dir_path = d
+            atexit.register(self._cleanup_branch_icon_dir)
+        return d
+
+    def _cleanup_branch_icon_dir(self):
+        d = getattr(self, "_branch_icon_dir_path", None)
+        if d:
+            import shutil
+            shutil.rmtree(d, ignore_errors=True)
+
+    def _render_branch_arrow_files(self, text_color, tree_bg):
+        """Отрисовать 4 стрелки в файлы (перезаписывая прежние для этих же
+        имён) и вернуть QSS-правила с путями к ним."""
         from PySide6.QtGui import QPixmap, QPainter, QPolygon, QColor
         from PySide6.QtCore import QPoint
-        import tempfile
-        import os as _os
-        if not hasattr(self, "_branch_icon_dir"):
-            self._branch_icon_dir = tempfile.mkdtemp(prefix="hranilka_branch_")
+        import os
 
-        def make(name, direction, color):
+        icon_dir = self._branch_icon_dir()
+
+        def make(direction, color, name):
             pm = QPixmap(16, 16)
             pm.fill(Qt.transparent)
             p = QPainter(pm)
@@ -419,21 +479,16 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, AccountCardMixin,
             else:                          # ▼
                 p.drawPolygon(QPolygon([QPoint(3, 5), QPoint(13, 5), QPoint(8, 11)]))
             p.end()
-            path = _os.path.join(self._branch_icon_dir, name + ".png")
+            path = os.path.join(icon_dir, name)
             pm.save(path, "PNG")
+            # QSS ожидает прямые слэши даже на Windows.
             return path.replace("\\", "/")
 
-        cn = make("closed_n", "closed", text_color)
-        op = make("open_n", "open", text_color)
-        cs = make("closed_s", "closed", tree_bg)
-        ops = make("open_s", "open", tree_bg)
-        # Заливка области стрелки берётся из настроек программы (а не из темы ОС):
-        # обычное состояние — фон дерева, выделение — цвет текста (как у строки,
-        # где фон инвертируется), наведение — фон окна.
+        cn = make("closed", text_color, "cn.png")
+        op = make("open", text_color, "op.png")
+        cs = make("closed", tree_bg, "cs.png")
+        ops = make("open", tree_bg, "ops.png")
         return f"""
-            QTreeWidget::branch {{ background-color: {tree_bg}; }}
-            QTreeWidget::branch:hover {{ background-color: {main_bg}; }}
-            QTreeWidget::branch:selected {{ background-color: {text_color}; }}
             QTreeWidget::branch:has-children:closed {{ image: url("{cn}"); }}
             QTreeWidget::branch:has-children:open {{ image: url("{op}"); }}
             QTreeWidget::branch:has-children:closed:selected {{ image: url("{cs}"); }}
@@ -481,7 +536,7 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, AccountCardMixin,
         # запрашивает её и показывает результат (см. _restore_from_backup).
         dialog.set_restore_handler(self._restore_from_backup)
         dialog.exec()
-        if dialog._delete_all_confirmed:
+        if dialog.delete_all_confirmed:     # публичное свойство (L-10)
             self._wipe_all_data()
 
     def open_export(self, node):
@@ -542,25 +597,58 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, AccountCardMixin,
             self._instance_lock.release()
             sys.exit(1)
 
+    @staticmethod
+    def _read_container_async(path):
+        """Запустить чтение файла-контейнера в отдельном потоке и вернуть Future
+        (H-9). В __init__ event-loop qasync ещё не крутится, поэтому используем
+        ThreadPoolExecutor, а не loop.run_in_executor. Пул закрывается сам после
+        завершения задачи (shutdown(wait=False))."""
+        import concurrent.futures
+
+        def _read():
+            with open(path, "rb") as f:
+                return f.read()
+
+        ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        fut = ex.submit(_read)
+        ex.shutdown(wait=False)                  # не ждём здесь — Future отдаёт результат
+        return fut
+
     def _open_database(self, parent=None):
-        """Открыть БД: зашифрованную — через ввод мастер-пароля/recovery-кода,
-        обычную — напрямую. При утере секрета пользователь может восстановить
-        бэкап или начать с чистой базы. Возвращает True при успехе, False если
-        пользователь выбрал «Выход». Источник истины о шифровании — сигнатура
-        файла."""
+        """Открыть СОЕДИНЕНИЕ с БД: зашифрованную — через ввод мастер-пароля/
+        recovery-кода, обычную — напрямую. При утере секрета пользователь может
+        восстановить бэкап или начать с чистой базы. Возвращает True при успехе,
+        False если пользователь выбрал «Выход». Источник истины о шифровании —
+        сигнатура файла.
+
+        ВАЖНО: только открывает соединение и НЕ валидирует/не мигрирует схему —
+        это делает отдельный шаг (_validate_schema_or_exit при старте/lock либо
+        _open_and_validate_after_restore с откатом при restore). Так один и тот же
+        опенер годится и для сценариев, где ошибку схемы нужно откатить, а не
+        завершать программу (H65-05)."""
         import crypto_store as cs
         from dialogs import UnlockDialog
         while True:
             if not cs.is_encrypted_file(self.db.db_path):
                 self.db.connect()
-                self._create_tables_or_exit()
                 self.config.set("encryption_enabled", False)
                 self.config.save()
                 return True
 
-            with open(self.db.db_path, "rb") as f:
-                container = f.read()
-            dlg = UnlockDialog(self.config, container, parent)
+            # Чтение зашифрованного контейнера (может быть крупным) выносим в
+            # фоновый поток и запускаем ДО построения диалога (H-9): тяжёлое
+            # чтение файла перекрывается с созданием/темизацией UnlockDialog и не
+            # блокирует UI-поток в __init__ (event-loop qasync ещё не запущен,
+            # поэтому используем поток, а не run_in_executor). Результат ждём перед
+            # самим показом — попытка разблокировки без контейнера невозможна.
+            reader = self._read_container_async(self.db.db_path)
+            dlg = UnlockDialog(self.config, b"", parent)
+            try:
+                dlg._container = reader.result()
+            except OSError as e:
+                theme.themed_info(self.config, parent, "Ошибка",
+                                  f"Не удалось прочитать файл базы:\n{e}")
+                return False
             dlg.exec()
 
             if dlg.result_data is not None:
@@ -590,6 +678,34 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, AccountCardMixin,
 
             return False  # «Выход»
 
+    def _open_and_validate_after_restore(self):
+        """Открыть переоткрытую БД И провалидировать/мигрировать её схему (H65-05).
+
+        Plaintext и encrypted проходят один путь: после открытия соединения
+        выполняется create_tables() (миграции, обязательные таблицы, отказ при
+        схеме новее поддерживаемой — FutureSchemaError). Возвращает True только
+        если БД открыта и схема валидна; при любой ошибке закрывает БД без записи
+        и возвращает False — вызыватель откатывается к прежнему vault. Так
+        восстановленный encrypted-файл больше не публикуется для чтения/записи без
+        миграции и проверки версии схемы."""
+        if not self._open_database(self):
+            return False
+        try:
+            self.db.create_tables()
+        except FutureSchemaError as e:
+            logging.error("Восстановленный файл: несовместимая схема: %s", e)
+            theme.themed_info(self.config, self, "Несовместимая версия базы", str(e))
+            self.db.close(persist=False)
+            return False
+        except Exception as e:                       # noqa: BLE001
+            logging.error("Восстановленный файл не прошёл проверку схемы: %s",
+                          e, exc_info=e)
+            theme.themed_info(self.config, self, "Ошибка базы",
+                              f"Восстановленный файл не прошёл проверку схемы:\n{e}")
+            self.db.close(persist=False)
+            return False
+        return True
+
     def _restore_from_backup(self, path):
         """Восстановление из бэкапа (вызывается из «Настроек»). Возвращает
         (ok, err) для показа в диалоге.
@@ -601,59 +717,69 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, AccountCardMixin,
         замены переоткрываем БД (восстановленный файл может оказаться
         зашифрованным — тогда _open_database спросит пароль)."""
         import os
-        import shutil
+        from pathlib import Path
         if not self.vault.wait_idle():
             return False, ("Фоновое сохранение базы не завершилось вовремя.\n"
                            "Повторите попытку через несколько секунд.")
+        # Гасим незавершённый async карточки/галереи ДО закрытия БД (H65-02).
+        self._quiesce_card_async()
         self.db.close(persist=False)
         db_path = self.db.db_path
-        # Страховочная копия текущей БД. Восстановленный encrypted-файл проверяется
-        # лишь структурно (_is_valid_db), а подлинность (GCM) и пароль — только при
-        # открытии. Если открыть не удалось (повреждён/чужой/отменён ввод пароля) —
-        # rollback удалён бы внутри restore_backup, и рабочая БД пропала бы (H6-04).
-        # Поэтому держим собственную копию и возвращаем прежнюю БД при неудаче.
+        # Страховочная копия текущей БД (durable: fsync содержимого). Восстановленный
+        # encrypted-файл проверяется лишь структурно (_is_valid_db), а подлинность
+        # (GCM), пароль и версия схемы — только при открытии. Если открыть/проверить
+        # не удалось, вернём прежнюю БД из этой копии.
         rollback = None
         if os.path.exists(db_path):
             rollback = db_path + ".pre-restore"
             try:
-                shutil.copy2(db_path, rollback)
-            except OSError:
-                rollback = None
+                bk._copy_durable(Path(db_path), Path(rollback))
+            except OSError as e:
+                # H65-03: рабочий файл есть, но страховочную копию создать не удалось.
+                # Продолжать restore нельзя — при неоткрытии кандидата рабочая БД
+                # пропала бы безвозвратно. Отменяем restore и возвращаем прежнюю БД.
+                logging.error("Не удалось создать страховочную копию перед restore: %s", e)
+                self._discard_file(rollback)
+                if self._open_and_validate_after_restore():
+                    self._after_db_reopened(None)
+                    return False, ("Не удалось создать страховочную копию; "
+                                   f"восстановление отменено:\n{e}")
+                self.close()
+                return False, f"Не удалось создать страховочную копию: {e}"
         try:
             bk.restore_backup(path, db_path)
         except Exception as e:
             # restore_backup при сбое откатывает файл к прежнему состоянию —
             # переоткрываем БД как была и сообщаем об ошибке.
             self._discard_file(rollback)
-            if not self._open_database(self):
+            if not self._open_and_validate_after_restore():
                 self.close()
                 return False, str(e)
             self._after_db_reopened(None)
             return False, str(e)
-        if not self._open_database(self):
-            # Восстановленный файл не открылся/не аутентифицирован/пароль не введён.
-            # Возвращаем прежнюю БД из страховочной копии — рабочие данные не теряем.
+        if not self._open_and_validate_after_restore():
+            # Восстановленный файл не открылся/не аутентифицирован/не прошёл
+            # проверку схемы. Возвращаем прежнюю БД из страховочной копии.
             if self._rollback_restore(rollback, db_path):
-                return False, ("Восстановленный файл не удалось открыть; "
+                return False, ("Восстановленный файл не удалось открыть или проверить; "
                                "возвращена прежняя база.")
             self.close()
-            return False, "Восстановленный файл не удалось открыть."
+            return False, "Восстановленный файл не удалось открыть или проверить."
         self._discard_file(rollback)
         self._after_db_reopened("База данных восстановлена из бэкапа.")
         return True, None
 
     def _discard_file(self, path):
-        """Тихо удалить временный файл (страховочную копию), если он есть."""
+        """Тихо удалить временную страховочную копию БД (.pre-restore), если она
+        есть. Это ПОЛНАЯ копия базы (все пароли/BLOB в открытом виде), поэтому
+        затираем содержимое нулями перед удалением, а не просто unlink (H-3)."""
         import os
         if path and os.path.exists(path):
-            try:
-                os.remove(path)
-            except OSError as e:
-                logging.warning("Не удалось удалить временный файл %s: %s", path, e)
+            util.best_effort_wipe(path)
 
     def _rollback_restore(self, rollback, db_path):
         """Вернуть прежнюю БД из страховочной копии после неудачного восстановления.
-        Возвращает True, если прежняя база возвращена и открыта."""
+        Возвращает True, если прежняя база возвращена, открыта и провалидирована."""
         import os
         if not rollback or not os.path.exists(rollback):
             return False
@@ -662,7 +788,7 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, AccountCardMixin,
         except OSError as e:
             logging.warning("Не удалось вернуть прежнюю БД: %s", e)
             return False
-        if not self._open_database(self):
+        if not self._open_and_validate_after_restore():
             return False
         self._after_db_reopened("Восстановление отменено: возвращена прежняя база.")
         return True

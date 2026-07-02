@@ -121,3 +121,17 @@ class WrappingTabWidget(QWidget):
 
     def tab_buttons(self):
         return list(self._buttons)
+
+    def one_row_width(self):
+        """Ширина, при которой все кнопки-вкладки помещаются ровно в один ряд:
+        сумма их sizeHint-ширин + горизонтальные промежутки FlowLayout."""
+        if not self._buttons:
+            return 0
+        # Полируем кнопки, чтобы sizeHint учитывал padding/border из таблицы
+        # стилей ещё до показа окна (иначе ряд считается уже реального).
+        for b in self._buttons:
+            b.ensurePolished()
+        total = sum(b.sizeHint().width() for b in self._buttons)
+        total += self._bar_layout._hspace * (len(self._buttons) - 1)
+        m = self._bar_layout.contentsMargins()
+        return total + m.left() + m.right()

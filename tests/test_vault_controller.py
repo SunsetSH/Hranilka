@@ -5,15 +5,10 @@
 """
 import pytest
 
-from PySide6.QtWidgets import QApplication
-
 from database import Database
 from vault_controller import VaultController
 
-
-@pytest.fixture(scope="module")
-def qapp():
-    return QApplication.instance() or QApplication([])
+# Общий session-qapp живёт в conftest.py (M-16).
 
 
 class _FakeBar:

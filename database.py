@@ -1,6 +1,7 @@
 import sqlite3
 import os
 import tempfile
+import logging
 import asyncio
 import threading
 import functools
@@ -9,7 +10,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import crypto_store as cs
 from domain import days_until_password_change, canonical_link_pair
+from util import best_effort_wipe
 
 
 # Версия схемы базы данных. Увеличивается при изменении структуры таблиц,
@@ -96,22 +99,49 @@ class Database:
         # сменилось. Так привилегированные операции (lock/restore) безопасны даже
         # при висящих в очереди фоновых задачах прежней сессии.
         self._session_gen = 0
+        # Кэш суммарного объёма галереи (M-9): SUM(LENGTH(image_data)) — полный
+        # скан gallery, а он вызывается при каждом добавлении картинки. Держим
+        # мемо-значение (None = не посчитано/устарело), инвалидируем при любой
+        # записи в галерею и смене сессии; recompute лениво по запросу.
+        self._gallery_bytes: int | None = None
+
+    def _invalidate_gallery_bytes(self):
+        """Сбросить кэш суммарного объёма галереи (после любой её мутации)."""
+        self._gallery_bytes = None
 
     def _bump_session(self):
         """Отметить смену соединения — погасить фоновые операции прежней сессии."""
         self._session_gen += 1
+        # Смена соединения (connect/open_encrypted/lock/close/restore) означает
+        # другую БД в памяти — кэш объёма галереи больше не актуален (M-9).
+        self._gallery_bytes = None
 
-    async def run_async(self, method, *args, **kwargs):
+    def current_session(self):
+        """Токен текущей сессии БД (растёт при connect/open_encrypted/lock/close).
+
+        Логическая операция из НЕСКОЛЬКИХ await (загрузка/сохранение карточки,
+        предпросмотр галереи) должна снять этот токен ОДИН раз в начале и
+        передавать его в каждый run_async (_session=…). Тогда смена сессии
+        (lock/restore/close) между любыми двумя await прерывает ВСЮ операцию, а не
+        только конкретный вызов, стоявший в очереди на момент смены (H65-02)."""
+        return self._session_gen
+
+    async def run_async(self, method, *args, _session=None, **kwargs):
         """Выполнить синхронный метод БД в фоновом потоке, не блокируя UI-поток.
 
         method — публичный метод этого экземпляра (уже обёрнут локом). Результат
         возвращается обычным await. Пример: await db.run_async(db.load_account, id).
 
-        Если за время ожидания в очереди сессия БД сменилась (close/lock/restore),
-        метод НЕ выполняется — поднимается StaleSessionError (вызыватель трактует
+        _session — ожидаемый токен сессии (см. current_session). Если не задан,
+        снимается текущий на момент вызова (защищает лишь этот вызов). Задавайте
+        его явно для многошаговых операций, чтобы вся coroutine была привязана к
+        одной сессии.
+
+        Если к моменту выполнения сессия БД сменилась (close/lock/restore) —
+        метод НЕ выполняется, поднимается StaleSessionError (вызыватель трактует
         как «результат устарел»)."""
         loop = asyncio.get_running_loop()
-        gen = self._session_gen
+        gen = self._session_gen if _session is None else _session
 
         def _call():
             # Сверка поколения и вызов — под одним локом: close/lock не вклинятся
@@ -239,7 +269,6 @@ class Database:
 
     def serialize_container(self) -> bytes:
         """serialize_db() + шифрование в контейнер (без записи). Синхронный путь."""
-        import crypto_store as cs
         return cs.seal(self.serialize_db(), self._dek, self._header)
 
     def seal_and_write(self, db_bytes: bytes, force: bool = False):
@@ -248,7 +277,6 @@ class Database:
         Не обращается к соединению SQLite — безопасно вызывать из рабочего
         потока (см. фоновую запись в main.py). Шифрование (AES-GCM) и запись —
         самые тяжёлые части сохранения."""
-        import crypto_store as cs
         container = cs.seal(db_bytes, self._dek, self._header)
         self._write_container(container, force=force)
 
@@ -318,6 +346,14 @@ class Database:
         self.conn.commit()
         self._mark_dirty()
 
+    def _write(self, sql, params=()):
+        """Выполнить один мутирующий statement в явной транзакции и пометить БД
+        грязной (M-6). `with self.conn` фиксирует при успехе и откатывает при
+        исключении; семантика dirty идентична _commit (commit + _mark_dirty)."""
+        with self.conn:
+            self.cursor.execute(sql, params)
+        self._mark_dirty()
+
     # ─── Управление шифрованием ──────────────────────────────────────────────
 
     def _atomic_write(self, data: bytes):
@@ -334,7 +370,6 @@ class Database:
         и только потом закрывается рабочее соединение. Если запись файла упадёт,
         переоткрываем обычную БД, чтобы объект не остался с закрытым соединением
         в несогласованном состоянии (раньше так и было — все CRUD падали)."""
-        import crypto_store as cs
         db_bytes = self.conn.serialize()
         container, recovery = cs.create_vault(db_bytes, password, preset)
         pt, dek, header = cs.unlock(container, password)  # валидируем ДО закрытия
@@ -364,14 +399,12 @@ class Database:
 
     def change_master_password(self, new_password: str, preset: str | None = None):
         """Сменить мастер-пароль (перезаворачивание DEK, без перешифровки данных)."""
-        import crypto_store as cs
         new_header = cs.change_password(None, self._dek, self._header,
                                         new_password, preset)
         self.set_header(new_header)
 
     def regenerate_recovery_code(self) -> str:
         """Сгенерировать новый recovery-код. Возвращает код (показать один раз)."""
-        import crypto_store as cs
         new_header, recovery = cs.regenerate_recovery(self._dek, self._header)
         self.set_header(new_header)
         return recovery
@@ -382,7 +415,6 @@ class Database:
         Доступ возможен любым секретом, так как оба заворачивают один и тот же
         DEK — поэтому смену пароля / отключение шифрования можно авторизовать
         и паролем, и recovery-кодом."""
-        import crypto_store as cs
         if not self.encrypted or self._header is None:
             return False
         try:
@@ -417,13 +449,21 @@ class Database:
             _ver = None         # пустая новая база — создаём с нуля
         if _ver is not None and _ver > SCHEMA_VERSION:
             raise FutureSchemaError(_ver, SCHEMA_VERSION)
-        if _ver == SCHEMA_VERSION and _REQUIRED_TABLES.issubset(existing):
-            return              # схема актуальна и все таблицы на месте — делать нечего
-        # M6-06: даже при «актуальной» версии не доверяем ей слепо — если
-        # обязательной таблицы нет (частично повреждённая база), НЕ возвращаемся
-        # рано, а проходим ниже CREATE TABLE IF NOT EXISTS и восстанавливаем её.
-        # Полный foreign_key_check на горячем пути не запускаем (дорого на больших
-        # базах); целостность связей проверяется отдельной операцией.
+        if (_ver == SCHEMA_VERSION and _REQUIRED_TABLES.issubset(existing)
+                and self._fast_path_fingerprint_ok()):
+            return              # схема актуальна и отпечаток цел — делать нечего
+        # M6-06/M65-04: даже при «актуальной» версии не доверяем ей слепо. Помимо
+        # наличия таблиц сверяем отпечаток схемы (обязательные колонки accounts и
+        # UNIQUE-индексы целостности). Если что-то не сходится (частично повреждённая
+        # база) — НЕ возвращаемся рано, а проходим ниже CREATE TABLE IF NOT EXISTS,
+        # dedup и пересоздание индексов и восстанавливаем схему. Полный
+        # foreign_key_check на горячем пути не запускаем (дорого на больших базах);
+        # он выполняется при restore (см. backup._is_valid_db).
+
+        # M65-05: durable-копия файла БД ПЕРЕД миграцией версии. Удаляется при
+        # успехе (в конце метода); если миграция прервётся исключением/сбоем —
+        # копия останется на диске (путь в логе) для восстановления.
+        premigrate = self._begin_premigration_backup(_ver)
 
         # Таблица папок
         self.cursor.execute("""
@@ -530,49 +570,55 @@ class Database:
         # ниже, чтобы uq_linked_pair лёг уже на пересобранную таблицу.
         self._rebuild_linked_accounts_if_needed()
 
-        # Перед созданием UNIQUE-индексов убираем возможные дубли (из старых баз
-        # или ручных правок), иначе создание уникального индекса упадёт.
-        # personal_data / recovery_phrases — не более одной строки на аккаунт.
-        self.cursor.execute(
-            "DELETE FROM personal_data WHERE id NOT IN "
-            "(SELECT MIN(id) FROM personal_data GROUP BY account_id)")
-        self.cursor.execute(
-            "DELETE FROM recovery_phrases WHERE id NOT IN "
-            "(SELECT MIN(id) FROM recovery_phrases GROUP BY account_id)")
-        # linked_accounts: убрать самоссылки и неупорядоченные дубли (A,B)/(B,A).
-        self.cursor.execute("DELETE FROM linked_accounts WHERE account_id = linked_account_id")
-        self.cursor.execute(
-            "DELETE FROM linked_accounts WHERE id NOT IN ("
-            " SELECT MIN(id) FROM linked_accounts "
-            " GROUP BY MIN(account_id, linked_account_id), MAX(account_id, linked_account_id))")
-        # Старые НЕуникальные индексы (если успели создаться) заменяем уникальными.
-        self.cursor.execute("DROP INDEX IF EXISTS idx_personal_account")
-        self.cursor.execute("DROP INDEX IF EXISTS idx_phrases_account")
+        # Дедуп + (пере)создание индексов — ОДНОЙ транзакцией (M65-05): при сбое
+        # посередине (диск/исключение) `with self.conn` откатит и удаление дублей,
+        # и создание индексов целиком, не оставив промежуточного состояния (дубли
+        # удалены, а UNIQUE-индекс ещё не создан). Успех фиксируется атомарно.
+        with self.conn:
+            # Перед созданием UNIQUE-индексов убираем возможные дубли (из старых баз
+            # или ручных правок), иначе создание уникального индекса упадёт.
+            # personal_data / recovery_phrases — не более одной строки на аккаунт.
+            self.cursor.execute(
+                "DELETE FROM personal_data WHERE id NOT IN "
+                "(SELECT MIN(id) FROM personal_data GROUP BY account_id)")
+            self.cursor.execute(
+                "DELETE FROM recovery_phrases WHERE id NOT IN "
+                "(SELECT MIN(id) FROM recovery_phrases GROUP BY account_id)")
+            # linked_accounts: убрать самоссылки и неупорядоченные дубли (A,B)/(B,A).
+            self.cursor.execute("DELETE FROM linked_accounts WHERE account_id = linked_account_id")
+            self.cursor.execute(
+                "DELETE FROM linked_accounts WHERE id NOT IN ("
+                " SELECT MIN(id) FROM linked_accounts "
+                " GROUP BY MIN(account_id, linked_account_id), MAX(account_id, linked_account_id))")
+            # Старые НЕуникальные индексы (если успели создаться) заменяем уникальными.
+            self.cursor.execute("DROP INDEX IF EXISTS idx_personal_account")
+            self.cursor.execute("DROP INDEX IF EXISTS idx_phrases_account")
 
-        # Индексы по внешним ключам и частым фильтрам. CREATE INDEX IF NOT EXISTS
-        # идемпотентен, поэтому безопасно выполняется при каждом открытии и
-        # автоматически появляется в уже существующих базах (миграция не нужна).
-        # UNIQUE-индексы заодно дают целостность (M-14): не более одной строки
-        # ПД/фразы на аккаунт и отсутствие дублирующихся связей.
-        for stmt in (
-            "CREATE INDEX IF NOT EXISTS idx_services_folder ON services(folder_id)",
-            "CREATE INDEX IF NOT EXISTS idx_accounts_service ON accounts(service_id)",
-            "CREATE INDEX IF NOT EXISTS idx_accounts_deleted ON accounts(deleted_at)",
-            "CREATE UNIQUE INDEX IF NOT EXISTS uq_personal_account ON personal_data(account_id)",
-            "CREATE INDEX IF NOT EXISTS idx_questions_account ON secret_questions(account_id)",
-            "CREATE UNIQUE INDEX IF NOT EXISTS uq_phrases_account ON recovery_phrases(account_id)",
-            "CREATE INDEX IF NOT EXISTS idx_codes_account ON recovery_codes(account_id)",
-            "CREATE INDEX IF NOT EXISTS idx_gallery_account ON gallery(account_id)",
-            "CREATE INDEX IF NOT EXISTS idx_linked_account ON linked_accounts(account_id)",
-            "CREATE INDEX IF NOT EXISTS idx_linked_linked ON linked_accounts(linked_account_id)",
-            "CREATE UNIQUE INDEX IF NOT EXISTS uq_linked_pair ON linked_accounts(account_id, linked_account_id)",
-        ):
-            self.cursor.execute(stmt)
-
-        self._commit()
+            # Индексы по внешним ключам и частым фильтрам. CREATE INDEX IF NOT EXISTS
+            # идемпотентен, поэтому безопасно выполняется при каждом открытии и
+            # автоматически появляется в уже существующих базах (миграция не нужна).
+            # UNIQUE-индексы заодно дают целостность (M-14): не более одной строки
+            # ПД/фразы на аккаунт и отсутствие дублирующихся связей.
+            for stmt in (
+                "CREATE INDEX IF NOT EXISTS idx_services_folder ON services(folder_id)",
+                "CREATE INDEX IF NOT EXISTS idx_accounts_service ON accounts(service_id)",
+                "CREATE INDEX IF NOT EXISTS idx_accounts_deleted ON accounts(deleted_at)",
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_personal_account ON personal_data(account_id)",
+                "CREATE INDEX IF NOT EXISTS idx_questions_account ON secret_questions(account_id)",
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_phrases_account ON recovery_phrases(account_id)",
+                "CREATE INDEX IF NOT EXISTS idx_codes_account ON recovery_codes(account_id)",
+                "CREATE INDEX IF NOT EXISTS idx_gallery_account ON gallery(account_id)",
+                "CREATE INDEX IF NOT EXISTS idx_linked_account ON linked_accounts(account_id)",
+                "CREATE INDEX IF NOT EXISTS idx_linked_linked ON linked_accounts(linked_account_id)",
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_linked_pair ON linked_accounts(account_id, linked_account_id)",
+            ):
+                self.cursor.execute(stmt)
+        self._mark_dirty()   # `with self.conn` уже зафиксировал; отметим для encrypted flush
 
         # Доработка существующих баз до актуальной схемы
         self._migrate()
+        # Миграция завершена успешно — pre-migration копия больше не нужна.
+        self._finish_premigration_backup(premigrate)
 
     # Ожидаемые колонки таблиц для добавления в старые базы (имя -> SQL-определение).
     # Используется только в _migrate(); новые базы создаются полными в create_tables().
@@ -597,6 +643,68 @@ class Database:
         """Возвращает множество имён колонок таблицы."""
         self.cursor.execute(f"PRAGMA table_info({table})")
         return {row["name"] for row in self.cursor.fetchall()}
+
+    # UNIQUE-индексы, задающие целостность актуальной схемы (одна ПД/фраза на
+    # аккаунт, отсутствие дублей связей). Их наличие — часть отпечатка «быстрого
+    # пути»: удалённый вручную UNIQUE-индекс раньше проходил незамеченным (M65-04).
+    _INTEGRITY_INDEXES = frozenset({
+        "uq_personal_account", "uq_phrases_account", "uq_linked_pair",
+    })
+
+    def _fast_path_fingerprint_ok(self):
+        """Лёгкая проверка отпечатка схемы на горячем пути (M65-04).
+
+        Помимо совпадения версии и наличия таблиц убеждаемся, что на месте
+        обязательные колонки accounts и UNIQUE-индексы целостности. Так частично
+        повреждённая (но с актуальной версией) база не будет принята слепо: при
+        несовпадении отпечатка вызыватель пройдёт путь восстановления схемы.
+        Дёшево — несколько PRAGMA/чтений sqlite_master, без сканирования данных."""
+        if not self._EXPECTED_COLUMNS["accounts"].keys() <= self._get_columns("accounts"):
+            return False
+        self.cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type='index'")
+        indexes = {row["name"] for row in self.cursor.fetchall()}
+        return self._INTEGRITY_INDEXES <= indexes
+
+    def _begin_premigration_backup(self, ver):
+        """Durable-копия файла БД ПЕРЕД миграцией версии (M65-05).
+
+        Только plaintext и только при реальном повышении версии (ver < текущей):
+        в шифрованном режиме на диске уже лежит НЕИЗМЕНЁННЫЙ контейнер прежней
+        версии — он и есть снимок «до миграции» (persist происходит уже после).
+        Возвращает путь копии (или None). Копия удаляется при успешной миграции;
+        если миграция прервётся, файл остаётся на диске для восстановления."""
+        if self.encrypted or ver is None or ver >= SCHEMA_VERSION:
+            return None
+        if not os.path.exists(self.db_path):
+            return None
+        path = self.db_path + ".pre-migrate"
+        try:
+            # Файл на диске согласован (транзакция ещё не начиналась) — копируем и
+            # принудительно сбрасываем на диск (устойчивость к сбою питания).
+            with open(self.db_path, "rb") as src, open(path, "wb") as dst:
+                while True:
+                    chunk = src.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    dst.write(chunk)
+                dst.flush()
+                os.fsync(dst.fileno())
+        except OSError as e:
+            logging.warning("Не удалось создать pre-migration копию: %s", e)
+            return None
+        logging.info("Миграция схемы %s→%s: сохранена копия перед миграцией: %s",
+                     ver, SCHEMA_VERSION, path)
+        return path
+
+    def _finish_premigration_backup(self, path):
+        """Удалить pre-migration копию после успешной миграции (M65-05).
+
+        Копия — полный plaintext-снимок БД (все пароли/BLOB), поэтому удаляем
+        через best_effort_wipe: содержимое затирается нулями до unlink (H-3)."""
+        if not path:
+            return
+        best_effort_wipe(path)
 
     def _migrate(self):
         """Приводит существующую базу к актуальной версии схемы.
@@ -697,6 +805,10 @@ class Database:
             return  # инвариант уже закреплён — таблица канонична
 
         self._commit()  # закрыть возможную открытую транзакцию (иначе PRAGMA игнорируется)
+        # Инвариант (M-7): PRAGMA foreign_keys переключается ТОЛЬКО вне открытой
+        # транзакции — внутри транзакции SQLite молча игнорирует PRAGMA, и FK
+        # остались бы включёнными во время пересборки таблицы.
+        assert not self.conn.in_transaction
         self.conn.execute("PRAGMA foreign_keys = OFF")
         try:
             with self.conn:
@@ -734,6 +846,9 @@ class Database:
 
         cols = ", ".join(info.keys())
         self._commit()  # закрыть возможную открытую транзакцию (иначе PRAGMA игнорируется)
+        # Инвариант (M-7): PRAGMA foreign_keys — только вне транзакции, иначе
+        # SQLite молча игнорирует её и FK останутся включёнными при пересборке.
+        assert not self.conn.in_transaction
         self.conn.execute("PRAGMA foreign_keys = OFF")
         try:
             with self.conn:
@@ -757,6 +872,9 @@ class Database:
             return
 
         self._commit()  # закрыть возможную открытую транзакцию (иначе PRAGMA игнорируется)
+        # Инвариант (M-7): PRAGMA foreign_keys — только вне транзакции, иначе
+        # SQLite молча игнорирует её и FK останутся включёнными при пересборке.
+        assert not self.conn.in_transaction
         self.conn.execute("PRAGMA foreign_keys = OFF")
         try:
             with self.conn:
@@ -814,35 +932,41 @@ class Database:
                            "secret_questions", "personal_data", "linked_accounts",
                            "accounts", "services", "folders"):
                 self.conn.execute(f"DELETE FROM {table}")
+        self._invalidate_gallery_bytes()   # галерея очищена (M-9)
         self._mark_dirty()
             
     def add_folder(self, name: str) -> int:
         """Добавление папки"""
-        self.cursor.execute(
-            "INSERT INTO folders (name) VALUES (?)",
-            (name,)
-        )
-        self._commit()
-        return int(self.cursor.lastrowid)
-    
+        with self.conn:
+            self.cursor.execute("INSERT INTO folders (name) VALUES (?)", (name,))
+            new_id = int(self.cursor.lastrowid)
+        self._mark_dirty()
+        return new_id
+
     def add_service(self, name: str, folder_id: int | None = None) -> int:
         """Добавление сервиса"""
-        self.cursor.execute(
-            "INSERT INTO services (name, folder_id) VALUES (?, ?)",
-            (name, folder_id)
-        )
-        self._commit()
-        return int(self.cursor.lastrowid)
-    
+        with self.conn:
+            self.cursor.execute(
+                "INSERT INTO services (name, folder_id) VALUES (?, ?)",
+                (name, folder_id))
+            new_id = int(self.cursor.lastrowid)
+        self._mark_dirty()
+        return new_id
+
     def add_account(self, service_id: int | None, account_name: str,
                     login: str | None = None, password: str | None = None) -> int:
         """Добавление аккаунта"""
-        self.cursor.execute(
-            "INSERT INTO accounts (service_id, account_name, login, password, created_at) VALUES (?, ?, ?, ?, ?)",
-            (service_id, account_name, login, password, datetime.now())
-        )
-        self._commit()
-        return int(self.cursor.lastrowid)
+        # created_at пишем строкой в формате SQLite CURRENT_TIMESTAMP
+        # (yyyy-MM-dd HH:mm:ss): datetime как SQL-параметр даёт DeprecationWarning
+        # на 3.12+ и его тот же формат ожидают парсеры (models._DT_FORMAT) (L-1).
+        with self.conn:
+            self.cursor.execute(
+                "INSERT INTO accounts (service_id, account_name, login, password, created_at) VALUES (?, ?, ?, ?, ?)",
+                (service_id, account_name, login, password,
+                 datetime.now().isoformat(" ", "seconds")))
+            new_id = int(self.cursor.lastrowid)
+        self._mark_dirty()
+        return new_id
     
     def _build_account_node(self, account):
         """Формирует узел аккаунта для дерева, включая дни до смены пароля."""
@@ -878,14 +1002,24 @@ class Database:
         nodes.sort(key=lambda n: not n['is_favorite'])
         return nodes
 
+    # Колонки accounts, нужные для построения/сортировки дерева (M-5). Тяжёлые
+    # текстовые поля (password, notes, extra_info, url, ip и т.д.) в дерево не
+    # входят — выбираем только используемые в _build_account_node/_sorted_accounts
+    # и группировке (service_id). created_at нужен для сортировки "created".
+    _TREE_ACCOUNT_COLUMNS = (
+        "id", "account_name", "login", "is_favorite", "service_id",
+        "password_changed_date", "password_change_interval_days",
+    )
+
     def _fetch_accounts(self, where_clause, params, sort_mode, descending):
         if sort_mode == "created":
             order = "created_at " + ("DESC" if descending else "ASC")
         else:
             order = "sort_order, account_name"
+        cols = ", ".join(self._TREE_ACCOUNT_COLUMNS)
         # Аккаунты в корзине (deleted_at не пуст) в дереве не показываем.
         self.cursor.execute(
-            f"SELECT * FROM accounts WHERE ({where_clause}) AND deleted_at IS NULL "
+            f"SELECT {cols} FROM accounts WHERE ({where_clause}) AND deleted_at IS NULL "
             f"ORDER BY {order}", params
         )
         return self._sorted_accounts(self.cursor.fetchall(), sort_mode, descending)
@@ -909,13 +1043,15 @@ class Database:
         else:
             acc_order = "sort_order, account_name"
 
-        self.cursor.execute(f"SELECT * FROM folders ORDER BY {order}")
+        self.cursor.execute(f"SELECT id, name FROM folders ORDER BY {order}")
         folders = self.cursor.fetchall()
-        self.cursor.execute(f"SELECT * FROM services ORDER BY {order}")
+        self.cursor.execute(f"SELECT id, name, folder_id FROM services ORDER BY {order}")
         services = self.cursor.fetchall()
         # Аккаунты в корзине (deleted_at не пуст) в дереве не показываем.
+        # Только колонки, нужные дереву (M-5) — без password/notes/extra_info.
+        acc_cols = ", ".join(self._TREE_ACCOUNT_COLUMNS)
         self.cursor.execute(
-            f"SELECT * FROM accounts WHERE deleted_at IS NULL ORDER BY {acc_order}"
+            f"SELECT {acc_cols} FROM accounts WHERE deleted_at IS NULL ORDER BY {acc_order}"
         )
         accounts = self.cursor.fetchall()
 
@@ -953,12 +1089,10 @@ class Database:
     # ----- Переименование -----
 
     def rename_folder(self, folder_id, name):
-        self.cursor.execute("UPDATE folders SET name = ? WHERE id = ?", (name, folder_id))
-        self._commit()
+        self._write("UPDATE folders SET name = ? WHERE id = ?", (name, folder_id))
 
     def rename_service(self, service_id, name):
-        self.cursor.execute("UPDATE services SET name = ? WHERE id = ?", (name, service_id))
-        self._commit()
+        self._write("UPDATE services SET name = ? WHERE id = ?", (name, service_id))
 
     # ----- Удаление без сохранения содержимого (полностью) -----
 
@@ -971,17 +1105,18 @@ class Database:
             for row in self.cursor.fetchall():
                 self.cursor.execute("DELETE FROM services WHERE id = ?", (row["id"],))
             self.cursor.execute("DELETE FROM folders WHERE id = ?", (folder_id,))
+        self._invalidate_gallery_bytes()   # каскад мог удалить картинки (M-9)
         self._mark_dirty()
 
     def delete_service(self, service_id):
         """Удаляет сервис вместе с его аккаунтами (каскад по FK)."""
-        self.cursor.execute("DELETE FROM services WHERE id = ?", (service_id,))
-        self._commit()
+        self._write("DELETE FROM services WHERE id = ?", (service_id,))
+        self._invalidate_gallery_bytes()   # каскад мог удалить картинки (M-9)
 
     def delete_account(self, account_id):
         """Удаляет аккаунт и все связанные данные (каскад по FK)."""
-        self.cursor.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
-        self._commit()
+        self._write("DELETE FROM accounts WHERE id = ?", (account_id,))
+        self._invalidate_gallery_bytes()   # каскад мог удалить картинки (M-9)
 
     # ----- Корзина (мягкое удаление аккаунтов) -----
 
@@ -996,18 +1131,15 @@ class Database:
     def move_account_to_bin(self, account_id):
         """Переносит аккаунт в корзину (мягкое удаление): данные сохраняются,
         но аккаунт скрыт из дерева и связей до восстановления."""
-        self.cursor.execute(
+        self._write(
             "UPDATE accounts SET deleted_at = ? WHERE id = ?",
-            (datetime.now(), account_id),
+            (datetime.now().isoformat(" ", "seconds"), account_id),
         )
-        self._commit()
 
     def restore_account(self, account_id):
         """Восстанавливает аккаунт из корзины."""
-        self.cursor.execute(
-            "UPDATE accounts SET deleted_at = NULL WHERE id = ?", (account_id,)
-        )
-        self._commit()
+        self._write(
+            "UPDATE accounts SET deleted_at = NULL WHERE id = ?", (account_id,))
 
     def get_deleted_count(self):
         """Количество аккаунтов в корзине."""
@@ -1027,8 +1159,8 @@ class Database:
 
     def empty_bin(self):
         """Безвозвратно удаляет все аккаунты из корзины."""
-        self.cursor.execute("DELETE FROM accounts WHERE deleted_at IS NOT NULL")
-        self._commit()
+        self._write("DELETE FROM accounts WHERE deleted_at IS NOT NULL")
+        self._invalidate_gallery_bytes()   # каскад мог удалить картинки (M-9)
 
     # ----- Удаление с сохранением содержимого -----
 
@@ -1068,26 +1200,23 @@ class Database:
     def move_service(self, service_id, folder_id):
         """Переносит сервис в папку (folder_id=None — вынести из папки), в конец списка."""
         order = self._next_sort_order("services", "folder_id", folder_id)
-        self.cursor.execute(
+        self._write(
             "UPDATE services SET folder_id = ?, sort_order = ? WHERE id = ?",
             (folder_id, order, service_id),
         )
-        self._commit()
 
     def move_account(self, account_id, service_id):
         """Переносит аккаунт в сервис (service_id=None — сделать свободным), в конец списка."""
         order = self._next_sort_order("accounts", "service_id", service_id)
-        self.cursor.execute(
+        self._write(
             "UPDATE accounts SET service_id = ?, sort_order = ? WHERE id = ?",
             (service_id, order, account_id),
         )
-        self._commit()
 
     def set_favorite(self, account_id, value):
-        self.cursor.execute(
-            "UPDATE accounts SET is_favorite = ? WHERE id = ?", (1 if value else 0, account_id)
-        )
-        self._commit()
+        self._write(
+            "UPDATE accounts SET is_favorite = ? WHERE id = ?",
+            (1 if value else 0, account_id))
 
     # ----- Сохранение порядка (для drag&drop) -----
 
@@ -1115,11 +1244,12 @@ class Database:
     # ----- Списки для меню перемещения -----
 
     def get_folders(self):
-        self.cursor.execute("SELECT id, name FROM folders ORDER BY name")
+        # COLLATE NOCASE — единый регистронезависимый порядок с _container_order (L-4).
+        self.cursor.execute("SELECT id, name FROM folders ORDER BY name COLLATE NOCASE")
         return [{"id": r["id"], "name": r["name"]} for r in self.cursor.fetchall()]
 
     def get_services(self):
-        self.cursor.execute("SELECT id, name FROM services ORDER BY name")
+        self.cursor.execute("SELECT id, name FROM services ORDER BY name COLLATE NOCASE")
         return [{"id": r["id"], "name": r["name"]} for r in self.cursor.fetchall()]
 
     def get_descendant_account_ids(self, node_type, node_id):
@@ -1174,23 +1304,40 @@ class Database:
         rows.sort(key=lambda r: r["name"].lower())
         return rows
 
+    def _gallery_total_all(self) -> int:
+        """Полный SUM(LENGTH(image_data)) по галерее с мемоизацией (M-9).
+
+        Значение считается один раз и хранится в self._gallery_bytes до первой
+        мутации галереи или смены сессии (там кэш сбрасывается в None)."""
+        if self._gallery_bytes is None:
+            self.cursor.execute(
+                "SELECT COALESCE(SUM(LENGTH(image_data)), 0) AS s FROM gallery")
+            self._gallery_bytes = int(self.cursor.fetchone()["s"])
+        return self._gallery_bytes
+
     def gallery_total_bytes(self, exclude_account_id: int | None = None) -> int:
         """Суммарный объём всех картинок в галерее (в байтах).
 
         exclude_account_id — исключить указанный аккаунт из суммы: его картинки
         обычно держатся в памяти редактируемой карточки, и учитывать их повторно
-        при проверке лимита суммарного объёма не нужно (M3-05)."""
+        при проверке лимита суммарного объёма не нужно (M3-05).
+
+        Полный объём кэшируется (M-9); при exclude вычитаем объём одного аккаунта
+        (дешёвый запрос по индексу idx_gallery_account) из кэшированной суммы."""
+        total = self._gallery_total_all()
         if exclude_account_id is None:
-            self.cursor.execute(
-                "SELECT COALESCE(SUM(LENGTH(image_data)), 0) AS s FROM gallery")
-        else:
-            self.cursor.execute(
-                "SELECT COALESCE(SUM(LENGTH(image_data)), 0) AS s "
-                "FROM gallery WHERE account_id != ?", (exclude_account_id,))
-        return int(self.cursor.fetchone()["s"])
+            return total
+        self.cursor.execute(
+            "SELECT COALESCE(SUM(LENGTH(image_data)), 0) AS s "
+            "FROM gallery WHERE account_id = ?", (exclude_account_id,))
+        return total - int(self.cursor.fetchone()["s"])
 
     def get_links(self, account_id: int) -> list[dict[str, Any]]:
-        """Связанные аккаунты (в обе стороны) с путями."""
+        """Связанные аккаунты (в обе стороны) с путями.
+
+        Пути строятся из заранее загруженных карт имён (_name_maps — 3 запроса),
+        а не вызовом get_account_path()/_is_in_bin() на каждый связанный id (было
+        N+1: до 4 запросов на связь). Формат результата идентичен прежнему (M-4)."""
         self.cursor.execute(
             "SELECT account_id, linked_account_id FROM linked_accounts "
             "WHERE account_id = ? OR linked_account_id = ?",
@@ -1201,9 +1348,16 @@ class Database:
             other = r["linked_account_id"] if r["account_id"] == account_id else r["account_id"]
             if other != account_id:
                 ids.add(other)
-        # Не показываем связи с аккаунтами, которые лежат в корзине.
-        result = [{"id": i, "name": self.get_account_path(i)}
-                  for i in ids if not self._is_in_bin(i)]
+        if not ids:
+            return []
+        acc, svc, fld = self._name_maps()
+        result = []
+        for i in ids:
+            a = acc.get(i)
+            # Нет записи или аккаунт в корзине (deleted_at не пуст) — не показываем.
+            if not a or a[2]:
+                continue
+            result.append({"id": i, "name": self._path_from_maps(i, acc, svc, fld)})
         result.sort(key=lambda r: r["name"].lower())
         return result
 
@@ -1285,8 +1439,12 @@ class Database:
             "SELECT id, description FROM gallery WHERE account_id = ? ORDER BY id",
             (account_id,),
         )
+        # image_id — id строки для контракта сохранения (H-6): вернув item с
+        # data=None и этим image_id, UI сообщает «сохранить существующий BLOB».
+        # Ключ "id" оставлен для обратной совместимости с прежними вызывателями.
         gallery = [
-            {"id": r["id"], "desc": r["description"] or "", "data": None}
+            {"id": r["id"], "image_id": r["id"],
+             "desc": r["description"] or "", "data": None}
             for r in self.cursor.fetchall()
         ]
 
@@ -1323,19 +1481,25 @@ class Database:
 
     def save_account(self, account_id, data):
         """Сохраняет полную карточку аккаунта. data — словарь примитивов в
-        формате load_account(). Связанные таблицы перезаписываются целиком."""
+        формате load_account(). Связанные таблицы перезаписываются целиком.
+        Возвращает список id строк галереи (см. _save_gallery_rows) — UI
+        присваивает их новым картинкам, чтобы повторное сохранение не
+        перезаливало их BLOB заново."""
         with self.conn:
-            self._save_account_rows(account_id, data)
+            gallery_ids = self._save_account_rows(account_id, data)
         self._mark_dirty()
+        return gallery_ids
 
     def save_account_with_links(self, account_id, data, target_ids):
         """Атомарно сохраняет карточку и её связи В ОДНОЙ транзакции (H6-02):
         раньше save_account и set_links были двумя транзакциями — сбой второй
-        оставлял карточку записанной, а связи нет. Теперь либо обе, либо ни одна."""
+        оставлял карточку записанной, а связи нет. Теперь либо обе, либо ни одна.
+        Возвращает список id строк галереи (как save_account)."""
         with self.conn:
-            self._save_account_rows(account_id, data)
+            gallery_ids = self._save_account_rows(account_id, data)
             self._set_links_rows(account_id, target_ids)
         self._mark_dirty()
+        return gallery_ids
 
     def _save_account_rows(self, account_id, data):
         """Тело save_account без управления транзакцией/пометкой dirty (для
@@ -1351,6 +1515,11 @@ class Database:
              f["password_changed_date"], f["password_change_interval_days"],
              f["notes"], f["ip"], f["browser"], f["os"], f["extra_info"], account_id),
         )
+        # Аккаунт мог быть удалён между открытием карточки и сохранением. Если
+        # UPDATE не затронул ни одной строки — прерываем внутри транзакции, чтобы
+        # `with self.conn` откатил уже вставленные связанные строки (L-6).
+        if self.cursor.rowcount != 1:
+            raise ValueError("Аккаунт не найден")
 
         p = data["personal"]
         self.cursor.execute("DELETE FROM personal_data WHERE account_id = ?", (account_id,))
@@ -1383,13 +1552,79 @@ class Database:
                 (account_id, code),
             )
 
-        self.cursor.execute("DELETE FROM gallery WHERE account_id = ?", (account_id,))
-        for g in data["gallery"]:
-            blob = sqlite3.Binary(g["data"]) if g["data"] is not None else None
-            self.cursor.execute(
-                "INSERT INTO gallery (account_id, description, image_data) VALUES (?, ?, ?)",
-                (account_id, g["desc"], blob),
-            )
+        return self._save_gallery_rows(account_id, data["gallery"])
+
+    def _save_gallery_rows(self, account_id, items):
+        """Согласует строки галереи аккаунта со списком items (контракт H-6).
+
+        Каждый item — dict с ключами:
+          * "desc" — подпись (метаданные);
+          * "data" — bytes (новый/обновлённый BLOB) или None;
+          * "image_id" — id существующей строки gallery (опционально).
+
+        Правила:
+          * data=None и задан image_id → «сохранить существующий BLOB»: строка
+            НЕ удаляется и НЕ обнуляется; обновляется только description
+            (image_data не трогаем);
+          * data=bytes → вставить новую строку; если задан image_id — обновить
+            BLOB и description существующей строки;
+          * строки, чей id ОТСУТСТВУЕТ среди переданных image_id → удалить (это
+            явное удаление картинки пользователем).
+
+        Порядок сохраняется как прежде (load_account ORDER BY id): сохранённые
+        строки удерживают свои id, новые вставляются в конец в порядке списка.
+
+        Возвращает список id той же длины и порядка, что items: id строки в БД
+        после сохранения либо None для пропущенного элемента (нет ни BLOB, ни
+        существующей строки). UI по этому списку присваивает id новым картинкам,
+        чтобы следующее сохранение обновляло строку, а не пересоздавало её."""
+        # Кэш суммарного объёма галереи устаревает при любой мутации (M-9).
+        self._invalidate_gallery_bytes()
+
+        # id всех текущих строк галереи аккаунта — чтобы удалить отсутствующие
+        # в новом списке и валидировать переданные image_id.
+        self.cursor.execute(
+            "SELECT id FROM gallery WHERE account_id = ?", (account_id,))
+        existing_ids = {r["id"] for r in self.cursor.fetchall()}
+
+        kept_ids = {g["image_id"] for g in items
+                    if g.get("image_id") is not None and g["image_id"] in existing_ids}
+        # Явно удалённые пользователем: были в БД, но их id нет в переданном списке.
+        to_delete = existing_ids - kept_ids
+        for row_id in to_delete:
+            self.cursor.execute("DELETE FROM gallery WHERE id = ?", (row_id,))
+
+        saved_ids: list[int | None] = []
+        for g in items:
+            image_id = g.get("image_id")
+            desc = g.get("desc", "")
+            data = g.get("data")
+            if data is None:
+                # «Сохранить существующий BLOB»: обновляем только подпись, не
+                # трогая image_data. Если строки уже нет (гонка/чужой id) —
+                # пропускаем (нечего сохранять, вставлять пустой BLOB не нужно).
+                if image_id is not None and image_id in existing_ids:
+                    self.cursor.execute(
+                        "UPDATE gallery SET description = ? WHERE id = ?",
+                        (desc, image_id))
+                    saved_ids.append(image_id)
+                else:
+                    saved_ids.append(None)
+                continue
+            blob = sqlite3.Binary(data)
+            if image_id is not None and image_id in existing_ids:
+                # Обновление BLOB существующей строки (перезалитая картинка).
+                self.cursor.execute(
+                    "UPDATE gallery SET description = ?, image_data = ? WHERE id = ?",
+                    (desc, blob, image_id))
+                saved_ids.append(image_id)
+            else:
+                # Новая картинка — вставляем в конец (новый, больший id).
+                self.cursor.execute(
+                    "INSERT INTO gallery (account_id, description, image_data) VALUES (?, ?, ?)",
+                    (account_id, desc, blob))
+                saved_ids.append(int(self.cursor.lastrowid))
+        return saved_ids
 
     # ----- Сбор данных для экспорта -----
 
@@ -1600,8 +1835,19 @@ _DB_NO_LOCK = frozenset({
     "seal_and_write",        # без conn; выполняется в QThread писателя — лок недопустим
     "flush",                 # обёртка над persist
     "run_async",             # сам диспетчер async (корутина); лок берёт вызываемый метод
+    "current_session",       # чтение токена сессии (атомарно), лок не нужен
     "shutdown_executor",     # управление пулом, не трогает conn
 })
+
+# ─── ИНВАРИАНТ ЛОКА (H-5) ─────────────────────────────────────────────────────
+# serialize_db ОБЯЗАН оставаться обёрнутым локом: это единственная точка, где
+# из фонового потока читается conn (conn.serialize). Методы без лока —
+# flush / persist / seal_and_write / serialize_container — выполняются в потоке
+# писателя и полагаются на то, что их conn-часть (именно serialize_db) берёт лок
+# сама. Если serialize_db попадёт в _DB_NO_LOCK, сериализация БД пойдёт без
+# лока параллельно UI-записи в conn → гонка/порча образа БД.
+assert "serialize_db" not in _DB_NO_LOCK, (
+    "serialize_db должен оставаться под локом (см. инвариант лока H-5)")
 
 
 def _synchronized(method):

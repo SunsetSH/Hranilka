@@ -48,6 +48,25 @@ class WindowChromeMixin:
             geo_hex = self.config.get("_window_geometry", "")
             if geo_hex:
                 self.restoreGeometry(QByteArray.fromHex(bytes(geo_hex, "ascii")))
+                self._ensure_on_screen()
+
+    def _ensure_on_screen(self):
+        """Если восстановленная геометрия не попадает ни на один доступный экран
+        (монитор отключили / сменился DPI) — вернуть окно в центр основного
+        экрана, при необходимости ужав до его размеров (L-13)."""
+        frame = self.frameGeometry()
+        if any(s.availableGeometry().intersects(frame)
+               for s in QApplication.screens()):
+            return
+        screen = QApplication.primaryScreen()
+        if screen is None:
+            return
+        avail = screen.availableGeometry()
+        self.resize(min(self.width(), avail.width()),
+                    min(self.height(), avail.height()))
+        geo = self.frameGeometry()
+        geo.moveCenter(avail.center())
+        self.move(geo.topLeft())
 
     # ─── Буфер обмена ────────────────────────────────────────────────────────
 
@@ -139,6 +158,10 @@ class WindowChromeMixin:
                 "Авто-блокировка отложена: есть несохранённые изменения.", 4000)
             return
         self._idle_timer.stop()
+        # Гасим незавершённый async карточки/галереи ДО закрытия/смены сессии БД:
+        # висящие загрузки/сохранения/предпросмотр не должны примениться к UI уже
+        # заблокированной или переоткрытой сессии (H65-02).
+        self._quiesce_card_async()
         # В обычном (plaintext) режиме «блокировка» лишь скрывает карточку с экрана:
         # ключ не теряется, поэтому несохранённые правки безопасно стэшим в кеш и
         # восстанавливаем при возврате (H5-03). В encrypted сюда попадаем уже без
@@ -210,6 +233,9 @@ class WindowChromeMixin:
         if not ok:
             self.close()
             return
+        # Валидация/миграция схемы после разблокировки (единый путь с рестартом,
+        # H65-05): _open_database открывает только соединение и схему не трогает.
+        self._create_tables_or_exit()
         self._reload_tree()
         self._last_activity = QDateTime.currentDateTime()
         self._idle_timer.start(self._idle_timer.interval() or 30000)

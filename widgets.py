@@ -1,13 +1,13 @@
 import os
-from qasync import asyncSlot
 import asyncio
+import logging
 from PySide6.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QLineEdit,
                                QPushButton, QLabel, QDateEdit, QDateTimeEdit,
                                QTextEdit, QFileDialog, QDialog, QMessageBox,
                                QApplication, QSpinBox, QMenu)
 from PySide6.QtCore import Signal, Qt, QDate, QByteArray, QBuffer, QIODevice
 from PySide6.QtGui import QPixmap, QImage, QImageReader
-from theme import themed_info, themed_confirm
+from theme import themed_info, themed_confirm, mix
 import util
 
 
@@ -267,17 +267,19 @@ class SecretQuestionsWidget(QWidget):
         h_layout.addWidget(q_edit)
         h_layout.addWidget(a_edit)
         h_layout.addWidget(del_btn)
-        
+
         self.layout.insertWidget(self.layout.count() - 2, row_widget)
-        self.rows.append((q_edit, a_edit))
+        # Храним прямые ссылки на виджеты строки (L-9): без хрупких поисков
+        # через parent()/layout().itemAt(...).
+        self.rows.append((q_edit, a_edit, del_btn, row_widget))
         self._update_empty()
 
     def remove_row(self, row_widget):
         if not _confirm(self.config, self, "Удаление",
                         "Удалить этот секретный вопрос?"):
             return
-        for i, (q, a) in enumerate(self.rows):
-            if q.parent() == row_widget:
+        for i, (_q, _a, _btn, w) in enumerate(self.rows):
+            if w == row_widget:
                 self.rows.pop(i)
                 break
         self.layout.removeWidget(row_widget)
@@ -286,11 +288,11 @@ class SecretQuestionsWidget(QWidget):
 
     def get_data(self):
         # Не сохраняем строку, если оба связанных поля пустые.
-        return [{"q": q.text(), "a": a.text()} for q, a in self.rows
+        return [{"q": q.text(), "a": a.text()} for q, a, _btn, _w in self.rows
                 if q.text().strip() or a.text().strip()]
 
     def set_data(self, data):
-        for row_widget in [q.parent() for q, a in self.rows]:
+        for _q, _a, _btn, row_widget in self.rows:
             self.layout.removeWidget(row_widget)
             row_widget.deleteLater()
         self.rows.clear()
@@ -299,10 +301,9 @@ class SecretQuestionsWidget(QWidget):
     def set_editable(self, editable):
         self._editable = editable
         self.add_btn.setVisible(editable)
-        for q, a in self.rows:
+        for q, a, del_btn, _w in self.rows:
             q.setReadOnly(not editable)
             a.setReadOnly(not editable)
-            del_btn = q.parent().layout().itemAt(2).widget()
             del_btn.setVisible(editable)
 
 class CodeListWidget(QWidget):
@@ -350,19 +351,20 @@ class CodeListWidget(QWidget):
         h_layout.addWidget(del_btn)
         
         self.layout.insertWidget(self.layout.count() - 2, row_widget)
-        self.rows.append((code_edit, row_widget))
+        # Прямая ссылка на кнопку удаления (L-9) — без layout().itemAt(...).
+        self.rows.append((code_edit, del_btn, row_widget))
         self._update_empty()
 
     def copy_code(self, text):
         if text:
             QApplication.clipboard().setText(text)
             self.copy_signal.emit()
-            
+
     def remove_code(self, row_widget):
         if not _confirm(self.config, self, "Удаление",
                         "Удалить этот код / резервный ключ?"):
             return
-        for i, (edit, widget) in enumerate(self.rows):
+        for i, (_edit, _btn, widget) in enumerate(self.rows):
             if widget == row_widget:
                 self.rows.pop(i)
                 break
@@ -372,22 +374,21 @@ class CodeListWidget(QWidget):
 
     def get_data(self):
         # Не сохраняем пустые коды.
-        return [edit.text() for edit, _ in self.rows if edit.text().strip()]
+        return [edit.text() for edit, _btn, _w in self.rows if edit.text().strip()]
 
     def set_data(self, data):
-        for _, widget in self.rows:
+        for _edit, _btn, widget in self.rows:
             self.layout.removeWidget(widget)
             widget.deleteLater()
         self.rows.clear()
         for code in data: self.add_code(code)
         self._update_empty()
-        
+
     def set_editable(self, editable):
         self._editable = editable
         self.add_btn.setVisible(editable)
-        for code_edit, widget in self.rows:
+        for code_edit, del_btn, _w in self.rows:
             code_edit.setReadOnly(not editable)
-            del_btn = widget.layout().itemAt(2).widget()
             del_btn.setVisible(editable)
 
 def _downscale_image_bytes(data, max_side, quality):
@@ -439,10 +440,24 @@ def _decode_thumb(data, bound):
 # чтение файла/BLOB и тяжёлый декод/сжатие идут вне UI-потока, а рисование
 # (QPixmap) остаётся на UI-потоке (см. _apply_thumb).
 
-def _read_file(path):
-    """Прочитать файл целиком. Для вызова в фоновом потоке (run_in_executor)."""
+class FileTooLargeError(Exception):
+    """Файл превысил допустимый размер при ограниченном чтении (L65-02)."""
+
+
+def _read_file(path, max_bytes):
+    """Прочитать файл целиком, но не более max_bytes. Для вызова в фоновом потоке.
+
+    Файл открывается ОДИН раз, а размер проверяется через fstat уже открытого
+    дескриптора — без TOCTOU-разрыва между getsize и open. Дополнительно читаем
+    не более max_bytes+1 байт: если файл/симлинк подменили на больший уже после
+    fstat, лишний байт вскроет это и мы не затянем в память гигабайты (L65-02)."""
     with open(path, "rb") as f:
-        return f.read()
+        if os.fstat(f.fileno()).st_size > max_bytes:
+            raise FileTooLargeError(path)
+        data = f.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        raise FileTooLargeError(path)
+    return data
 
 
 def _prepare_image_bytes(data, downscale=True):
@@ -464,6 +479,11 @@ def _prepare_image_bytes(data, downscale=True):
 class GalleryWidget(QWidget):
     """Галерея изображений. Хранит сами байты картинок (для записи в BLOB),
     а не пути к файлам — чтобы документ был самодостаточным."""
+
+    # Испускается при смене «идут ли сейчас загрузки файлов» (0 задач <-> 1+).
+    # UI (статус-бар) подписывается один раз при старте — сам виджет живёт всё
+    # время работы карточек, пересоздаётся не он, а его данные (set_data).
+    upload_status_changed = Signal(bool)
 
     def __init__(self, config=None, parent=None):
         super().__init__(parent)
@@ -497,8 +517,20 @@ class GalleryWidget(QWidget):
         # Колбэк ленивой загрузки BLOB: loader_fn(image_id) -> bytes | None.
         # Устанавливается через set_image_loader() после set_data().
         self._image_loader = None
+        # Async-чтение BLOB через координатор БД (run_async с фиксированным токеном
+        # сессии) — чтобы фоновый предпросмотр не обходил проверку сессии и не читал
+        # данные другой сессии vault после lock/restore (H65-02).
+        # reader(image_id, session) -> awaitable[bytes|None]; session_provider() -> токен.
+        self._async_reader = None
+        self._session_provider = None
         # Поколение предпросмотра: гасит устаревшую async-цепочку при смене карточки.
         self._preload_gen = 0
+        # Поколение данных карточки: растёт при каждом set_data (загрузка другой
+        # карточки) и при cancel_all_tasks (lock/restore/close). Async-импорт
+        # (upload/paste) снимает его при старте и добавляет элемент ТОЛЬКО если
+        # поколение не сменилось — иначе завершившаяся вставка попала бы в чужую
+        # карточку общего виджета (M65-01/M65-02).
+        self._data_gen = 0
         # Активные задачи загрузки файлов в галерею. Пока они не завершены, BLOB
         # ещё не в элементе (bytes=None) и get_data его пропустит — сохранение до
         # их завершения потеряло бы картинку (M6-01). Save их дожидается.
@@ -508,17 +540,40 @@ class GalleryWidget(QWidget):
         """Включено ли сжатие больших изображений при импорте (настройка)."""
         return bool(self.config.get("image_downscale", True)) if self.config else True
 
+    # ─── Стили миниатюр из цветов темы (H-10) ────────────────────────────────
+    # Раньше фон/текст миниатюр были жёстко зашиты (#333/#FFC400/#AAAAAA) и на
+    # темах вроде Windows 95 (чёрный на серебре) выглядели чужеродно, а текст
+    # мог терять контраст. Теперь фон — tree_bg_color, текст — text_color,
+    # «приглушённый» вариант — смесь текста с фоном (theme.mix).
+
+    def _theme_colors(self):
+        """(text, bg) из настроек; запасные значения — если config не внедрён."""
+        if self.config is not None:
+            return (self.config.get("text_color", "#FFFFFF"),
+                    self.config.get("tree_bg_color", "#333333"))
+        return "#FFFFFF", "#333333"
+
+    def _thumb_css(self, fg=None):
+        """CSS миниатюры: фон из темы; fg — None (только фон), "full" (текст
+        темы, для заметных сообщений) или "dim" (приглушённый placeholder)."""
+        text, bg = self._theme_colors()
+        css = f"background-color: {bg};"
+        if fg == "full":
+            css += f" color: {text};"
+        elif fg == "dim":
+            css += f" color: {mix(text, bg, 0.4)};"
+        return css
+
     def _read_file_bytes(self, path):
+        # Открываем один раз и читаем не более лимита (M6-04/L65-02): без TOCTOU
+        # между проверкой размера и чтением, без затягивания гигабайтов в память.
         try:
-            # Проверяем размер ДО чтения (M6-04): путь из буфера обмена тоже не
-            # должен затягивать в память гигабайтный файл до проверки лимита.
-            if os.path.getsize(path) > self._MAX_IMAGE_BYTES:
-                mb = self._MAX_IMAGE_BYTES // (1024 * 1024)
-                _warn(self.config, self, "Слишком большой файл",
-                      f"Файл больше {mb} МБ и не будет загружен.")
-                return None
-            with open(path, "rb") as f:
-                return f.read()
+            return _read_file(path, self._MAX_IMAGE_BYTES)
+        except FileTooLargeError:
+            mb = self._MAX_IMAGE_BYTES // (1024 * 1024)
+            _warn(self.config, self, "Слишком большой файл",
+                  f"Файл больше {mb} МБ и не будет загружен.")
+            return None
         except OSError as e:
             _warn(self.config, self, "Ошибка", f"Не удалось прочитать файл:\n{e}")
             return None
@@ -546,12 +601,32 @@ class GalleryWidget(QWidget):
         self._other_bytes_provider = other_bytes_provider
 
     def set_image_loader(self, loader_fn):
-        """Установить колбэк ленивой загрузки BLOB из БД и запустить фоновый
-        предпросмотр: миниатюры ленивых элементов подгружаются автоматически
-        (последовательно, не блокируя UI), а не только по клику.
+        """Установить колбэк ленивой загрузки BLOB из БД.
+
+        Если настройка gallery_thumb_preload = "startup" (по умолчанию), сразу
+        запускаем фоновый предпросмотр: миниатюры ленивых элементов
+        подгружаются автоматически (последовательно, не блокируя UI). В режиме
+        "on_click" предзагрузку не делаем — BLOB читается только при нажатии на
+        изображение, что снижает пиковое потребление ОЗУ (M6-03).
         loader_fn(image_id: int) -> bytes | None."""
         self._image_loader = loader_fn
-        self._start_thumb_preload()
+        if self._preload_on_start_enabled():
+            self._start_thumb_preload()
+
+    def _preload_on_start_enabled(self):
+        """Подгружать ли все миниатюры сразу при открытии карточки (настройка)."""
+        mode = self.config.get("gallery_thumb_preload", "startup") if self.config else "startup"
+        return mode != "on_click"
+
+    def set_async_reader(self, reader, session_provider):
+        """Внедрить async-чтение BLOB через координатор БД (H65-02).
+
+        reader(image_id, session) -> awaitable[bytes|None] — читает под run_async
+        с зафиксированным токеном сессии; session_provider() -> текущий токен.
+        Предпросмотр снимает токен один раз на запуск, поэтому смена сессии
+        (lock/restore) прерывает чтение, а не читает чужую БД."""
+        self._async_reader = reader
+        self._session_provider = session_provider
 
     def _local_bytes(self):
         """Суммарный объём картинок в текущей (редактируемой) карточке.
@@ -595,11 +670,16 @@ class GalleryWidget(QWidget):
         потоке — там вызывается _accept_image_checked, чтобы не декодировать на UI."""
         return self._accept_image_checked(data, self._read_image_size(data))
 
-    def _accept_image_checked(self, data, size):
+    def _accept_image_checked(self, data, size, pending_placeholder=False):
         """Проверяет ДОБАВЛЯЕМОЕ изображение при УЖЕ известном размере: размер
         файла, разрешение (защита от «бомбы»), число картинок на аккаунт и
         суммарный объём по базе. Возвращает True, если можно сохранить. К уже
-        сохранённым в БД изображениям не применяется (см. add_item)."""
+        сохранённым в БД изображениям не применяется (см. add_item).
+
+        pending_placeholder — кандидат уже добавлен в self.items как placeholder
+        (путь upload). Тогда при подсчёте лимита его нужно исключить, иначе при 49
+        реальных картинках placeholder делает счётчик 50 и отклоняет сам себя
+        (off-by-one, L65-01)."""
         if not data:
             return False
         if len(data) > self._MAX_IMAGE_BYTES:
@@ -617,7 +697,8 @@ class GalleryWidget(QWidget):
             _warn(self.config, self, "Слишком большое изображение",
                   f"Разрешение превышает {mp} Мп и не будет добавлено.")
             return False
-        if len(self.items) >= self._MAX_IMAGES_PER_ACCOUNT:
+        committed = len(self.items) - (1 if pending_placeholder else 0)
+        if committed >= self._MAX_IMAGES_PER_ACCOUNT:
             _warn(self.config, self, "Слишком много изображений",
                   f"На один аккаунт допускается не более "
                   f"{self._MAX_IMAGES_PER_ACCOUNT} изображений.")
@@ -631,8 +712,13 @@ class GalleryWidget(QWidget):
                 # L5-01: раньше ошибка провайдера глоталась с other=0 — лимит
                 # суммарного объёма молча отключался. Fail-closed: не зная
                 # реального объёма базы, отклоняем добавление.
+                # Пользователю — без сырого текста исключения (M-14): там могут
+                # быть внутренности БД; детали — в лог.
+                logging.error("Не удалось проверить общий объём галереи: %s",
+                              e, exc_info=e)
                 _warn(self.config, self, "Ошибка",
-                      f"Не удалось проверить общий объём галереи:\n{e}")
+                      "Не удалось проверить общий объём галереи "
+                      f"({type(e).__name__}). Подробности — в логе программы.")
                 return False
         if other + self._local_bytes() + len(data) > self._MAX_TOTAL_BYTES:
             gb = self._MAX_TOTAL_BYTES / (1024 * 1024 * 1024)
@@ -667,25 +753,59 @@ class GalleryWidget(QWidget):
         """Поставить готовую миниатюру (QImage) в QLabel — только в UI-потоке
         (здесь создаётся QPixmap, что вне UI-потока недопустимо)."""
         if thumb_img is not None and not thumb_img.isNull():
-            lbl.setStyleSheet("background-color: #333;")
+            lbl.setStyleSheet(self._thumb_css())
             lbl.setText("")
             lbl.setPixmap(QPixmap.fromImage(thumb_img).scaled(
                 100, 100, Qt.KeepAspectRatio, Qt.SmoothTransformation))
         else:
-            lbl.setStyleSheet("background-color: #333; color: #FFC400;")
+            lbl.setStyleSheet(self._thumb_css("full"))
             lbl.setText("[ нет\nпревью ]")
+
+    def _track_upload(self, coro):
+        """Запустить async-импорт и, под работающим event-loop, учесть его задачу,
+        чтобы Save мог дождаться (M6-01), а cancel_all_tasks — отменить."""
+        was_empty = not self._upload_tasks
+        task = util.fire(coro)
+        # Под работающим event-loop fire возвращает Task. Без loop (тесты)
+        # конвейер уже отработал синхронно.
+        if asyncio.isfuture(task):
+            self._upload_tasks.add(task)
+            task.add_done_callback(self._on_upload_task_done)
+            if was_empty:
+                self.upload_status_changed.emit(True)
+
+    def _on_upload_task_done(self, task):
+        self._upload_tasks.discard(task)
+        if not self._upload_tasks:
+            self.upload_status_changed.emit(False)
 
     def _queue_file_load(self, path):
         """Сразу добавить placeholder (bytes=None — UI не блокируется) и запустить
         async-конвейер загрузки. Реальная работа — в _upload_pipeline."""
         self.add_item(None)                  # placeholder «[ фото ]», bytes=None
         item = self.items[-1]
-        task = util.fire(self._upload_pipeline(item, path))
-        # Под работающим event-loop fire возвращает Task — учитываем его, чтобы
-        # Save мог дождаться (M6-01). Без loop (тесты) конвейер уже отработал.
-        if asyncio.isfuture(task):
-            self._upload_tasks.add(task)
-            task.add_done_callback(self._upload_tasks.discard)
+        self._track_upload(self._upload_pipeline(item, path, self._data_gen))
+
+    def _cancel_upload_tasks(self):
+        """Отменить все активные задачи импорта (смена карточки/lock/restore).
+        Возвращает число отменённых задач."""
+        tasks = list(self._upload_tasks)
+        for t in tasks:
+            t.cancel()
+        self._upload_tasks.clear()
+        if tasks:
+            # Сбрасываем статус сразу — не дожидаясь done-callback отменённых
+            # задач (может не успеть отработать до пересборки карточки).
+            self.upload_status_changed.emit(False)
+        return len(tasks)
+
+    def cancel_all_tasks(self):
+        """Погасить весь фоновый асинхрон виджета (импорт + предпросмотр) перед
+        сменой сессии БД (lock/restore/close). Элементы карточки не трогаем —
+        UI пересоберётся при следующем set_data."""
+        self._data_gen += 1
+        self._preload_gen += 1
+        return self._cancel_upload_tasks()
 
     def has_pending_uploads(self):
         """Идут ли ещё загрузки файлов в галерею (BLOB не готовы для get_data)."""
@@ -696,25 +816,37 @@ class GalleryWidget(QWidget):
         if self._upload_tasks:
             await asyncio.gather(*list(self._upload_tasks), return_exceptions=True)
 
-    async def _upload_pipeline(self, item, path):
+    async def _upload_pipeline(self, item, path, gen):
         """Async-конвейер загрузки картинки с диска. Разные операции — в разных
         потоках пула (run_in_executor), UI-поток лишь рисует результат:
           1) чтение файла           → поток;
           2) сжатие + декод миниатюры → поток (самый тяжёлый CPU);
-          3) проверка лимитов + рисование → UI-поток (дёшево)."""
+          3) проверка лимитов + рисование → UI-поток (дёшево).
+
+        gen — поколение карточки на момент запуска: если оно сменилось (пользователь
+        переключил аккаунт / lock / restore), результат в текущую карточку не
+        применяем (M65-02)."""
         loop = asyncio.get_running_loop()
         try:
-            data = await loop.run_in_executor(None, _read_file, path)
+            data = await loop.run_in_executor(
+                None, _read_file, path, self._MAX_IMAGE_BYTES)
+        except FileTooLargeError:
+            if gen == self._data_gen and item in self.items:
+                self._remove_item_silent(item)
+            mb = self._MAX_IMAGE_BYTES // (1024 * 1024)
+            _warn(self.config, self, "Слишком большой файл",
+                  f"Файл больше {mb} МБ и не будет загружен.")
+            return
         except OSError as e:
-            if item in self.items:
+            if gen == self._data_gen and item in self.items:
                 self._remove_item_silent(item)
             _warn(self.config, self, "Ошибка", f"Не удалось прочитать файл:\n{e}")
             return
         data, size, thumb = await loop.run_in_executor(
             None, _prepare_image_bytes, data, self._downscale_enabled())
-        if item not in self.items:
-            return                           # элемент удалили, пока грузился
-        if not self._accept_image_checked(data, size):
+        if gen != self._data_gen or item not in self.items:
+            return                           # карточку сменили / элемент удалили
+        if not self._accept_image_checked(data, size, pending_placeholder=True):
             self._remove_item_silent(item)   # предупреждение уже показал accept
             return
         item["bytes"] = data
@@ -732,11 +864,14 @@ class GalleryWidget(QWidget):
             return
         self._preload_gen += 1
         gen = self._preload_gen
+        # Токен сессии на весь запуск предпросмотра: если сессия сменится (lock/
+        # restore), async-чтение поднимет StaleSessionError и цепочка прервётся.
+        session = self._session_provider() if self._session_provider else None
         pending = [it for it in self.items
                    if it["bytes"] is None and it["image_id"] is not None]
-        util.fire(self._preload_pipeline(pending, gen))
+        util.fire(self._preload_pipeline(pending, gen, session))
 
-    async def _preload_pipeline(self, items, gen):
+    async def _preload_pipeline(self, items, gen, session):
         loop = asyncio.get_running_loop()
         for item in items:
             if gen != self._preload_gen:
@@ -745,8 +880,12 @@ class GalleryWidget(QWidget):
             if (item not in self.items or item["bytes"] is not None
                     or item["image_id"] is None or loader is None):
                 continue
-            # Чтение BLOB — в потоке (load_gallery_image потокобезопасен под RLock БД).
-            data = await loop.run_in_executor(None, loader, item["image_id"])
+            # Чтение BLOB — через координатор БД (session-токен) либо, если он не
+            # внедрён, в потоке пула (load_gallery_image потокобезопасен под RLock).
+            if self._async_reader is not None:
+                data = await self._async_reader(item["image_id"], session)
+            else:
+                data = await loop.run_in_executor(None, loader, item["image_id"])
             if gen != self._preload_gen or item not in self.items:
                 return
             if data is None:
@@ -770,8 +909,13 @@ class GalleryWidget(QWidget):
         self.items_layout.removeWidget(w)
         w.deleteLater()
 
-    @asyncSlot()
-    async def paste_image(self):
+    def paste_image(self):
+        """Вставка из буфера. Как и загрузка с диска, идёт через отслеживаемую
+        задачу (M65-01): Save её дождётся, а завершившаяся вставка проверит
+        поколение карточки и не попадёт в чужой аккаунт при переключении."""
+        self._track_upload(self._paste_pipeline(self._data_gen))
+
+    async def _paste_pipeline(self, gen):
         loop = asyncio.get_running_loop()
         clipboard = QApplication.clipboard()
         mime_data = clipboard.mimeData()
@@ -799,6 +943,8 @@ class GalleryWidget(QWidget):
             # снимаем размер в фоне (M6-02), затем добавляем.
             data, size, _ = await loop.run_in_executor(
                 None, _prepare_image_bytes, data, self._downscale_enabled())
+            if gen != self._data_gen:
+                return                       # карточку сменили — не добавляем в чужую
             if self._accept_image_checked(data, size):
                 self.add_item(data)
         else:
@@ -815,7 +961,11 @@ class GalleryWidget(QWidget):
         клике или при save через get_data).
         """
         item_widget = QWidget(self)
-        item_widget.setStyleSheet("border: 1px solid #808080; padding: 5px;")
+        # Рамка элемента — полутон между текстом и фоном темы (H-10): видна и на
+        # тёмных, и на светлых темах, вместо жёсткого #808080.
+        _text, _bg = self._theme_colors()
+        item_widget.setStyleSheet(
+            f"border: 1px solid {mix(_text, _bg, 0.5)}; padding: 5px;")
         h_layout = QHBoxLayout(item_widget)
 
         thumb_label = QLabel()
@@ -827,15 +977,15 @@ class GalleryWidget(QWidget):
             # Обычный режим — байты уже есть, рендерим миниатюру.
             thumb_img = self._decode_image(image_bytes, bound=100)
             if thumb_img is not None:
-                thumb_label.setStyleSheet("background-color: #333;")
+                thumb_label.setStyleSheet(self._thumb_css())
                 thumb_label.setPixmap(QPixmap.fromImage(thumb_img).scaled(
                     100, 100, Qt.KeepAspectRatio, Qt.SmoothTransformation))
             else:
-                thumb_label.setStyleSheet("background-color: #333; color: #FFC400;")
+                thumb_label.setStyleSheet(self._thumb_css("full"))
                 thumb_label.setText("[ нет\nпревью ]")
         else:
             # Ленивый режим — BLOB ещё не загружен, показываем placeholder.
-            thumb_label.setStyleSheet("background-color: #333; color: #AAAAAA;")
+            thumb_label.setStyleSheet(self._thumb_css("dim"))
             thumb_label.setText("[ фото ]")
 
         h_layout.addWidget(thumb_label)
@@ -886,45 +1036,106 @@ class GalleryWidget(QWidget):
         self.items_layout.removeWidget(widget)
         widget.deleteLater()
 
-    def _load_lazy_bytes(self, item, update_thumb=True):
-        """Загружает BLOB для ленивого элемента (image_id задан, bytes=None) и
-        кэширует байты в item — для полного просмотра/экспорта/сохранения.
-        update_thumb=False — не перерисовывать миниатюру (на пути get_data при
-        сохранении она уже подгружена предпросмотром; декод тут лишний).
-        Возвращает bytes или None (если загрузчик не задан / нет данных)."""
+    async def _load_lazy_bytes_async(self, item):
+        """Асинхронно загрузить BLOB ленивого элемента (image_id задан, bytes=None)
+        и закэшировать в item — для просмотра/экспорта по клику. Чтение вынесено
+        из UI-потока (H-7): на больших BLOB синхронный loader вешал интерфейс.
+
+        Как и предпросмотр (_preload_pipeline), читаем через координатор БД с
+        зафиксированным токеном сессии (session-провайдер), иначе — в потоке пула.
+        Токен снимается ОДИН раз: смена сессии (lock/restore) прерывает чтение.
+        Возвращает bytes или None (загрузчик не задан / нет данных / устарело)."""
         if item["bytes"] is not None:
             return item["bytes"]
         if item["image_id"] is None or self._image_loader is None:
             return None
-        data = self._image_loader(item["image_id"])
+        loop = asyncio.get_running_loop()
+        session = self._session_provider() if self._session_provider else None
+        image_id = item["image_id"]
+        if self._async_reader is not None:
+            data = await self._async_reader(image_id, session)
+        else:
+            loader = self._image_loader
+            data = await loop.run_in_executor(None, loader, image_id)
+        if item not in self.items:
+            return None                          # элемент удалили за время чтения
         if data is not None:
             item["bytes"] = data
-            if update_thumb:
-                self._apply_thumb(item["thumb"], self._decode_image(data, bound=100))
+            self._apply_thumb(item["thumb"], self._decode_image(data, bound=100))
         return data
 
+    def _set_thumb_loading(self, item, loading):
+        """Лёгкое состояние «загрузка» на миниатюре ленивого элемента, пока идёт
+        async-чтение BLOB по клику (H-7). Возвращаем placeholder-текст, только если
+        байты так и не появились (иначе миниатюру уже нарисовал _apply_thumb)."""
+        lbl = item["thumb"]
+        if loading:
+            lbl.setStyleSheet(self._thumb_css("dim"))
+            lbl.setText("[ … ]")
+        elif item["bytes"] is None:
+            lbl.setStyleSheet(self._thumb_css("dim"))
+            lbl.setText("[ фото ]")
+
     def _on_thumb_click(self, item):
-        """Обработчик ЛКМ по миниатюре: загружает BLOB при необходимости, затем
-        показывает полное изображение."""
-        data = self._load_lazy_bytes(item)
-        if data:
+        """Обработчик ЛКМ по миниатюре: если BLOB уже в памяти — показываем сразу,
+        иначе запускаем async-загрузку (UI не виснет, H-7)."""
+        if item["bytes"] is not None:
+            self.show_full_image(item["bytes"])
+            return
+        if item.get("_loading"):
+            return                               # защита от двойного клика
+        util.fire(self._on_thumb_click_async(item))
+
+    async def _on_thumb_click_async(self, item):
+        item["_loading"] = True
+        self._set_thumb_loading(item, True)
+        try:
+            data = await self._load_lazy_bytes_async(item)
+        finally:
+            if item in self.items:
+                item["_loading"] = False
+                self._set_thumb_loading(item, False)
+        if data and item in self.items:
             self.show_full_image(data)
 
     def _show_image_menu_lazy(self, label, pos, item):
-        """Контекстное меню миниатюры с ленивой загрузкой перед экспортом."""
+        """Контекстное меню миниатюры с ленивой загрузкой перед экспортом (async —
+        чтение BLOB не блокирует UI, H-7)."""
         menu = QMenu(self)
         act_file = menu.addAction("Экспорт в файл…")
         act_clip = menu.addAction("Экспорт в буфер обмена")
         chosen = menu.exec(label.mapToGlobal(pos))
-        if chosen in (act_file, act_clip):
-            data = self._load_lazy_bytes(item)
-            if not data:
-                _warn(self.config, self, "Ошибка", "Изображение недоступно.")
-                return
-            if chosen == act_file:
-                self._export_image_to_file(data)
-            else:
-                self._export_image_to_clipboard(data)
+        if chosen not in (act_file, act_clip):
+            return
+        if item["bytes"] is not None:
+            self._export_menu_action(chosen, act_file, item["bytes"])
+            return
+        if item.get("_loading"):
+            return
+        util.fire(self._show_image_menu_lazy_async(chosen, act_file, item))
+
+    async def _show_image_menu_lazy_async(self, chosen, act_file, item):
+        item["_loading"] = True
+        self._set_thumb_loading(item, True)
+        try:
+            data = await self._load_lazy_bytes_async(item)
+        finally:
+            if item in self.items:
+                item["_loading"] = False
+                self._set_thumb_loading(item, False)
+        if item not in self.items:
+            return
+        if not data:
+            _warn(self.config, self, "Ошибка", "Изображение недоступно.")
+            return
+        self._export_menu_action(chosen, act_file, data)
+
+    def _export_menu_action(self, chosen, act_file, data):
+        """Экспорт изображения по выбранному пункту меню (файл / буфер обмена)."""
+        if chosen == act_file:
+            self._export_image_to_file(data)
+        else:
+            self._export_image_to_clipboard(data)
 
     def show_full_image(self, image_bytes):
         img = self._decode_image(image_bytes, bound=1600)
@@ -988,31 +1199,64 @@ class GalleryWidget(QWidget):
         _warn(self.config, self, "Готово", "Изображение скопировано в буфер обмена.")
 
     def get_data(self):
-        """Возвращает список {"data": bytes, "desc": str} для сохранения в БД.
-        Ленивые элементы (bytes=None, image_id задан) загружаются через loader
-        прямо здесь — чтобы save_account получил полный BLOB."""
+        """Возвращает список элементов галереи для сохранения в БД (контракт H-6).
+
+        Каждый элемент — {"desc": str, "data": bytes|None, "image_id": int|None}:
+          * ленивый, ещё не загруженный (bytes=None, image_id задан) → отдаём
+            data=None + image_id: БД сохранит существующий BLOB, не удаляя его
+            (раньше такой элемент молча пропускался — потеря данных, H-6). BLOB
+            здесь НЕ дочитываем синхронно (это фризило UI, H-7);
+          * загруженный/новый (bytes есть) → отдаём data=bytes; если у элемента
+            есть image_id (перезалитая картинка) — он тоже идёт, иначе вставка
+            новой строки.
+        Элемент без bytes и без image_id (пустой placeholder) пропускаем."""
         result = []
         for it in self.items:
             data = it["bytes"]
-            if data is None and it["image_id"] is not None:
-                data = self._load_lazy_bytes(it, update_thumb=False)
-            if data is not None:
-                result.append({"data": data, "desc": it["desc"].text()})
+            image_id = it["image_id"]
+            if data is None and image_id is None:
+                continue                         # нечего сохранять
+            result.append({"desc": it["desc"].text(),
+                           "data": data, "image_id": image_id})
         return result
+
+    def assign_saved_ids(self, saved_ids):
+        """Присваивает элементам id строк БД после успешного сохранения.
+
+        saved_ids — результат Database.save_account*: список id в порядке и
+        составе get_data() (пустые placeholder'ы пропущены). Без этого новая
+        картинка не знала бы свой id, и следующее сохранение в той же сессии
+        пересоздавало бы её строку (лишняя перезапись BLOB). Элементы галереи
+        на время записи заблокированы (set_all_editable(False)), поэтому состав
+        не меняется; на случай гонки сверяем длину и молча выходим."""
+        savable = [it for it in self.items
+                   if it["bytes"] is not None or it["image_id"] is not None]
+        if len(savable) != len(saved_ids):
+            return
+        for it, new_id in zip(savable, saved_ids):
+            if new_id is not None:
+                it["image_id"] = new_id
 
     def set_data(self, data):
         """Загрузить список элементов галереи.
 
         Каждый элемент может быть:
-          {"data": bytes, "desc": str}            — байты уже в памяти
-          {"id": int, "desc": str, "data": None}  — ленивый (только из БД)
-        """
+          {"data": bytes, "desc": str}                  — байты уже в памяти
+          {"image_id": int, "desc": str, "data": None}  — ленивый (только из БД)
+        image_id читаем как из ключа "id" (прямой ответ load_account), так и из
+        "image_id" (после round-trip через кеш правок to_storage/from_storage,
+        H-6) — чтобы контракт «оставить существующий BLOB» не терялся."""
+        # Смена карточки: любой ещё не завершённый импорт (upload/paste) прежней
+        # карточки теперь относится к другому аккаунту — гасим его поколение,
+        # чтобы результат не попал в загружаемую карточку (M65-01/M65-02).
+        self._data_gen += 1
+        self._cancel_upload_tasks()
         for it in self.items:
             self.items_layout.removeWidget(it["widget"])
             it["widget"].deleteLater()
         self.items.clear()
         for item in data:
-            img_id = item.get("id")
+            img_id = item.get("id", item.get("image_id"))
             img_data = item.get("data")
             desc = item.get("desc", "")
             if img_data is not None:
@@ -1111,11 +1355,12 @@ class LinkedAccountsWidget(QWidget):
         h.addWidget(del_btn)
 
         self.rows_layout.addWidget(row)
-        self.items.append((account_id, name, row))
+        # Прямая ссылка на кнопку удаления (L-9) — без layout().itemAt(...).
+        self.items.append((account_id, name, row, del_btn))
         self._update_empty()
 
     def _remove_row(self, row):
-        for i, (aid, name, w) in enumerate(self.items):
+        for i, (_aid, _name, w, _btn) in enumerate(self.items):
             if w == row:
                 self.items.pop(i)
                 break
@@ -1127,7 +1372,7 @@ class LinkedAccountsWidget(QWidget):
         self.empty_label.setVisible(not self.items)
 
     def set_data(self, links):
-        for _, _, w in self.items:
+        for _aid, _name, w, _btn in self.items:
             w.hide()
             self.rows_layout.removeWidget(w)
             w.deleteLater()
@@ -1137,10 +1382,10 @@ class LinkedAccountsWidget(QWidget):
         self._update_empty()
 
     def get_data(self):
-        return [aid for aid, _, _ in self.items]
+        return [aid for aid, _name, _w, _btn in self.items]
 
     def set_editable(self, editable):
         self._editable = editable
         self.add_btn.setVisible(editable)
-        for _, _, row in self.items:
-            row.layout().itemAt(1).widget().setVisible(editable)
+        for _aid, _name, _row, del_btn in self.items:
+            del_btn.setVisible(editable)

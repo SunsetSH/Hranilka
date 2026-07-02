@@ -17,11 +17,10 @@ import widgets
 from widgets import GalleryWidget
 
 
-@pytest.fixture(scope="module")
-def qapp():
-    app = QApplication.instance() or QApplication([])
-    QImageReader.setAllocationLimit(256)
-    return app
+# Общий session-qapp живёт в conftest.py (M-16). setAllocationLimit —
+# процессно-глобальная настройка Qt; вызываем на импорте модуля (эффект
+# сохраняется на весь прогон, как и прежде при module-фикстуре).
+QImageReader.setAllocationLimit(256)
 
 
 @pytest.fixture(autouse=True)
@@ -201,17 +200,15 @@ async def test_queue_file_load_placeholder(qapp, tmp_path):
 
 async def test_queue_file_load_completes(qapp, tmp_path):
     """После завершения async-конвейера bytes заполняются и get_data их отдаёт."""
-    import asyncio
     img_path = tmp_path / "img.png"
     img_path.write_bytes(_png_bytes(40, 40))
 
     gw = GalleryWidget()
     gw._queue_file_load(str(img_path))
 
-    for _ in range(200):                       # даём конвейеру отработать
-        if gw.items and gw.items[0]["bytes"] is not None:
-            break
-        await asyncio.sleep(0.01)
+    # Детерминированно ждём завершения конвейера через собственный API виджета
+    # (M-15) вместо polling-цикла с asyncio.sleep.
+    await gw.wait_pending_uploads()
 
     assert len(gw.items) == 1
     assert gw.items[0]["bytes"] is not None
@@ -243,14 +240,13 @@ def test_prepare_respects_downscale_flag(qapp):
     assert len(data_off) == len(big)        # не перекодировано
 
 
-def test_read_file_bytes_rejects_oversized(qapp, tmp_path, monkeypatch):
-    """Путь из буфера обмена тоже не читает гигантский файл в память до проверки
-    лимита (M6-04)."""
-    import os as _os
+def test_read_file_bytes_rejects_oversized(qapp, tmp_path):
+    """Путь из буфера обмена не читает файл больше лимита в память (M6-04/L65-02):
+    ограничение чтения — по fstat уже открытого дескриптора, без TOCTOU."""
     p = tmp_path / "x.png"
     p.write_bytes(_png_bytes(10, 10))
-    monkeypatch.setattr(_os.path, "getsize", lambda _: 20 * 1024 * 1024)
     gw = GalleryWidget()
+    gw._MAX_IMAGE_BYTES = 10                     # искусственно занижаем порог
     assert gw._read_file_bytes(str(p)) is None
 
 

@@ -75,6 +75,10 @@ class ShortcutsMixin:
     def _sc_cancel_edit(self):
         if self.is_editing:
             self.cancel_edit()
+        elif self.search_box.hasFocus() and self.search_box.text():
+            # Вне режима правки WindowShortcut «съедал» Esc, и стандартная
+            # очистка поля поиска не срабатывала — делаем её явно (L-14).
+            self.search_box.clear()
 
     def _sc_gen_password(self):
         if self.is_editing:

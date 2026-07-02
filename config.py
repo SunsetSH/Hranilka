@@ -28,6 +28,7 @@ _INT_RANGES = {
 _ENUMS = {
     "argon2_preset": {"fast", "balanced", "paranoid"},
     "sort_mode": {"manual", "name", "created", "pwd_due"},
+    "gallery_thumb_preload": {"startup", "on_click"},
 }
 
 
@@ -78,6 +79,10 @@ class Config:
             "encryption_enabled": False,
             "argon2_preset": "balanced",
             "image_downscale": True,       # сжимать большие изображения при импорте
+            # Когда подгружать миниатюры галереи: "startup" — все сразу при
+            # открытии карточки (пик ОЗУ, см. M6-03), "on_click" — только BLOB
+            # нажатого изображения (ленивее по памяти).
+            "gallery_thumb_preload": "startup",
             "shortcuts": {},
             # Ранее «потреблялись», но отсутствовали в defaults и потому
             # проходили БЕЗ валидации (M3-04). Теперь известны и проверяются.

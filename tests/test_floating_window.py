@@ -20,9 +20,7 @@ import widgets
 from widgets import GalleryWidget
 
 
-@pytest.fixture(scope="module")
-def qapp():
-    return QApplication.instance() or QApplication([])
+# Общий session-qapp живёт в conftest.py (M-16).
 
 
 @pytest.fixture(autouse=True)

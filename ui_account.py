@@ -37,11 +37,39 @@ class AccountCardMixin:
         self.save_btn.setEnabled(not busy)
         self.cancel_btn.setEnabled(not busy)
 
+    def _on_gallery_upload_status(self, loading):
+        """Индикация в статус-баре, пока идёт async-загрузка картинки в галерею
+        (файл с диска или из буфера) — до этого момента BLOB ещё не в памяти,
+        и пользователь не видит, что что-то происходит в фоне."""
+        if loading:
+            self.statusBar().showMessage("[ ЗАГРУЗКА ]")   # без таймаута — до конца
+        else:
+            self.statusBar().clearMessage()
+
+    def _quiesce_card_async(self):
+        """Погасить весь незавершённый async карточки и галереи ПЕРЕД сменой сессии
+        БД (lock/restore/close). Новое поколение карточки делает устаревшими висящие
+        coroutine загрузки/сохранения: их проверки gen после await прерывают работу,
+        а finally не трогает UI уже другой сессии. Галерея отменяет импорт и
+        предпросмотр. Вызывать ДО db.lock()/close()/restore (H65-02)."""
+        self._card_gen += 1
+        self._card_busy = False
+        try:
+            self.tabs.f_gallery_widget.cancel_all_tasks()
+        except Exception as e:                       # noqa: BLE001 — teardown-хардненинг
+            logging.warning("Не удалось отменить задачи галереи: %s", e)
+
     def _show_card_error(self, title, exc):
         """Показать пользователю ошибку async-операции карточки (L6-03): иначе
-        кнопка визуально ничего не делает, а причина уходит только в лог."""
+        кнопка визуально ничего не делает, а причина уходит только в лог.
+
+        Пользователю — короткое сообщение без сырого текста исключения (M-14):
+        в нём могут быть пути/внутренности БД. Полные детали — в лог (exc_info)."""
         logging.error("%s: %s", title, exc, exc_info=exc)
-        theme.themed_info(self.config, self, title, f"{title}:\n{exc}")
+        theme.themed_info(
+            self.config, self, title,
+            f"Операция не выполнена ({type(exc).__name__}).\n"
+            "Подробности — в логе программы.")
 
     def on_item_selected(self, current, previous):
         node = self._node(current)
@@ -78,14 +106,21 @@ class AccountCardMixin:
         """Асинхронно загрузить карточку и заполнить интерфейс. Все обращения к БД
         идут через db.run_async (фоновый поток). После каждого await сверяем gen с
         текущим: если пользователь переключился — результат устарел, выходим, не
-        снимая блокировку (ею владеет более новая загрузка)."""
+        снимая блокировку (ею владеет более новая загрузка).
+
+        Токен сессии (session) снимается ОДИН раз и передаётся в каждый run_async:
+        если между await произошёл lock/restore/close, следующий вызов поднимет
+        StaleSessionError и вся загрузка прервётся, не смешивая данные разных
+        сессий vault (H65-02)."""
+        session = self.db.current_session()
         try:
             if new_id in self._edit_cache:
                 # Возврат к аккаунту с несохранёнными правками — восстанавливаем из кеша.
                 cached = self._edit_cache[new_id]
-                links = await self.db.run_async(self._resolve_link_names, cached["links"])
+                links = await self.db.run_async(
+                    self._resolve_link_names, cached["links"], _session=session)
                 other_bytes = await self.db.run_async(
-                    self.db.gallery_total_bytes, new_id)
+                    self.db.gallery_total_bytes, new_id, _session=session)
                 if gen != self._card_gen:
                     return
                 self.current_account_data = AccountData.from_storage(cached["storage"])
@@ -94,7 +129,8 @@ class AccountCardMixin:
                 self.tabs.set_all_editable(True)
                 self.edit_btn.hide(); self.save_btn.show(); self.cancel_btn.show()
             else:
-                storage = await self.db.run_async(self.db.load_account, new_id)
+                storage = await self.db.run_async(
+                    self.db.load_account, new_id, _session=session)
                 if gen != self._card_gen:
                     return
                 if storage is None:
@@ -105,9 +141,10 @@ class AccountCardMixin:
                     self._show_placeholder()
                     self._update_status_info()
                     return
-                links = await self.db.run_async(self.db.get_links, new_id)
+                links = await self.db.run_async(
+                    self.db.get_links, new_id, _session=session)
                 other_bytes = await self.db.run_async(
-                    self.db.gallery_total_bytes, new_id)
+                    self.db.gallery_total_bytes, new_id, _session=session)
                 if gen != self._card_gen:
                     return
                 self.current_account_data = AccountData.from_storage(storage)
@@ -126,6 +163,17 @@ class AccountCardMixin:
         finally:
             if gen == self._card_gen:
                 self._set_card_busy(False)
+
+    async def _gallery_read_blob(self, image_id, session):
+        """Async-чтение BLOB галереи для предпросмотра — через координатор БД с
+        зафиксированным токеном сессии (H65-02). При смене сессии (lock/restore)
+        run_async поднимает StaleSessionError — возвращаем None; предпросмотр к
+        этому моменту уже погашен сменой поколения и результат не применит."""
+        try:
+            return await self.db.run_async(
+                self.db.load_gallery_image, image_id, _session=session)
+        except StaleSessionError:
+            return None
 
     def _resolve_link_names(self, ids):
         """Имена связанных аккаунтов по их id (для отображения). Вызывается в
@@ -216,9 +264,12 @@ class AccountCardMixin:
         self.tabs.f_questions_widget.set_data(d.secret_questions)
         self.tabs.f_codes_widget.set_data(d.one_time_codes)
         self.tabs.f_gallery_widget.set_data(d.gallery)
-        # Ленивая загрузка BLOB: виджет читает байты картинки в фоновом потоке
-        # (load_gallery_image потокобезопасен — доступ к БД под RLock).
+        # Ленивая загрузка BLOB: синхронный колбэк — для клика/get_data (БД
+        # открыта), а фоновый предпросмотр читает через координатор БД с токеном
+        # сессии, чтобы не читать чужую сессию после lock/restore (H65-02).
         self.tabs.f_gallery_widget.set_image_loader(self.db.load_gallery_image)
+        self.tabs.f_gallery_widget.set_async_reader(
+            self._gallery_read_blob, self.db.current_session)
         # Лимит суммарного объёма галереи. В горячем пути объём прочих аккаунтов
         # уже посчитан асинхронно (other_bytes) — провайдер отдаёт готовое число,
         # без обращения к БД при добавлении картинки. Иначе (холодный путь) —
@@ -258,12 +309,14 @@ class AccountCardMixin:
 
     async def _cancel_edit_async(self, gen):
         # Отмена отбрасывает несохранённые правки этого аккаунта
+        session = self.db.current_session()
         aid = self._current_account_id
         self._edit_cache.pop(aid, None)
         self._dirty_ids.discard(aid)
         self.is_editing = False
         try:
-            storage = await self.db.run_async(self.db.load_account, aid)
+            storage = await self.db.run_async(
+                self.db.load_account, aid, _session=session)
             if gen != self._card_gen:
                 return                          # пользователь уже переключился
             if storage is None:
@@ -273,8 +326,9 @@ class AccountCardMixin:
                 self._update_status_info()
                 self._reload_tree()
                 return
-            links = await self.db.run_async(self.db.get_links, aid)
-            other_bytes = await self.db.run_async(self.db.gallery_total_bytes, aid)
+            links = await self.db.run_async(self.db.get_links, aid, _session=session)
+            other_bytes = await self.db.run_async(
+                self.db.gallery_total_bytes, aid, _session=session)
             if gen != self._card_gen:
                 return
             self.current_account_data = AccountData.from_storage(storage)
@@ -304,10 +358,16 @@ class AccountCardMixin:
         # Сбор данных из полей UI — синхронно (до первого await), снимок
         # согласован. get_data() может дочитать незагруженные BLOB (обычно уже
         # в кеше после предпросмотра).
+        session = self.db.current_session()
         aid = self._current_account_id
         if aid is None:
             self._set_card_busy(False)
             return
+        # H65-01: на всё время записи переводим поля карточки в read-only. Кнопки
+        # уже заблокированы (_set_card_busy), но сами поля оставались editable —
+        # текст, введённый во время await, не попадал бы ни в снимок, ни в БД и
+        # тихо терялся. Блокируем ДО первого await (ожидание загрузок картинок).
+        self.tabs.set_all_editable(False)
         # Дождаться незавершённых загрузок картинок: иначе get_data() пропустит
         # ещё не дочитанные BLOB и Save «потеряет» изображение (M6-01).
         gallery = self.tabs.f_gallery_widget
@@ -321,17 +381,20 @@ class AccountCardMixin:
         link_ids = self.tabs.f_linked.get_data()
         # Запись карточки и связей — атомарно, в одной транзакции, в фоновом потоке.
         try:
-            await self.db.run_async(
-                self.db.save_account_with_links, aid, storage, link_ids)
+            gallery_ids = await self.db.run_async(
+                self.db.save_account_with_links, aid, storage, link_ids,
+                _session=session)
         except StaleSessionError:
             return                               # БД сменена (restore) — запись неактуальна
         except Exception as e:                   # noqa: BLE001
             if gen == self._card_gen:
                 # Снимок не потерян: возвращаем его в кеш правок, чтобы пользователь
-                # мог повторить сохранение, и показываем причину.
+                # мог повторить сохранение, и показываем причину. Поля возвращаем в
+                # editable — пользователь остаётся в режиме правки (H65-01).
                 self._edit_cache[aid] = {"storage": storage, "links": link_ids}
                 self._dirty_ids.add(aid)
                 self._refresh_dirty_markers()
+                self.tabs.set_all_editable(True)
                 self._show_card_error("Не удалось сохранить аккаунт", e)
                 self._set_card_busy(False)
             return
@@ -340,6 +403,9 @@ class AccountCardMixin:
         # Кеш правок чистим ТОЛЬКО если за время await пользователь не переключился
         # и не перезанёс свежий черновик для aid (иначе потеряли бы новые правки, H6-02).
         if gen == self._card_gen:
+            # Новые картинки получают id своих строк — повторное сохранение
+            # обновит их, а не пересоздаст (лишняя перезапись BLOB).
+            gallery.assign_saved_ids(gallery_ids)
             self._edit_cache.pop(aid, None)
             self._dirty_ids.discard(aid)
             self.is_editing = False
@@ -382,13 +448,31 @@ class AccountCardMixin:
         node = self._node(self.current_tree_item)
         if not node:
             return
-        candidates = [a for a in self.db.get_all_accounts() if a["id"] != node["id"]]
+        # Чтение всех аккаунтов — в фоновом потоке БД (H-8): на больших базах
+        # get_all_accounts не должен вешать UI. Модальный выбор показываем уже
+        # после загрузки кандидатов (сам диалог остаётся синхронным — его
+        # результат нужен по месту).
+        util.fire(self._add_link_async(node["id"]))
+
+    async def _add_link_async(self, node_id):
+        session = self.db.current_session()
+        try:
+            accounts = await self.db.run_async(
+                self.db.get_all_accounts, _session=session)
+        except StaleSessionError:
+            return
+        except Exception as e:                       # noqa: BLE001
+            self._show_card_error("Не удалось загрузить список аккаунтов", e)
+            return
+        candidates = [a for a in accounts if a["id"] != node_id]
         chosen, ok = theme.themed_multiselect(
-            self.config, self, "Связать аккаунты", candidates, self.tabs.f_linked.get_data()
+            self.config, self, "Связать аккаунты", candidates,
+            self.tabs.f_linked.get_data()
         )
         if ok:
             chosen_set = set(chosen)
-            links = [{"id": a["id"], "name": a["name"]} for a in candidates if a["id"] in chosen_set]
+            links = [{"id": a["id"], "name": a["name"]}
+                     for a in candidates if a["id"] in chosen_set]
             self.tabs.f_linked.set_data(links)
             self.tabs.f_linked.set_editable(self.is_editing)
 

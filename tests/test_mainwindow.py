@@ -7,12 +7,7 @@
 """
 import pytest
 
-from PySide6.QtWidgets import QApplication
-
-
-@pytest.fixture(scope="module")
-def qapp():
-    return QApplication.instance() or QApplication([])
+# Общий session-qapp живёт в conftest.py (M-16).
 
 
 @pytest.fixture
@@ -57,6 +52,53 @@ def test_chrome_methods_no_crash(window):
     window._on_field_copied()
     window._apply_screenshot_protect(False)
     window._restore_geometry()
+
+
+def test_field_copied_arms_clear_timer(window):
+    """При clipboard_clear_secs>0 _on_field_copied взводит таймер авто-очистки
+    буфера; по срабатыванию таймера буфер очищается (ui_chrome.py:54-66)."""
+    from PySide6.QtWidgets import QApplication
+
+    window.config.set("clipboard_clear_secs", 5)
+    QApplication.clipboard().setText("секрет")
+    window._on_field_copied()
+    assert window._clip_timer.isActive()          # таймер очистки взведён
+
+    # Симулируем срабатывание таймера напрямую (offscreen-safe, без ожидания).
+    window._clip_timer.timeout.emit()
+    assert QApplication.clipboard().text() == ""  # буфер очищен
+
+
+def test_field_copied_no_timer_when_disabled(window):
+    """При clipboard_clear_secs==0 таймер не взводится."""
+    window.config.set("clipboard_clear_secs", 0)
+    window._clip_timer.stop()
+    window._on_field_copied()
+    assert not window._clip_timer.isActive()
+
+
+def test_idle_check_locks_plaintext_card(window, monkeypatch):
+    """_check_idle прячет открытую карточку по простою в обычном режиме
+    (ui_chrome.py:114-161). Эмулируем «давно не было активности» подменой
+    _last_activity, чтобы не ждать реального таймаута."""
+    from PySide6.QtCore import QDateTime
+
+    window.config.set("idle_lock_mins", 1)
+    window._current_account_id = 123          # как будто открыта карточка
+    window.is_editing = False
+    # Последняя активность — 10 минут назад (> порога в 1 мин).
+    window._last_activity = QDateTime.currentDateTime().addSecs(-600)
+
+    called = {}
+    monkeypatch.setattr(window, "_lock_screen", lambda: called.setdefault("locked", True))
+    window._check_idle()
+    assert called.get("locked") is True
+
+    # Свежая активность — блокировки нет.
+    called.clear()
+    window._last_activity = QDateTime.currentDateTime()
+    window._check_idle()
+    assert "locked" not in called
 
 
 def test_restore_plaintext_backup_no_winerror(window, tmp_path):

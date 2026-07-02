@@ -36,3 +36,29 @@ def test_csv_formula_injection_neutralized():
     for danger in ("=cmd()", "+1", "-1", "@x", "\tx"):
         assert export._csv_safe(danger).startswith("'")
     assert export._csv_safe("normal") == "normal"
+
+
+# ─── L-15: экспорт пустого дерева и «пустого» аккаунта ───────────────────────
+
+def test_export_empty_tree_no_crash(db, tmp_path):
+    """Экспорт базы без аккаунтов не падает и создаёт файл во всех форматах."""
+    tree = db.export_subtree()               # пустая база → []
+    assert tree == []
+    opts = Options(theme=_theme(), title="Пусто")
+    for fmt, (fn, ext, _flt) in export.FORMATS.items():
+        out = tmp_path / ("empty" + ext)
+        fn(tree, opts, str(out))
+        assert out.exists(), fmt             # файл создан (может быть с заголовком)
+
+
+def test_export_account_with_empty_fields(db, tmp_path):
+    """Аккаунт с password=None и пустыми полями экспортируется без исключений."""
+    sid = db.add_service("Сервис")
+    # login/password не заданы → None; прочие поля тоже пустые.
+    db.add_account(sid, "ПустойАкк")
+    tree = db.export_subtree()
+    opts = Options(theme=_theme(), title="Тест")
+    for fmt, (fn, ext, _flt) in export.FORMATS.items():
+        out = tmp_path / ("nulls" + ext)
+        fn(tree, opts, str(out))
+        assert out.exists() and out.stat().st_size > 0, fmt

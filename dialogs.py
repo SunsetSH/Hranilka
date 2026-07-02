@@ -29,6 +29,27 @@ import export
 import shortcuts
 
 
+class RecoveryCodeDialog(ThemedDialog):
+    """Диалог показа recovery-кода. Код показывается ОДИН РАЗ, поэтому закрытие
+    без подтверждения «Я сохранил код» (крестик, Esc, Alt+F4) переспрашивает
+    (L-3) — случайно потерять код нельзя."""
+
+    def _confirm_discard(self):
+        return themed_confirm(self.config, self, "Recovery-код",
+                              "Код не сохранён. Закрыть без сохранения?")
+
+    def reject(self):
+        if self._confirm_discard():
+            super().reject()
+
+    def closeEvent(self, e):
+        # Alt+F4/системное закрытие идёт мимо reject() — тоже переспрашиваем.
+        if self.result() == QDialog.Accepted or self._confirm_discard():
+            super().closeEvent(e)
+        else:
+            e.ignore()
+
+
 class SettingsDialog(ThemedDialog):
     settings_applied = Signal()      # финальное «Применить» (полная переинициализация)
     appearance_changed = Signal()    # живой предпросмотр шрифта/темы/цвета (только стили)
@@ -37,9 +58,10 @@ class SettingsDialog(ThemedDialog):
         super().__init__(config, parent)
         self.setWindowTitle("Настройки")
         self.setModal(True)
-        # Ширину держим, чтобы строки шорткатов помещались; высоту не форсируем —
-        # реальный минимум задаёт самая высокая вкладка (а её мы ужали).
-        self.setMinimumSize(720, 400)
+        # Ширину задаём по одному ряду вкладок (см. _fit_width_to_tabs после
+        # сборки UI); высоту не форсируем — реальный минимум задаёт самая
+        # высокая вкладка.
+        self.setMinimumHeight(400)
         self._db_path = "hranilka.db"
         self._db = None
         self._run_vault_op = self._default_vault_op
@@ -59,6 +81,13 @@ class SettingsDialog(ThemedDialog):
 
     def set_db_path(self, path: str):
         self._db_path = path
+
+    @property
+    def delete_all_confirmed(self) -> bool:
+        """Подтвердил ли пользователь «УДАЛИТЬ ВСЕ ДАННЫЕ» (двойное
+        подтверждение на вкладке «Данные»). Публичное read-only свойство для
+        главного окна (L-10) — приватный флаг наружу не отдаём."""
+        return self._delete_all_confirmed
 
     def set_db(self, db):
         """Ссылка на активную БД — нужна вкладке «Шифрование»."""
@@ -103,6 +132,7 @@ class SettingsDialog(ThemedDialog):
         self._tabs.addTab(self._page_backup(),     "Бэкапы")
         self._tabs.addTab(self._page_data(),       "Данные")
         self._tabs.addTab(self._page_behavior(),   "Поведение")
+        self._tabs.addTab(self._page_shortcuts(),  "Шорткаты")
         self.body.addWidget(self._tabs, 1)
 
         sep = QFrame()
@@ -121,9 +151,17 @@ class SettingsDialog(ThemedDialog):
         self.body.addLayout(btn_row)
 
         self._apply_group_fonts()
+        self._fit_width_to_tabs()
         # Снимок значений всех настроек для определения несохранённых изменений
         # при закрытии (блок шифрования сюда не входит — он применяется сразу).
         self._initial_settings = self._collect_settings()
+
+    def _fit_width_to_tabs(self):
+        """Сузить окно до ширины одного ряда вкладок: ширина панели вкладок +
+        поля тела диалога (14+14) + рамка dialogFrame (2+2)."""
+        width = self._tabs.one_row_width() + 14 + 14 + 2 + 2
+        self.setMinimumWidth(width)
+        self.resize(width, max(400, self.height()))
 
     def _apply_group_fonts(self):
         """Шрифт заголовков групп через стили Qt применяет ненадёжно, поэтому
@@ -233,6 +271,14 @@ class SettingsDialog(ThemedDialog):
         self.idle_mins.setValidator(QIntValidator(0, 120, self))
         ilf.addRow("Скрыть данные при простое:", self.idle_mins)
         ilf.addRow("", QLabel("в минутах, 0 — не скрывать"))
+        idle_note = QLabel(
+            "Пока в аккаунте есть несохранённые изменения, автоблокировка "
+            "откладывается (чтобы не потерять правки) — по простою она не "
+            "сработает до сохранения или отмены. В это время данные остаются "
+            "расшифрованными в памяти дольше заданного времени, поэтому, отходя "
+            "от компьютера, сохраняйте или отменяйте редактирование.")
+        idle_note.setWordWrap(True)
+        ilf.addRow(idle_note)
         lay.addWidget(idle_group)
 
         self._build_encryption_groups(lay)
@@ -405,67 +451,63 @@ class SettingsDialog(ThemedDialog):
             return
         self._show_recovery(res)
 
+    def _ask_credential(self, title: str, prompt: str, with_recovery: bool):
+        """Общий однопольный ввод секрета (L-11): каркас диалога один, а режим
+        задаётся параметром. При with_recovery добавляются переключатель
+        «использовать recovery-код» и вставка из буфера.
+
+        Возвращает None при отмене; иначе (secret, is_recovery) при
+        with_recovery=True либо просто строку при with_recovery=False."""
+        d = ThemedDialog(self.config, self)
+        d.setWindowTitle(title)
+        d.setMinimumWidth(400 if with_recovery else 380)
+        lay = d.body
+        lay.addWidget(QLabel(prompt))
+        edit = QLineEdit()
+        edit.setEchoMode(QLineEdit.Password)
+        lay.addWidget(edit)
+
+        rec_check = None
+        if with_recovery:
+            rec_check = QCheckBox("Использовать recovery-код")
+
+            def on_toggle(use_rec):
+                edit.setEchoMode(QLineEdit.Normal if use_rec else QLineEdit.Password)
+                edit.setPlaceholderText("XXXX-XXXX-…" if use_rec else "")
+                edit.clear()
+            rec_check.toggled.connect(on_toggle)
+            lay.addWidget(rec_check)
+
+            paste_row = QHBoxLayout()
+            paste_btn = QPushButton("Вставить из буфера")
+            paste_btn.clicked.connect(
+                lambda: edit.setText(QApplication.clipboard().text()))
+            paste_row.addWidget(paste_btn)
+            paste_row.addStretch()
+            lay.addLayout(paste_row)
+
+        row = QHBoxLayout()
+        row.addStretch()
+        ok = QPushButton("OK"); ok.setDefault(True); ok.clicked.connect(d.accept)
+        cancel = QPushButton("Отмена"); cancel.clicked.connect(d.reject)
+        row.addWidget(ok); row.addWidget(cancel)
+        lay.addLayout(row)
+        edit.returnPressed.connect(d.accept)
+        QTimer.singleShot(0, edit.setFocus)
+        if d.exec() != QDialog.Accepted:
+            return None
+        if with_recovery:
+            return edit.text().strip(), rec_check.isChecked()
+        return edit.text()
+
     def _ask_secret(self, title: str, prompt: str):
         """Ввод мастер-пароля ИЛИ recovery-кода. Возвращает (secret, is_recovery)
         или None (отмена). Есть переключатель режима и вставка из буфера."""
-        d = ThemedDialog(self.config, self)
-        d.setWindowTitle(title)
-        d.setMinimumWidth(400)
-        lay = d.body
-        lay.addWidget(QLabel(prompt))
-        edit = QLineEdit()
-        edit.setEchoMode(QLineEdit.Password)
-        lay.addWidget(edit)
-
-        rec_check = QCheckBox("Использовать recovery-код")
-
-        def on_toggle(use_rec):
-            edit.setEchoMode(QLineEdit.Normal if use_rec else QLineEdit.Password)
-            edit.setPlaceholderText("XXXX-XXXX-…" if use_rec else "")
-            edit.clear()
-        rec_check.toggled.connect(on_toggle)
-        lay.addWidget(rec_check)
-
-        paste_row = QHBoxLayout()
-        paste_btn = QPushButton("Вставить из буфера")
-        paste_btn.clicked.connect(lambda: edit.setText(QApplication.clipboard().text()))
-        paste_row.addWidget(paste_btn)
-        paste_row.addStretch()
-        lay.addLayout(paste_row)
-
-        row = QHBoxLayout()
-        row.addStretch()
-        ok = QPushButton("OK"); ok.setDefault(True); ok.clicked.connect(d.accept)
-        cancel = QPushButton("Отмена"); cancel.clicked.connect(d.reject)
-        row.addWidget(ok); row.addWidget(cancel)
-        lay.addLayout(row)
-        edit.returnPressed.connect(d.accept)
-        QTimer.singleShot(0, edit.setFocus)
-        if d.exec() != QDialog.Accepted:
-            return None
-        return edit.text().strip(), rec_check.isChecked()
+        return self._ask_credential(title, prompt, with_recovery=True)
 
     def _ask_password(self, title: str, prompt: str):
         """Однопольный ввод пароля. Возвращает строку или None (отмена)."""
-        d = ThemedDialog(self.config, self)
-        d.setWindowTitle(title)
-        d.setMinimumWidth(380)
-        lay = d.body
-        lay.addWidget(QLabel(prompt))
-        edit = QLineEdit()
-        edit.setEchoMode(QLineEdit.Password)
-        lay.addWidget(edit)
-        row = QHBoxLayout()
-        row.addStretch()
-        ok = QPushButton("OK"); ok.setDefault(True); ok.clicked.connect(d.accept)
-        cancel = QPushButton("Отмена"); cancel.clicked.connect(d.reject)
-        row.addWidget(ok); row.addWidget(cancel)
-        lay.addLayout(row)
-        edit.returnPressed.connect(d.accept)
-        QTimer.singleShot(0, edit.setFocus)
-        if d.exec() != QDialog.Accepted:
-            return None
-        return edit.text()
+        return self._ask_credential(title, prompt, with_recovery=False)
 
     @staticmethod
     def _generate_password(length: int = 16) -> str:
@@ -534,9 +576,10 @@ class SettingsDialog(ThemedDialog):
         return e1.text()
 
     def _show_recovery(self, code: str):
-        """Показать recovery-код один раз: копировать / сохранить в файл."""
+        """Показать recovery-код один раз: копировать / сохранить в файл.
+        Закрытие без «Я сохранил код» переспрашивает (L-3)."""
         from PySide6.QtWidgets import QApplication
-        d = ThemedDialog(self.config, self)
+        d = RecoveryCodeDialog(self.config, self)
         d.setWindowTitle("Recovery-код")
         d.setMinimumWidth(440)
         lay = d.body
@@ -647,6 +690,9 @@ class SettingsDialog(ThemedDialog):
         dl.addWidget(warn)
 
         del_btn = QPushButton("УДАЛИТЬ ВСЕ ДАННЫЕ")
+        # Намеренно жёсткие цвета (danger-стиль): пара фон+текст задана ВМЕСТЕ
+        # (белый на тёмно-красном), поэтому самосогласована и читаема на любой
+        # теме. Через настройки не выводится сознательно (H-10, допустимо).
         del_btn.setStyleSheet(
             "QPushButton { background-color: #8B0000; color: #FFFFFF; "
             "font-weight: bold; border: 2px outset #FF0000; }"
@@ -750,11 +796,48 @@ class SettingsDialog(ThemedDialog):
             "Уже сохранённые изображения не затрагиваются."))
         lay.addWidget(img_group)
 
-        # Шорткаты — отдельной секцией внизу вкладки «Поведение»
+        gal_group = QGroupBox("Галерея")
+        gf2 = QFormLayout(gal_group)
+        self.thumb_preload_combo = QComboBox()
+        # (config-значение, подпись) — индекс сохраняем по значению.
+        self._THUMB_PRELOAD_OPTIONS = [
+            ("startup",  "При запуске Хранилки"),
+            ("on_click", "По нажатию на изображение"),
+        ]
+        for _, label in self._THUMB_PRELOAD_OPTIONS:
+            self.thumb_preload_combo.addItem(label)
+        self.thumb_preload_combo.setCurrentIndex(
+            self._thumb_preload_index(self.config.get("gallery_thumb_preload", "startup")))
+        gf2.addRow("Предзагрузка миниатюр в галерее:", self.thumb_preload_combo)
+        gf2.addRow("", QLabel(
+            "«При запуске» подгружает все миниатюры сразу — быстрее просмотр,\n"
+            "но весь объём изображений аккаунта держится в ОЗУ. «По нажатию»\n"
+            "читает изображение только при клике — меньше нагрузка на память."))
+        lay.addWidget(gal_group)
+
+        lay.addStretch()
+        return w
+
+    def _thumb_preload_index(self, value: str) -> int:
+        for i, (key, _) in enumerate(self._THUMB_PRELOAD_OPTIONS):
+            if key == value:
+                return i
+        return 0
+
+    def _thumb_preload_value(self) -> str:
+        return self._THUMB_PRELOAD_OPTIONS[self.thumb_preload_combo.currentIndex()][0]
+
+    # ─── Вкладка: Шорткаты ───────────────────────────────────────────────────
+
+    def _page_shortcuts(self):
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setSpacing(10)
+        lay.setContentsMargins(0, 8, 0, 0)
         lay.addWidget(self._build_shortcuts_group(), 1)
         return w
 
-    # ─── Секция: Шорткаты (внутри вкладки «Поведение») ───────────────────────
+    # ─── Секция: Шорткаты (горячие клавиши) ──────────────────────────────────
 
     def _build_shortcuts_group(self):
         # Рабочая копия сочетаний — правки копятся здесь, в конфиг попадают
@@ -772,11 +855,9 @@ class SettingsDialog(ThemedDialog):
         scroll.setFrameShape(QFrame.NoFrame)
         # Горизонтальную прокрутку убираем — содержимое подгоняется по ширине.
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        # Компактная высота, чтобы вкладка «Поведение» (а значит и всё окно
-        # настроек) не вырастала — список листается внутри прокрутки. На
-        # растянутом окне блок занимает доступное место по высоте.
+        # На собственной вкладке блок занимает всю доступную высоту; список
+        # длинный — листается внутри прокрутки.
         scroll.setMinimumHeight(72)
-        scroll.setMaximumHeight(200)
 
         inner = QWidget()
         self._sc_inner = inner
@@ -912,6 +993,7 @@ class SettingsDialog(ThemedDialog):
             "clipboard_clear_secs": int(self.clip_clear_secs.text() or "0"),
             "clipboard_clear_on_exit": self.clip_clear_exit_check.isChecked(),
             "recycle_bin_enabled": self.recycle_bin_check.isChecked(),
+            "gallery_thumb_preload": self._thumb_preload_value(),
             "text_color": self.config.get("text_color"),
             "tree_bg_color": self.config.get("tree_bg_color"),
             "main_bg_color": self.config.get("main_bg_color"),
@@ -1082,6 +1164,7 @@ class SettingsDialog(ThemedDialog):
         self.config.set("clipboard_clear_on_exit", self.clip_clear_exit_check.isChecked())
         self.config.set("recycle_bin_enabled",     self.recycle_bin_check.isChecked())
         self.config.set("image_downscale",         self.image_downscale_check.isChecked())
+        self.config.set("gallery_thumb_preload",   self._thumb_preload_value())
         # Шорткаты: в конфиг кладём только отличия от дефолтов (компактно и
         # forward-compatible — новые действия унаследуют дефолт).
         self.config.set("shortcuts", {
@@ -1151,7 +1234,12 @@ class KeyCaptureDialog(ThemedDialog):
                     f"Сочетание «{candidate}» уже назначено действию "
                     f"«{shortcuts.LABELS.get(other_sid, other_sid)}». "
                     f"Выберите другое.")
-                self._prompt.setStyleSheet("color: #C0392B; font-weight: bold;")
+                # Акцент ошибки — самосогласованная пара фон+текст (белый на
+                # кирпично-красном): читаема на любой теме, в отличие от
+                # прежнего красного текста поверх фона темы (H-10).
+                self._prompt.setStyleSheet(
+                    "background-color: #C0392B; color: #FFFFFF;"
+                    " font-weight: bold; padding: 2px;")
                 return
         self.result_sequence = candidate
         self.accept()
@@ -1505,7 +1593,9 @@ class ExportDialog(ThemedDialog):
             "файл на диске. Храните файл в надёжном месте.")
         warn.setWordWrap(True)
         # Цвет — из темы (как у остального текста), но жирным для акцента.
-        warn.setStyleSheet(f"color: {self.config.get('text_color', '#000000')}; "
+        # Литеральный fallback убран (H-10): Config всегда содержит text_color,
+        # а '#000000' не совпадал с фактическим дефолтом настроек.
+        warn.setStyleSheet(f"color: {self.config.get('text_color')}; "
                            "font-weight: bold;")
         lay.addWidget(warn)
 

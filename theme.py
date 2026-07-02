@@ -5,7 +5,22 @@ QMessageBox/QInputDialog."""
 from PySide6.QtWidgets import (QDialog, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                                QLineEdit, QPushButton, QComboBox, QListWidget,
                                QListWidgetItem)
+from PySide6.QtGui import QColor
 from PySide6.QtCore import Qt, QTimer
+
+
+def mix(c1, c2, t):
+    """Линейная интерполяция двух цветов: t=0 → c1, t=1 → c2.
+
+    Нужна, чтобы «приглушённые» варианты (placeholder, вспомогательный текст)
+    выводились из цветов темы, а не жёстко зашитого серого — иначе на тёмных/
+    светлых темах они теряли читаемость (H-10). Принимает hex-строки '#RRGGBB'."""
+    a, b = QColor(c1), QColor(c2)
+    t = max(0.0, min(1.0, t))
+    r = round(a.red()   + (b.red()   - a.red())   * t)
+    g = round(a.green() + (b.green() - a.green()) * t)
+    bl = round(a.blue()  + (b.blue()  - a.blue())  * t)
+    return QColor(r, g, bl).name()
 
 
 def _colors(config):
@@ -217,7 +232,12 @@ def themed_info(config, parent, title, text):
     d = ThemedDialog(config, parent)
     d.setWindowTitle(title)
     lay = d.body
-    lay.addWidget(QLabel(text))
+    lbl = QLabel(text)
+    # Длинные сообщения (пути, тексты ошибок) переносим по словам и ограничиваем
+    # ширину — иначе окно растягивалось за пределы экрана (M-14).
+    lbl.setWordWrap(True)
+    lbl.setMaximumWidth(560)
+    lay.addWidget(lbl)
     _buttons_row(lay, d, "OK")
     d.exec()
 

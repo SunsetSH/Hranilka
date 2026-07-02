@@ -99,7 +99,12 @@ class AccountData:
             "questions": [{"q": q.get("q", ""), "a": q.get("a", "")} for q in self.secret_questions],
             "recovery": {"phrase": self.recovery_phrase, "device_id": self.device_id},
             "codes": list(self.one_time_codes),
-            "gallery": [{"data": g.get("data"), "desc": g.get("desc", "")} for g in self.gallery],
+            # image_id сохраняем: он несёт контракт H-6 (data=None + image_id →
+            # «оставить существующий BLOB») сквозь кеш несохранённых правок
+            # (stash → to_storage → from_storage → set_data). Без него ленивые
+            # картинки после стэша пересохранялись бы заново либо терялись.
+            "gallery": [{"data": g.get("data"), "desc": g.get("desc", ""),
+                         "image_id": g.get("image_id")} for g in self.gallery],
         }
 
     @classmethod

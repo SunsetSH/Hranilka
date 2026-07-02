@@ -120,6 +120,166 @@ def test_links_check_rejects_noncanonical(db):
             (a, a))
 
 
+def _card(gallery=None):
+    """Минимальная карточка в формате save_account/_save_account_rows."""
+    return {
+        "fields": {
+            "account_name": "A", "url": None, "login": None, "password": None,
+            "creation_date": None, "password_changed_date": None,
+            "password_change_interval_days": None, "notes": None, "ip": None,
+            "browser": None, "os": None, "extra_info": None,
+        },
+        "personal": {"first_name": None, "last_name": None, "middle_name": None,
+                     "birth_date": None, "address": None},
+        "questions": [],
+        "recovery": {"phrase": "", "device_id": ""},
+        "codes": [],
+        "gallery": gallery or [],
+    }
+
+
+def _gallery_rows(db, account_id):
+    db.cursor.execute(
+        "SELECT id, description, image_data FROM gallery "
+        "WHERE account_id = ? ORDER BY id", (account_id,))
+    return db.cursor.fetchall()
+
+
+# ─── H-5: инвариант лока ──────────────────────────────────────────────────────
+
+def test_serialize_db_stays_lock_wrapped():
+    """serialize_db не должен попасть в _DB_NO_LOCK (иначе сериализация БД шла бы
+    без лока параллельно записи в conn — гонка)."""
+    import database
+    assert "serialize_db" not in database._DB_NO_LOCK
+
+
+# ─── H-6: контракт сохранения галереи ─────────────────────────────────────────
+
+def test_save_gallery_lazy_item_preserves_blob(db):
+    """data=None + image_id=X сохраняет существующий BLOB строки X (не удаляет,
+    не обнуляет), обновляя лишь подпись."""
+    sid = db.add_service("S")
+    aid = db.add_account(sid, "A")
+    db.save_account(aid, _card([{"desc": "one", "data": b"AAA"}]))
+    row = _gallery_rows(db, aid)[0]
+    img_id = row["id"]
+    assert bytes(row["image_data"]) == b"AAA"
+
+    # Повторное сохранение с ленивым item: data=None, image_id указывает на строку.
+    db.save_account(aid, _card([{"desc": "renamed", "data": None, "image_id": img_id}]))
+    rows = _gallery_rows(db, aid)
+    assert len(rows) == 1
+    assert rows[0]["id"] == img_id
+    assert bytes(rows[0]["image_data"]) == b"AAA"    # BLOB не тронут
+    assert rows[0]["description"] == "renamed"       # подпись обновилась
+
+
+def test_save_gallery_omitted_id_deletes(db):
+    """Строка, чей image_id отсутствует в переданном списке, удаляется."""
+    sid = db.add_service("S")
+    aid = db.add_account(sid, "A")
+    db.save_account(aid, _card([{"desc": "keep", "data": b"AAA"},
+                                {"desc": "drop", "data": b"BBB"}]))
+    rows = _gallery_rows(db, aid)
+    keep_id = rows[0]["id"]
+    # Сохраняем только первую (ленивым item); вторую не передаём вовсе.
+    db.save_account(aid, _card([{"desc": "keep", "data": None, "image_id": keep_id}]))
+    rows = _gallery_rows(db, aid)
+    assert len(rows) == 1
+    assert rows[0]["id"] == keep_id
+    assert bytes(rows[0]["image_data"]) == b"AAA"
+
+
+def test_save_gallery_mixed_order_preserved(db):
+    """Смешанный список (сохранённые + новые) сохраняет порядок: сохранённые по
+    своим id, новые — в конце в порядке списка."""
+    sid = db.add_service("S")
+    aid = db.add_account(sid, "A")
+    db.save_account(aid, _card([{"desc": "g1", "data": b"111"},
+                                {"desc": "g2", "data": b"222"}]))
+    rows = _gallery_rows(db, aid)
+    id1, id2 = rows[0]["id"], rows[1]["id"]
+    # g1 остаётся (lazy), g2 остаётся (lazy), плюс новая g3 с байтами в конце.
+    db.save_account(aid, _card([
+        {"desc": "g1", "data": None, "image_id": id1},
+        {"desc": "g2", "data": None, "image_id": id2},
+        {"desc": "g3", "data": b"333"},
+    ]))
+    rows = _gallery_rows(db, aid)
+    assert [r["description"] for r in rows] == ["g1", "g2", "g3"]
+    assert [bytes(r["image_data"]) for r in rows] == [b"111", b"222", b"333"]
+    assert rows[0]["id"] == id1 and rows[1]["id"] == id2
+
+
+def test_save_gallery_returns_row_ids(db):
+    """save_account возвращает id строк галереи в порядке items: существующие —
+    свои, новые — lastrowid. UI по ним присваивает id новым картинкам, чтобы
+    повторное сохранение не пересоздавало строку."""
+    sid = db.add_service("S")
+    aid = db.add_account(sid, "A")
+    ids = db.save_account(aid, _card([{"desc": "a", "data": b"AAA"},
+                                      {"desc": "b", "data": b"BBB"}]))
+    rows = _gallery_rows(db, aid)
+    assert ids == [rows[0]["id"], rows[1]["id"]]
+
+    # Смешанный список: lazy (свой id), новая (новый id), «мёртвый» id (None).
+    ids2 = db.save_account(aid, _card([
+        {"desc": "a", "data": None, "image_id": ids[0]},
+        {"desc": "c", "data": b"CCC"},
+        {"desc": "ghost", "data": None, "image_id": 999999},
+    ]))
+    rows = _gallery_rows(db, aid)
+    assert ids2[0] == ids[0]
+    assert ids2[1] == rows[-1]["id"]                 # новая строка в конце
+    assert ids2[2] is None                           # чужой/мёртвый id пропущен
+
+    # Повторное сохранение с возвращёнными id не пересоздаёт строки.
+    ids3 = db.save_account(aid, _card([
+        {"desc": "a", "data": None, "image_id": ids2[0]},
+        {"desc": "c", "data": None, "image_id": ids2[1]},
+    ]))
+    assert ids3 == ids2[:2]
+
+
+def test_save_gallery_bytes_path_unchanged(db):
+    """Прежнее поведение (все items с bytes, без image_id) не изменилось:
+    строки перезаписываются, порядок = порядок списка."""
+    sid = db.add_service("S")
+    aid = db.add_account(sid, "A")
+    db.save_account(aid, _card([{"desc": "x", "data": b"AAA"},
+                                {"desc": "y", "data": b"BBB"}]))
+    db.save_account(aid, _card([{"desc": "z", "data": b"CCC"}]))
+    rows = _gallery_rows(db, aid)
+    assert len(rows) == 1
+    assert bytes(rows[0]["image_data"]) == b"CCC"
+
+
+# ─── L-6: save_account с несуществующим аккаунтом откатывается ─────────────────
+
+def test_save_account_missing_raises_and_rolls_back(db):
+    import pytest as _pytest
+    with _pytest.raises(ValueError):
+        db.save_account(99999, _card())
+    # Транзакция откатилась — мусорных связанных строк не осталось.
+    db.cursor.execute("SELECT COUNT(*) AS n FROM personal_data WHERE account_id = 99999")
+    assert db.cursor.fetchone()["n"] == 0
+
+
+# ─── M-9: кэш суммарного объёма галереи ───────────────────────────────────────
+
+def test_gallery_total_bytes_cache_and_invalidation(db):
+    sid = db.add_service("S")
+    aid = db.add_account(sid, "A")
+    assert db.gallery_total_bytes() == 0
+    db.save_account(aid, _card([{"desc": "x", "data": b"\x00" * 100}]))
+    assert db.gallery_total_bytes() == 100
+    # exclude вычитает объём аккаунта из кэша.
+    assert db.gallery_total_bytes(exclude_account_id=aid) == 0
+    db.delete_account(aid)
+    assert db.gallery_total_bytes() == 0
+
+
 def test_links_migration_normalizes_old_rows(tmp_db_path):
     """Старая (v6) база с обратными дублями и самоссылкой нормализуется при
     открытии: остаётся одна каноничная строка, версия схемы поднимается до 7."""

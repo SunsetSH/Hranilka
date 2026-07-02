@@ -125,17 +125,30 @@ async def test_queued_async_aborts_after_session_change(adb):
     """Задача run_async, поставленная в очередь до смены сессии БД (close/lock/
     restore), НЕ выполняется над новым соединением, а поднимает StaleSessionError
     (H6-03). Иначе данные прежней сессии могли бы попасть в восстановленную базу."""
-    block = threading.Event()
+    # Детерминированная синхронизация без sleep (M-15): blocker сигналит started,
+    # как только занял единственный воркер, и держит его до release. Тест ждёт
+    # started через run_in_executor (тот же executor — задача выполнится ПОСЛЕ
+    # blocker'а, значит queued уже стоит в очереди за blocker'ом с прежним
+    # поколением), затем меняет сессию и отпускает воркер.
+    started = threading.Event()
+    release = threading.Event()
 
     def blocker():
-        block.wait(2)                       # держим единственный воркер занятым
+        started.set()                       # воркер занят blocker'ом
+        release.wait(2)                     # держим воркер до сигнала теста
 
+    loop = asyncio.get_running_loop()
     busy = asyncio.ensure_future(adb.run_async(blocker))
-    await asyncio.sleep(0.05)               # blocker занял воркер и захватил поколение
+    await loop.run_in_executor(None, started.wait, 2)   # ждём, пока blocker занял воркер
     queued = asyncio.ensure_future(adb.run_async(adb.get_all_accounts))
-    await asyncio.sleep(0.05)               # queued встал в очередь с тем же поколением
+    # Уступаем циклу, пока корутина queued не поставит свою задачу в очередь
+    # единственного воркера БД (за blocker'ом). Проверяем это детерминированно по
+    # размеру рабочей очереди executor'а — без таймингов/sleep фиксированной длины.
+    while adb._executor._work_queue.qsize() < 1:
+        await asyncio.sleep(0)
+    # Теперь queued точно стоит в очереди за blocker'ом с прежним поколением.
     adb._bump_session()                     # сессия сменилась, пока queued ждёт
-    block.set()                             # отпускаем воркер → queued берётся за работу
+    release.set()                           # отпускаем воркер → queued берётся за работу
 
     with pytest.raises(StaleSessionError):
         await queued
