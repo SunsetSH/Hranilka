@@ -46,6 +46,90 @@ class AccountCardMixin:
         else:
             self.statusBar().clearMessage()
 
+    def _on_gallery_orphan_upload(self, account_id, desc, data):
+        """Осиротевшая загрузка галереи (M7-05): импорт стартовал для account_id,
+        но к моменту завершения пользователь ушёл с карточки. Не теряем картинку —
+        адресуем её своему аккаунту.
+
+          * пользователь ВЕРНУЛСЯ (account_id == текущий, карточка открыта) →
+            добавляем прямо в живой виджет и помечаем аккаунт «грязным»;
+          * иначе → дописываем в черновик правок account_id (или подгружаем его из
+            БД, если черновика ещё нет) и помечаем «грязным».
+        Если аккаунт удалён — сообщаем и роняем."""
+        if account_id is None:
+            return
+        if (account_id == self._current_account_id
+                and self._current_account_id is not None and self.is_editing):
+            # Вернулись на карточку в режиме правки: кладём в живой виджет как
+            # ручную правку (при следующем switch попадёт в _stash_current_edits).
+            self.tabs.f_gallery_widget.add_item(data, desc)
+            self._dirty_ids.add(account_id)
+            self._refresh_dirty_markers()
+            return
+        # Ушли на другую карточку/заглушку (или карточка не в правке) — картинку
+        # кладём в черновик правок, чтобы она не потерялась вне режима правки.
+        if account_id in self._edit_cache:
+            self._edit_cache[account_id]["storage"]["gallery"].append(
+                {"desc": desc, "data": data, "image_id": None, "blob_size": None})
+            self._dirty_ids.add(account_id)
+            self._refresh_dirty_markers()
+            return
+        # Черновика ещё нет (edge: пользователь не редактировал этот аккаунт —
+        # кнопки загрузки видны только в правке, но карточку могли сменить сразу).
+        # Подгружаем аккаунт из БД, формируем черновик в формате _stash_current_edits.
+        util.fire(self._orphan_into_new_draft(account_id, desc, data))
+
+    async def _orphan_into_new_draft(self, account_id, desc, data):
+        """Создать черновик правок для account_id из состояния в БД и дописать в
+        него осиротевшую картинку (M7-05). Если аккаунт удалён — сообщаем и роняем."""
+        session = self.db.current_session()
+        try:
+            storage = await self.db.run_async(
+                self.db.load_account, account_id, _session=session)
+        except StaleSessionError:
+            return                               # сессия сменилась (lock/restore) — молча
+        except Exception as e:                   # noqa: BLE001
+            logging.error("Не удалось подгрузить аккаунт для осиротевшей "
+                          "загрузки: %s", e, exc_info=e)
+            return
+        if storage is None:
+            # Аккаунт удалён, пока грузилась картинка — сохранять некуда.
+            self.statusBar().showMessage("Загрузка отменена: аккаунт удалён", 4000)
+            return
+        # Могло случиться, что за время await пользователь уже вернулся на карточку
+        # в режиме правки — тогда кладём в живой виджет, не перетирая состояние.
+        if account_id == self._current_account_id and self.is_editing:
+            self.tabs.f_gallery_widget.add_item(data, desc)
+            self._dirty_ids.add(account_id)
+            self._refresh_dirty_markers()
+            return
+        if account_id in self._edit_cache:
+            self._edit_cache[account_id]["storage"]["gallery"].append(
+                {"desc": desc, "data": data, "image_id": None, "blob_size": None})
+        else:
+            # Формат черновика идентичен _stash_current_edits: storage из
+            # AccountData + links (id связанных аккаунтов).
+            acc = AccountData.from_storage(storage)
+            acc.gallery = list(acc.gallery)
+            acc.gallery.append(
+                {"desc": desc, "data": data, "image_id": None, "blob_size": None})
+            # В черновике links — список id (формат _stash_current_edits, который
+            # берёт f_linked.get_data()); db.get_links отдаёт dict'ы — берём id.
+            try:
+                link_rows = await self.db.run_async(
+                    self.db.get_links, account_id, _session=session)
+            except StaleSessionError:
+                return
+            except Exception as e:               # noqa: BLE001
+                logging.error("Не удалось подгрузить связи для осиротевшей "
+                              "загрузки: %s", e, exc_info=e)
+                link_rows = []
+            link_ids = [r["id"] for r in link_rows]
+            self._edit_cache[account_id] = {
+                "storage": acc.to_storage(), "links": link_ids}
+        self._dirty_ids.add(account_id)
+        self._refresh_dirty_markers()
+
     def _quiesce_card_async(self):
         """Погасить весь незавершённый async карточки и галереи ПЕРЕД сменой сессии
         БД (lock/restore/close). Новое поколение карточки делает устаревшими висящие
@@ -270,6 +354,13 @@ class AccountCardMixin:
         self.tabs.f_gallery_widget.set_image_loader(self.db.load_gallery_image)
         self.tabs.f_gallery_widget.set_async_reader(
             self._gallery_read_blob, self.db.current_session)
+        # Загрузка картинки переживает смену карточки (M7-05): виджет снимает id
+        # аккаунта на старте импорта, а завершившийся после переключения результат
+        # отдаёт через orphan-handler своему аккаунту (в живую карточку/черновик).
+        self.tabs.f_gallery_widget.set_account_provider(
+            lambda: self._current_account_id)
+        self.tabs.f_gallery_widget.set_orphan_upload_handler(
+            self._on_gallery_orphan_upload)
         # Лимит суммарного объёма галереи. В горячем пути объём прочих аккаунтов
         # уже посчитан асинхронно (other_bytes) — провайдер отдаёт готовое число,
         # без обращения к БД при добавлении картинки. Иначе (холодный путь) —
@@ -437,6 +528,7 @@ class AccountCardMixin:
         self.tabs.f_middle.set_text(person["middle"])
         bd = person["birth_date"]
         self.tabs.f_birth.set_date(QDate(bd.year, bd.month, bd.day))
+        self.tabs.f_address.set_text(person["address"])
         self.statusBar().showMessage("ПД СГЕНЕРИРОВАНЫ", 2000)
 
     # ----- Связанные аккаунты -----

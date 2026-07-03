@@ -52,6 +52,25 @@ class VaultConflictError(Exception):
     Перезапись затёрла бы чужие изменения — поэтому требуется решение пользователя."""
 
 
+class PreMigrationBackupError(Exception):
+    """Не удалось создать durable-копию БД перед необратимой правкой схемы
+    (миграция версии или деструктивный dedup + пересборка UNIQUE-индексов).
+
+    Без резервной копии продолжать нельзя: сбой в процессе оставил бы базу в
+    промежуточном (частично мигрированном) состоянии без пути к откату.
+    Открытие прерывается так же, как при FutureSchemaError — с понятным
+    сообщением пользователю (см. _create_tables_or_exit в main.py)."""
+
+    def __init__(self, path, cause):
+        self.path = path
+        self.cause = cause
+        super().__init__(
+            f"Не удалось создать резервную копию базы перед изменением "
+            f"схемы ({path}): {cause}. Изменение отменено, база не тронута. "
+            f"Освободите место на диске/проверьте доступ к папке и повторите."
+        )
+
+
 class StaleSessionError(Exception):
     """Фоновая run_async-операция относится к уже закрытой/сменённой сессии БД
     (между постановкой в очередь и выполнением произошёл close/lock/restore).
@@ -152,6 +171,36 @@ class Database:
                 return method(*args, **kwargs)
 
         return await loop.run_in_executor(self._executor, _call)
+
+    def wait_executor_idle(self, timeout: float = 15.0) -> bool:
+        """Дождаться, пока поток-исполнитель run_async опустеет (H7-01).
+
+        Сабмитит в тот же single-worker executor задачу-барьер (no-op) и ждёт её
+        завершения: т.к. воркер один и очередь FIFO, к моменту выполнения барьера
+        все ранее поставленные run_async-мутаторы уже отработали (и, закоммитив,
+        успели пометить БД грязной). Возвращает True, если executor освободился в
+        пределах timeout, иначе False (вызыватель ОБЯЗАН прервать свой шаг: не
+        закрывать БД, не подменять файл — иначе in-flight-мутатор допишет в уже
+        неактуальное соединение). Идемпотентно; при остановленном executor — True.
+
+        Крутить event-loop здесь НЕ нужно: барьер не зависит от UI-потока, а
+        Future.result(timeout) блокирует лишь вызывающий (UI) поток на время
+        ожидания — это допустимо в привилегированных точках (restore/close)."""
+        import concurrent.futures
+        ex = getattr(self, "_executor", None)
+        if ex is None:
+            return True
+        try:
+            fut = ex.submit(lambda: None)
+        except RuntimeError:
+            # Executor уже останавливается — задач в нём не осталось.
+            return True
+        try:
+            fut.result(timeout=timeout)
+            return True
+        except concurrent.futures.TimeoutError:
+            logging.warning("run_async-исполнитель не освободился за %s c.", timeout)
+            return False
 
     def shutdown_executor(self):
         """Остановить поток-исполнитель async-операций (идемпотентно). Вызывать на
@@ -570,6 +619,17 @@ class Database:
         # ниже, чтобы uq_linked_pair лёг уже на пересобранную таблицу.
         self._rebuild_linked_accounts_if_needed()
 
+        # Деструктивный dedup (удаление дублирующих строк) может выполниться и на
+        # базе АКТУАЛЬНОЙ версии — например, когда версия совпала, но отпечаток
+        # схемы не сошёлся (частично повреждённая база). Тогда миграционной копии
+        # (_begin_premigration_backup выше) ещё нет, а удаление строк необратимо.
+        # Создаём durable-копию и здесь (H7-03c), если её ещё не сделали. Быстрый
+        # путь (отпечаток цел) сюда не доходит — стартовые копии не плодятся.
+        premigrate_dedup = None
+        if premigrate is None:
+            premigrate_dedup = self._make_durable_copy(
+                _ver, "восстановление/нормализация схемы (dedup)")
+
         # Дедуп + (пере)создание индексов — ОДНОЙ транзакцией (M65-05): при сбое
         # посередине (диск/исключение) `with self.conn` откатит и удаление дублей,
         # и создание индексов целиком, не оставив промежуточного состояния (дубли
@@ -617,8 +677,10 @@ class Database:
 
         # Доработка существующих баз до актуальной схемы
         self._migrate()
-        # Миграция завершена успешно — pre-migration копия больше не нужна.
+        # Правка схемы завершена успешно — durable-копии этого прогона больше не
+        # нужны (удаляем только их, уцелевшие копии прошлых прогонов не трогаем).
         self._finish_premigration_backup(premigrate)
+        self._finish_premigration_backup(premigrate_dedup)
 
     # Ожидаемые колонки таблиц для добавления в старые базы (имя -> SQL-определение).
     # Используется только в _migrate(); новые базы создаются полными в create_tables().
@@ -666,23 +728,68 @@ class Database:
         indexes = {row["name"] for row in self.cursor.fetchall()}
         return self._INTEGRITY_INDEXES <= indexes
 
-    def _begin_premigration_backup(self, ver):
-        """Durable-копия файла БД ПЕРЕД миграцией версии (M65-05).
+    def _warn_leftover_premigrate(self):
+        """Найти уцелевшие .pre-migrate*-копии от ПРЕДЫДУЩИХ неудачных прогонов
+        и заметно залогировать их пути (H7-03b). Такие файлы — рабочие снимки
+        базы «до миграции»: если предыдущий запуск прервался, они остались на
+        диске. НЕ удаляем их (могут понадобиться для ручного восстановления),
+        но громко предупреждаем — иначе пользователь о них не узнает."""
+        directory = os.path.dirname(self.db_path) or "."
+        base = os.path.basename(self.db_path) + ".pre-migrate"
+        try:
+            names = os.listdir(directory)
+        except OSError:
+            return
+        for name in names:
+            if name.startswith(base):
+                logging.error(
+                    "Обнаружена уцелевшая резервная копия от прошлой прерванной "
+                    "миграции: %s. Файл НЕ удалён — используйте его для "
+                    "восстановления при необходимости.",
+                    os.path.join(directory, name))
 
-        Только plaintext и только при реальном повышении версии (ver < текущей):
-        в шифрованном режиме на диске уже лежит НЕИЗМЕНЁННЫЙ контейнер прежней
-        версии — он и есть снимок «до миграции» (persist происходит уже после).
-        Возвращает путь копии (или None). Копия удаляется при успешной миграции;
-        если миграция прервётся, файл остаётся на диске для восстановления."""
-        if self.encrypted or ver is None or ver >= SCHEMA_VERSION:
+    def _make_durable_copy(self, ver, reason):
+        """Durable-копия файла БД ПЕРЕД необратимой правкой схемы (H7-03).
+
+        Используется и перед миграцией версии, и перед деструктивным dedup +
+        пересборкой UNIQUE-индексов (M7-01). Только plaintext: в шифрованном
+        режиме на диске уже лежит НЕИЗМЕНЁННЫЙ контейнер прежней версии — он и
+        есть снимок «до правки» (persist происходит уже после).
+
+        Имя копии УНИКАЛЬНО (`<db>.pre-migrate-v{ver}-{YYYYMMDD-HHMMSS}`): копию
+        от прошлого прерванного прогона мы НЕ перезаписываем (иначе рабочий файл
+        затёр бы уцелевший снимок — H7-03b). Возвращает путь копии (или None,
+        если копия не нужна: encrypted / нет файла на диске).
+
+        При сбое копирования поднимает PreMigrationBackupError — правка схемы
+        НЕ должна продолжаться без резервной копии (H7-03a)."""
+        if self.encrypted:
             return None
         if not os.path.exists(self.db_path):
             return None
-        path = self.db_path + ".pre-migrate"
+        # Уцелевшие копии прошлых прерванных прогонов — заметно в лог, не трогаем.
+        self._warn_leftover_premigrate()
+        ver_tag = "unknown" if ver is None else str(ver)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        base = f"{self.db_path}.pre-migrate-v{ver_tag}-{stamp}"
+        # Имя уникально по метке времени; на случай двух прогонов в одну секунду
+        # добавляем счётчик — «xb» не перезапишет уцелевшую копию прошлого прогона.
+        path = base
         try:
             # Файл на диске согласован (транзакция ещё не начиналась) — копируем и
             # принудительно сбрасываем на диск (устойчивость к сбою питания).
-            with open(self.db_path, "rb") as src, open(path, "wb") as dst:
+            # "xb": НИКОГДА не перезаписываем существующий файл (H7-03b).
+            dst = None
+            for suffix in ("", "-1", "-2", "-3", "-4", "-5"):
+                path = base + suffix
+                try:
+                    dst = open(path, "xb")
+                    break
+                except FileExistsError:
+                    continue
+            if dst is None:
+                raise OSError("не удалось подобрать уникальное имя копии")
+            with open(self.db_path, "rb") as src, dst:
                 while True:
                     chunk = src.read(1024 * 1024)
                     if not chunk:
@@ -691,17 +798,32 @@ class Database:
                 dst.flush()
                 os.fsync(dst.fileno())
         except OSError as e:
-            logging.warning("Не удалось создать pre-migration копию: %s", e)
-            return None
-        logging.info("Миграция схемы %s→%s: сохранена копия перед миграцией: %s",
-                     ver, SCHEMA_VERSION, path)
+            logging.error("Не удалось создать резервную копию перед %s: %s",
+                          reason, e)
+            # Частично записанный файл (если успел появиться) — убрать.
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except OSError:
+                pass
+            raise PreMigrationBackupError(path, e)
+        logging.info("%s: сохранена резервная копия: %s", reason, path)
         return path
 
+    def _begin_premigration_backup(self, ver):
+        """Durable-копия ПЕРЕД миграцией версии (только при ver < текущей)."""
+        if ver is None or ver >= SCHEMA_VERSION:
+            return None
+        return self._make_durable_copy(
+            ver, f"миграция схемы {ver}→{SCHEMA_VERSION}")
+
     def _finish_premigration_backup(self, path):
-        """Удалить pre-migration копию после успешной миграции (M65-05).
+        """Удалить durable-копию, созданную ЭТИМ прогоном, после успеха (H7-03).
 
         Копия — полный plaintext-снимок БД (все пароли/BLOB), поэтому удаляем
-        через best_effort_wipe: содержимое затирается нулями до unlink (H-3)."""
+        через best_effort_wipe: содержимое затирается нулями до unlink (H-3).
+        Удаляется ТОЛЬКО копия этого прогона — уцелевшие копии прошлых
+        прерванных прогонов не трогаем (см. _warn_leftover_premigrate)."""
         if not path:
             return
         best_effort_wipe(path)
@@ -935,36 +1057,51 @@ class Database:
         self._invalidate_gallery_bytes()   # галерея очищена (M-9)
         self._mark_dirty()
             
+    def _add_folder_rows(self, name: str) -> int:
+        """Тело add_folder без транзакции/dirty (для составных методов)."""
+        self.cursor.execute("INSERT INTO folders (name) VALUES (?)", (name,))
+        return int(self.cursor.lastrowid)
+
+    def _add_service_rows(self, name: str, folder_id: int | None = None) -> int:
+        """Тело add_service без транзакции/dirty (для составных методов)."""
+        self.cursor.execute(
+            "INSERT INTO services (name, folder_id) VALUES (?, ?)",
+            (name, folder_id))
+        return int(self.cursor.lastrowid)
+
+    def _add_account_rows(self, service_id: int | None, account_name: str,
+                          login: str | None = None,
+                          password: str | None = None) -> int:
+        """Тело add_account без транзакции/dirty (для составных методов).
+        created_at пишем строкой в формате SQLite CURRENT_TIMESTAMP
+        (yyyy-MM-dd HH:mm:ss): datetime как SQL-параметр даёт DeprecationWarning
+        на 3.12+ и тот же формат ожидают парсеры (models._DT_FORMAT) (L-1)."""
+        self.cursor.execute(
+            "INSERT INTO accounts (service_id, account_name, login, password, created_at) VALUES (?, ?, ?, ?, ?)",
+            (service_id, account_name, login, password,
+             datetime.now().isoformat(" ", "seconds")))
+        return int(self.cursor.lastrowid)
+
     def add_folder(self, name: str) -> int:
         """Добавление папки"""
         with self.conn:
-            self.cursor.execute("INSERT INTO folders (name) VALUES (?)", (name,))
-            new_id = int(self.cursor.lastrowid)
+            new_id = self._add_folder_rows(name)
         self._mark_dirty()
         return new_id
 
     def add_service(self, name: str, folder_id: int | None = None) -> int:
         """Добавление сервиса"""
         with self.conn:
-            self.cursor.execute(
-                "INSERT INTO services (name, folder_id) VALUES (?, ?)",
-                (name, folder_id))
-            new_id = int(self.cursor.lastrowid)
+            new_id = self._add_service_rows(name, folder_id)
         self._mark_dirty()
         return new_id
 
     def add_account(self, service_id: int | None, account_name: str,
                     login: str | None = None, password: str | None = None) -> int:
         """Добавление аккаунта"""
-        # created_at пишем строкой в формате SQLite CURRENT_TIMESTAMP
-        # (yyyy-MM-dd HH:mm:ss): datetime как SQL-параметр даёт DeprecationWarning
-        # на 3.12+ и его тот же формат ожидают парсеры (models._DT_FORMAT) (L-1).
         with self.conn:
-            self.cursor.execute(
-                "INSERT INTO accounts (service_id, account_name, login, password, created_at) VALUES (?, ?, ?, ?, ?)",
-                (service_id, account_name, login, password,
-                 datetime.now().isoformat(" ", "seconds")))
-            new_id = int(self.cursor.lastrowid)
+            new_id = self._add_account_rows(service_id, account_name,
+                                            login, password)
         self._mark_dirty()
         return new_id
     
@@ -1096,15 +1233,27 @@ class Database:
 
     # ----- Удаление без сохранения содержимого (полностью) -----
 
+    def _delete_folder_rows(self, folder_id):
+        """Тело delete_folder без транзакции/dirty (для составных методов)."""
+        # services.folder_id имеет ON DELETE SET NULL, поэтому удаляем
+        # сервисы явно (их аккаунты уйдут каскадом), затем папку.
+        self.cursor.execute("SELECT id FROM services WHERE folder_id = ?", (folder_id,))
+        for row in self.cursor.fetchall():
+            self.cursor.execute("DELETE FROM services WHERE id = ?", (row["id"],))
+        self.cursor.execute("DELETE FROM folders WHERE id = ?", (folder_id,))
+
+    def _delete_service_rows(self, service_id):
+        """Тело delete_service без транзакции/dirty (для составных методов)."""
+        self.cursor.execute("DELETE FROM services WHERE id = ?", (service_id,))
+
+    def _delete_account_rows(self, account_id):
+        """Тело delete_account без транзакции/dirty (для составных методов)."""
+        self.cursor.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
+
     def delete_folder(self, folder_id):
         """Удаляет папку вместе со всеми сервисами и их аккаунтами."""
         with self.conn:
-            # services.folder_id имеет ON DELETE SET NULL, поэтому удаляем
-            # сервисы явно (их аккаунты уйдут каскадом), затем папку.
-            self.cursor.execute("SELECT id FROM services WHERE folder_id = ?", (folder_id,))
-            for row in self.cursor.fetchall():
-                self.cursor.execute("DELETE FROM services WHERE id = ?", (row["id"],))
-            self.cursor.execute("DELETE FROM folders WHERE id = ?", (folder_id,))
+            self._delete_folder_rows(folder_id)
         self._invalidate_gallery_bytes()   # каскад мог удалить картинки (M-9)
         self._mark_dirty()
 
@@ -1127,6 +1276,13 @@ class Database:
         )
         row = self.cursor.fetchone()
         return bool(row and row["deleted_at"])
+
+    def _move_account_to_bin_rows(self, account_id):
+        """Тело move_account_to_bin без транзакции/dirty (для составных методов)."""
+        self.cursor.execute(
+            "UPDATE accounts SET deleted_at = ? WHERE id = ?",
+            (datetime.now().isoformat(" ", "seconds"), account_id),
+        )
 
     def move_account_to_bin(self, account_id):
         """Переносит аккаунт в корзину (мягкое удаление): данные сохраняются,
@@ -1164,23 +1320,83 @@ class Database:
 
     # ----- Удаление с сохранением содержимого -----
 
+    def _delete_folder_keep_content_rows(self, folder_id):
+        """Тело delete_folder_keep_content без транзакции/dirty."""
+        self.cursor.execute(
+            "UPDATE services SET folder_id = NULL WHERE folder_id = ?", (folder_id,)
+        )
+        self.cursor.execute("DELETE FROM folders WHERE id = ?", (folder_id,))
+
+    def _delete_service_keep_content_rows(self, service_id):
+        """Тело delete_service_keep_content без транзакции/dirty."""
+        self.cursor.execute(
+            "UPDATE accounts SET service_id = NULL WHERE service_id = ?", (service_id,)
+        )
+        self.cursor.execute("DELETE FROM services WHERE id = ?", (service_id,))
+
     def delete_folder_keep_content(self, folder_id):
         """Удаляет папку, но её сервисы становятся самостоятельными (вне папки)."""
         with self.conn:
-            self.cursor.execute(
-                "UPDATE services SET folder_id = NULL WHERE folder_id = ?", (folder_id,)
-            )
-            self.cursor.execute("DELETE FROM folders WHERE id = ?", (folder_id,))
+            self._delete_folder_keep_content_rows(folder_id)
         self._mark_dirty()
 
     def delete_service_keep_content(self, service_id):
         """Удаляет сервис, но его аккаунты становятся свободными (без сервиса)."""
         with self.conn:
-            self.cursor.execute(
-                "UPDATE accounts SET service_id = NULL WHERE service_id = ?", (service_id,)
-            )
-            self.cursor.execute("DELETE FROM services WHERE id = ?", (service_id,))
+            self._delete_service_keep_content_rows(service_id)
         self._mark_dirty()
+
+    def _descendant_account_ids_rows(self, node_type, node_id):
+        """Тело get_descendant_account_ids без лока (для составных методов)."""
+        if node_type == "service":
+            self.cursor.execute("SELECT id FROM accounts WHERE service_id = ?", (node_id,))
+        elif node_type == "folder":
+            self.cursor.execute(
+                "SELECT id FROM accounts WHERE service_id IN "
+                "(SELECT id FROM services WHERE folder_id = ?)", (node_id,))
+        else:
+            return []
+        return [r["id"] for r in self.cursor.fetchall()]
+
+    def delete_items(self, items, keep=False, to_bin=False):
+        """Атомарно удаляет набор узлов дерева в ОДНОЙ транзакции (M7-04).
+
+        items — список кортежей (type, id) в заданном порядке, где type это
+        "folder" | "service" | "account". keep=True — удалять контейнеры с
+        сохранением содержимого (на уровень выше). to_bin=True — аккаунты
+        отправлять в корзину (мягко), а не удалять.
+
+        Возвращает список id аккаунтов, реально удалённых/перемещённых в
+        корзину (для очистки UI-кэша несохранённых правок ПОСЛЕ успеха)."""
+        affected: list = []
+        gallery_touched = False
+        with self.conn:
+            for node_type, node_id in items:
+                if node_type == "folder":
+                    if keep:
+                        self._delete_folder_keep_content_rows(node_id)
+                    else:
+                        affected += self._descendant_account_ids_rows("folder", node_id)
+                        self._delete_folder_rows(node_id)
+                        gallery_touched = True
+                elif node_type == "service":
+                    if keep:
+                        self._delete_service_keep_content_rows(node_id)
+                    else:
+                        affected += self._descendant_account_ids_rows("service", node_id)
+                        self._delete_service_rows(node_id)
+                        gallery_touched = True
+                else:                                   # account
+                    if to_bin:
+                        self._move_account_to_bin_rows(node_id)
+                    else:
+                        self._delete_account_rows(node_id)
+                        gallery_touched = True
+                    affected.append(node_id)
+        if gallery_touched:
+            self._invalidate_gallery_bytes()   # каскад мог удалить картинки (M-9)
+        self._mark_dirty()
+        return affected
 
     # ----- Перемещение и избранное -----
 
@@ -1197,26 +1413,89 @@ class Database:
             )
         return self.cursor.fetchone()["n"]
 
-    def move_service(self, service_id, folder_id):
-        """Переносит сервис в папку (folder_id=None — вынести из папки), в конец списка."""
+    def _move_service_rows(self, service_id, folder_id):
+        """Тело move_service без транзакции/dirty (для составных методов)."""
         order = self._next_sort_order("services", "folder_id", folder_id)
-        self._write(
+        self.cursor.execute(
             "UPDATE services SET folder_id = ?, sort_order = ? WHERE id = ?",
             (folder_id, order, service_id),
         )
 
-    def move_account(self, account_id, service_id):
-        """Переносит аккаунт в сервис (service_id=None — сделать свободным), в конец списка."""
+    def _move_account_rows(self, account_id, service_id):
+        """Тело move_account без транзакции/dirty (для составных методов)."""
         order = self._next_sort_order("accounts", "service_id", service_id)
-        self._write(
+        self.cursor.execute(
             "UPDATE accounts SET service_id = ?, sort_order = ? WHERE id = ?",
             (service_id, order, account_id),
         )
 
-    def set_favorite(self, account_id, value):
-        self._write(
+    def _set_favorite_rows(self, account_id, value):
+        """Тело set_favorite без транзакции/dirty (для составных методов)."""
+        self.cursor.execute(
             "UPDATE accounts SET is_favorite = ? WHERE id = ?",
             (1 if value else 0, account_id))
+
+    def move_service(self, service_id, folder_id):
+        """Переносит сервис в папку (folder_id=None — вынести из папки), в конец списка."""
+        with self.conn:
+            self._move_service_rows(service_id, folder_id)
+        self._mark_dirty()
+
+    def move_account(self, account_id, service_id):
+        """Переносит аккаунт в сервис (service_id=None — сделать свободным), в конец списка."""
+        with self.conn:
+            self._move_account_rows(account_id, service_id)
+        self._mark_dirty()
+
+    def set_favorite(self, account_id, value):
+        with self.conn:
+            self._set_favorite_rows(account_id, value)
+        self._mark_dirty()
+
+    # ----- Составные (атомарные) операции с деревом (M7-04) -----
+
+    def move_services(self, service_ids, folder_id):
+        """Пакетно переносит сервисы в папку в ОДНОЙ транзакции (M7-04)."""
+        with self.conn:
+            for sid in service_ids:
+                self._move_service_rows(sid, folder_id)
+        self._mark_dirty()
+
+    def move_accounts(self, account_ids, service_id):
+        """Пакетно переносит аккаунты в сервис в ОДНОЙ транзакции (M7-04)."""
+        with self.conn:
+            for aid in account_ids:
+                self._move_account_rows(aid, service_id)
+        self._mark_dirty()
+
+    def set_favorites(self, account_ids, value):
+        """Пакетно проставляет/снимает избранное в ОДНОЙ транзакции (M7-04)."""
+        with self.conn:
+            for aid in account_ids:
+                self._set_favorite_rows(aid, value)
+        self._mark_dirty()
+
+    def move_services_to_new_folder(self, name, service_ids):
+        """Создаёт папку и переносит в неё сервисы в ОДНОЙ транзакции (M7-04).
+        При сбое любого шага папка не создаётся, ни один сервис не перемещён.
+        Возвращает id созданной папки."""
+        with self.conn:
+            folder_id = self._add_folder_rows(name)
+            for sid in service_ids:
+                self._move_service_rows(sid, folder_id)
+        self._mark_dirty()
+        return folder_id
+
+    def move_accounts_to_new_service(self, name, account_ids):
+        """Создаёт сервис и переносит в него аккаунты в ОДНОЙ транзакции (M7-04).
+        При сбое любого шага сервис не создаётся, ни один аккаунт не перемещён.
+        Возвращает id созданного сервиса."""
+        with self.conn:
+            service_id = self._add_service_rows(name, None)
+            for aid in account_ids:
+                self._move_account_rows(aid, service_id)
+        self._mark_dirty()
+        return service_id
 
     # ----- Сохранение порядка (для drag&drop) -----
 
@@ -1436,15 +1715,21 @@ class Database:
         codes = [r["code"] for r in self.cursor.fetchall()]
 
         self.cursor.execute(
-            "SELECT id, description FROM gallery WHERE account_id = ? ORDER BY id",
+            "SELECT id, description, LENGTH(image_data) AS blob_size "
+            "FROM gallery WHERE account_id = ? ORDER BY id",
             (account_id,),
         )
         # image_id — id строки для контракта сохранения (H-6): вернув item с
         # data=None и этим image_id, UI сообщает «сохранить существующий BLOB».
         # Ключ "id" оставлен для обратной совместимости с прежними вызывателями.
+        # blob_size — размер BLOB без чтения самих байтов (LENGTH по заголовку,
+        # дёшево): нужен для учёта ленивых картинок в лимите общего объёма (M7-03),
+        # иначе ещё не загруженные BLOB не считались бы и кап в 500 МБ можно было
+        # незаметно превысить.
         gallery = [
             {"id": r["id"], "image_id": r["id"],
-             "desc": r["description"] or "", "data": None}
+             "desc": r["description"] or "", "data": None,
+             "blob_size": r["blob_size"]}
             for r in self.cursor.fetchall()
         ]
 
@@ -1489,6 +1774,19 @@ class Database:
             gallery_ids = self._save_account_rows(account_id, data)
         self._mark_dirty()
         return gallery_ids
+
+    def add_account_with_card(self, service_id, name, storage) -> int:
+        """Создаёт аккаунт и сразу пишет его карточку в ОДНОЙ транзакции (M7-04).
+        Раньше add_account и save_account были двумя транзакциями: сбой второй
+        оставлял полупустой аккаунт. Теперь либо обе, либо ни одна.
+        Возвращает id созданного аккаунта (галерея у нового аккаунта пуста)."""
+        with self.conn:
+            account_id = self._add_account_rows(service_id, name)
+            # rowcount-гард в _save_account_rows проверяет UPDATE по только что
+            # вставленной строке — она есть, поэтому проходит (L-6).
+            self._save_account_rows(account_id, storage)
+        self._mark_dirty()
+        return account_id
 
     def save_account_with_links(self, account_id, data, target_ids):
         """Атомарно сохраняет карточку и её связи В ОДНОЙ транзакции (H6-02):
@@ -1837,6 +2135,8 @@ _DB_NO_LOCK = frozenset({
     "run_async",             # сам диспетчер async (корутина); лок берёт вызываемый метод
     "current_session",       # чтение токена сессии (атомарно), лок не нужен
     "shutdown_executor",     # управление пулом, не трогает conn
+    "wait_executor_idle",    # барьер пула: держать лок нельзя (иначе дедлок с
+                             # in-flight-методом, берущим тот же лок из воркера)
 })
 
 # ─── ИНВАРИАНТ ЛОКА (H-5) ─────────────────────────────────────────────────────

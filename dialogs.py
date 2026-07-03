@@ -758,6 +758,13 @@ class SettingsDialog(ThemedDialog):
 
     # ─── Вкладка: Поведение ──────────────────────────────────────────────────
 
+    def _show_welcome(self):
+        # Локальный импорт — исключает цикл dialogs ↔ ui_welcome.
+        # Вложенный модальный диалог — норма кодовой базы (themed_info и т.п.).
+        # Флаг welcome_shown здесь не трогаем: он касается только первого запуска.
+        from ui_welcome import WelcomeDialog
+        WelcomeDialog(self.config, self).exec()
+
     def _page_behavior(self):
         w = QWidget()
         lay = QVBoxLayout(w)
@@ -814,6 +821,15 @@ class SettingsDialog(ThemedDialog):
             "но весь объём изображений аккаунта держится в ОЗУ. «По нажатию»\n"
             "читает изображение только при клике — меньше нагрузка на память."))
         lay.addWidget(gal_group)
+
+        help_group = QGroupBox("Обучение")
+        hl = QHBoxLayout(help_group)
+        hl.addWidget(QLabel("Слайды с обзором основных функций программы"))
+        hl.addStretch()
+        self.show_welcome_btn = QPushButton("Показать обучение")
+        self.show_welcome_btn.clicked.connect(self._show_welcome)
+        hl.addWidget(self.show_welcome_btn)
+        lay.addWidget(help_group)
 
         lay.addStretch()
         return w
@@ -1347,12 +1363,18 @@ class UnlockDialog(ThemedDialog):
     При успехе self.result_data = (db_bytes, dek, header). При отмене (выход)
     результат остаётся None — вызывающий код должен завершить программу."""
 
-    def __init__(self, config, container: bytes, parent=None):
+    def __init__(self, config, container: bytes = b"", parent=None):
         super().__init__(config, parent)
         self.setWindowTitle("Разблокировка")
         self.setModal(True)
         self.setMinimumWidth(420)
+        # Байты контейнера могут прийти сразу (готовые) ИЛИ отложенно через
+        # set_container_future (M7-06): тяжёлое чтение крупного файла тогда идёт
+        # параллельно вводу пароля, а диалог показывается моментально. _container
+        # хранит уже прочитанные байты; _container_future — ещё не завершённое
+        # чтение (résolve при первой попытке разблокировки).
         self._container = container
+        self._container_future = None
         self.result_data = None
         self.recovery_action = None   # None | "reset" | "restore"
         self.restore_path = None
@@ -1397,6 +1419,39 @@ class UnlockDialog(ThemedDialog):
 
         self._field.returnPressed.connect(self._attempt)
         QTimer.singleShot(0, self._field.setFocus)
+
+    def set_container_future(self, future):
+        """Отдать диалогу ЕЩЁ НЕ завершённое чтение файла-контейнера (M7-06).
+
+        Диалог показывается сразу, а тяжёлое чтение крупного файла идёт в фоне и
+        перекрывается вводом пароля. Байты берутся лениво — только когда они реально
+        нужны (первая попытка разблокировки, см. _ensure_container). OSError из
+        future всплывёт там же и будет показан пользователю."""
+        self._container_future = future
+
+    def _ensure_container(self) -> bool:
+        """Гарантировать наличие байт контейнера (résolve future при необходимости).
+
+        Возвращает True, если байты готовы (в self._container), False — если чтение
+        файла завершилось ошибкой (сообщение уже показано в поле ошибки диалога).
+        На время ожидания показываем «Чтение файла…» и блокируем кнопку — future
+        обычно уже завершён (чтение шло параллельно вводу пароля)."""
+        fut = self._container_future
+        if fut is None:
+            return True
+        self._err.setText("Чтение файла…")
+        self._ok.setEnabled(False)
+        QApplication.processEvents()   # дать метке «Чтение файла…» отрисоваться
+        try:
+            self._container = fut.result()
+            self._container_future = None
+            self._err.setText("")
+            return True
+        except OSError as e:
+            self._err.setText(f"Не удалось прочитать файл базы: {e}")
+            return False
+        finally:
+            self._ok.setEnabled(True)
 
     def _paste(self):
         self._field.setText(QApplication.clipboard().text().strip())
@@ -1517,6 +1572,10 @@ class UnlockDialog(ThemedDialog):
     def _attempt(self):
         secret = self._field.text().strip()
         if not secret:
+            return
+        # Байты контейнера нужны именно здесь (не при показе диалога): дожидаемся
+        # фонового чтения файла (M7-06). При ошибке чтения — сообщение и выход.
+        if not self._ensure_container():
             return
         is_rec = self._rec_check.isChecked()
         try:

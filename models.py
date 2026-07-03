@@ -103,8 +103,12 @@ class AccountData:
             # «оставить существующий BLOB») сквозь кеш несохранённых правок
             # (stash → to_storage → from_storage → set_data). Без него ленивые
             # картинки после стэша пересохранялись бы заново либо терялись.
+            # blob_size переносим сквозь кеш правок (M7-03): у ленивых картинок
+            # (data=None) он несёт размер BLOB для учёта в лимите общего объёма,
+            # иначе после стэша ленивая картинка «весила» бы ноль.
             "gallery": [{"data": g.get("data"), "desc": g.get("desc", ""),
-                         "image_id": g.get("image_id")} for g in self.gallery],
+                         "image_id": g.get("image_id"),
+                         "blob_size": g.get("blob_size")} for g in self.gallery],
         }
 
     @classmethod

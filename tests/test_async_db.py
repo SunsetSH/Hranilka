@@ -153,3 +153,50 @@ async def test_queued_async_aborts_after_session_change(adb):
     with pytest.raises(StaleSessionError):
         await queued
     await busy
+
+
+# ─── H7-01: барьер executor'а (wait_executor_idle) ───────────────────────────
+
+def test_wait_executor_idle_true_when_empty(adb):
+    """Пустой executor: барьер сразу True."""
+    assert adb.wait_executor_idle(timeout=2) is True
+
+
+def test_wait_executor_idle_waits_for_inflight(adb):
+    """Барьер дожидается выполняющейся задачи: она успевает записать данные ДО
+    возврата True (иначе restore/close потеряли бы последний коммит)."""
+    started = threading.Event()
+    release = threading.Event()
+    done = {}
+
+    def slow():
+        started.set()
+        release.wait(2)
+        adb.add_service("late")             # «поздний» коммит из фонового потока
+        done["ok"] = True
+
+    fut = adb._executor.submit(slow)
+    assert started.wait(2)
+    release.set()
+    # Барьер сабмитит no-op ПОСЛЕ slow (FIFO, один воркер) → ждёт его завершения.
+    assert adb.wait_executor_idle(timeout=5) is True
+    assert done.get("ok") is True
+    assert [s["name"] for s in adb.get_services()] == ["late"]
+    fut.result(timeout=2)
+
+
+def test_wait_executor_idle_timeout_returns_false(adb):
+    """Если задача не отпускает воркера дольше timeout — барьер возвращает False
+    (вызыватель обязан прервать restore/close)."""
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocker():
+        started.set()
+        release.wait(5)
+
+    fut = adb._executor.submit(blocker)
+    assert started.wait(2)
+    assert adb.wait_executor_idle(timeout=0.2) is False
+    release.set()
+    fut.result(timeout=5)

@@ -7,6 +7,7 @@ from PySide6.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QLineEdit,
                                QApplication, QSpinBox, QMenu)
 from PySide6.QtCore import Signal, Qt, QDate, QByteArray, QBuffer, QIODevice
 from PySide6.QtGui import QPixmap, QImage, QImageReader
+import shiboken6
 from theme import themed_info, themed_confirm, mix
 import util
 
@@ -535,6 +536,16 @@ class GalleryWidget(QWidget):
         # ещё не в элементе (bytes=None) и get_data его пропустит — сохранение до
         # их завершения потеряло бы картинку (M6-01). Save их дожидается.
         self._upload_tasks = set()
+        # Контекст аккаунта и «раковина» для осиротевших загрузок (M7-05). Импорт
+        # больше не отменяется при смене карточки — он доживает в фоне, а результат
+        # уходит не в чужую активную карточку общего виджета, а обратно тому
+        # аккаунту, для которого стартовал (в его черновик правок / живую карточку).
+        #   _account_provider() -> id аккаунта на момент СТАРТА загрузки (снимается
+        #     до первого await в _queue_file_load/_paste_pipeline);
+        #   _orphan_handler(account_id, desc_text, data_bytes) — куда отдать байты,
+        #     если карточку сменили за время загрузки.
+        self._account_provider = None
+        self._orphan_handler = None
 
     def _downscale_enabled(self):
         """Включено ли сжатие больших изображений при импорте (настройка)."""
@@ -628,10 +639,54 @@ class GalleryWidget(QWidget):
         self._async_reader = reader
         self._session_provider = session_provider
 
+    def set_account_provider(self, provider):
+        """Внедрить провайдер id текущего аккаунта (M7-05). Снимается в момент
+        СТАРТА загрузки картинки; если к завершению карточку сменили, результат
+        адресуется этому id через orphan-handler, а не текущей карточке."""
+        self._account_provider = provider
+
+    def set_orphan_upload_handler(self, handler):
+        """Внедрить обработчик осиротевшей загрузки (M7-05): вызывается как
+        handler(account_id, desc_text, data_bytes), когда конвейер завершился, а
+        карточка уже сменилась (gen != self._data_gen или элемент удалён). Handler
+        дописывает картинку в черновик правок / живую карточку своего аккаунта."""
+        self._orphan_handler = handler
+
+    def _current_account_id(self):
+        """id аккаунта на момент вызова (для захвата при старте загрузки)."""
+        if self._account_provider is None:
+            return None
+        try:
+            return self._account_provider()
+        except Exception:                        # noqa: BLE001 — teardown/гонки
+            return None
+
+    def _emit_orphan(self, account_id, desc_text, data):
+        """Отдать осиротевшую загрузку обработчику. Если обработчик не внедрён или
+        аккаунт неизвестен — молча роняем (как и раньше при смене карточки)."""
+        if self._orphan_handler is None or account_id is None:
+            return
+        try:
+            self._orphan_handler(account_id, desc_text, data)
+        except Exception as e:                   # noqa: BLE001 — не валим конвейер
+            logging.error("Не удалось передать осиротевшую загрузку: %s",
+                          e, exc_info=e)
+
     def _local_bytes(self):
         """Суммарный объём картинок в текущей (редактируемой) карточке.
-        Элементы с bytes=None (ещё не загружены) не учитываются."""
-        return sum(len(it["bytes"]) for it in self.items if it["bytes"] is not None)
+
+        Загруженные элементы считаем по фактическим байтам (len(bytes)); ленивые
+        (bytes=None) — по blob_size из БД (M7-03), иначе в режиме on_click ещё не
+        подгруженные BLOB не учитывались бы и лимит общего объёма можно было бы
+        незаметно превысить. Приоритет — у фактических байтов (после подгрузки
+        len(bytes) точнее, а blob_size может отличаться от размера в памяти)."""
+        total = 0
+        for it in self.items:
+            if it["bytes"] is not None:
+                total += len(it["bytes"])
+            else:
+                total += it.get("blob_size") or 0
+        return total
 
     @staticmethod
     def _read_image_size(data):
@@ -784,7 +839,11 @@ class GalleryWidget(QWidget):
         async-конвейер загрузки. Реальная работа — в _upload_pipeline."""
         self.add_item(None)                  # placeholder «[ фото ]», bytes=None
         item = self.items[-1]
-        self._track_upload(self._upload_pipeline(item, path, self._data_gen))
+        # Захватываем аккаунт и поколение ДО первого await (M7-05): если карточку
+        # сменят за время загрузки, результат уйдёт этому аккаунту, а не текущему.
+        aid = self._current_account_id()
+        self._track_upload(
+            self._upload_pipeline(item, path, self._data_gen, aid))
 
     def _cancel_upload_tasks(self):
         """Отменить все активные задачи импорта (смена карточки/lock/restore).
@@ -812,11 +871,49 @@ class GalleryWidget(QWidget):
         return bool(self._upload_tasks)
 
     async def wait_pending_uploads(self):
-        """Дождаться завершения всех активных загрузок файлов (для Save, M6-01)."""
+        """Дождаться завершения всех активных загрузок файлов (для Save, M6-01).
+
+        После M7-05 загрузки переживают смену карточки, поэтому здесь могут
+        оказаться и задачи ДРУГИХ аккаунтов — это допустимо: их результат уйдёт
+        своему аккаунту через orphan-handler, а Save дождётся согласованного
+        снимка галереи текущей карточки."""
         if self._upload_tasks:
             await asyncio.gather(*list(self._upload_tasks), return_exceptions=True)
 
-    async def _upload_pipeline(self, item, path, gen):
+    def _orphan_desc(self, item):
+        """Текст описания элемента для осиротевшей загрузки (M7-05). Placeholder к
+        моменту завершения обычно имеет пустое описание, но если пользователь успел
+        что-то ввести — сохраняем его.
+
+        Виджет описания к этому моменту уже мог быть удалён (set_data при смене
+        карточки зовёт deleteLater): обращение к освобождённому C++-объекту через
+        shiboken бросает RuntimeError. Проверяем валидность shiboken.isValid перед
+        доступом и на всякий случай ловим исключение — иначе осиротевшая загрузка
+        падала бы вместо мягкого «пустого описания»."""
+        edit = item.get("desc")
+        if edit is None:
+            return ""
+        try:
+            if not shiboken6.isValid(edit):
+                return ""
+            return edit.text()
+        except Exception:                        # noqa: BLE001 — виджет мог исчезнуть
+            return ""
+
+    def _accept_orphan(self, data, size):
+        """Проверки осиротевшей загрузки, НЕ зависящие от аккаунта (M7-05): размер
+        файла и разрешение («бомба»). Пер-элементные проверки уже сделаны в
+        конвейере выше, здесь дублируем дёшево на всякий случай. Лимит ОБЩЕГО
+        объёма (500 МБ) для сирот НЕ проверяем: он мягкий и всё равно
+        перепроверяется при следующем открытии карточки; жёстко ронять уже
+        прочитанную с диска картинку из-за суммарного капа здесь неоправданно."""
+        if not data or len(data) > self._MAX_IMAGE_BYTES:
+            return False
+        if size is None or size[0] * size[1] > self._MAX_IMAGE_PIXELS:
+            return False
+        return True
+
+    async def _upload_pipeline(self, item, path, gen, account_id=None):
         """Async-конвейер загрузки картинки с диска. Разные операции — в разных
         потоках пула (run_in_executor), UI-поток лишь рисует результат:
           1) чтение файла           → поток;
@@ -825,7 +922,8 @@ class GalleryWidget(QWidget):
 
         gen — поколение карточки на момент запуска: если оно сменилось (пользователь
         переключил аккаунт / lock / restore), результат в текущую карточку не
-        применяем (M65-02)."""
+        применяем (M65-02), а отдаём его аккаунту account_id через orphan-handler
+        (M7-05) — загрузка больше не теряется при переключении."""
         loop = asyncio.get_running_loop()
         try:
             data = await loop.run_in_executor(
@@ -845,7 +943,12 @@ class GalleryWidget(QWidget):
         data, size, thumb = await loop.run_in_executor(
             None, _prepare_image_bytes, data, self._downscale_enabled())
         if gen != self._data_gen or item not in self.items:
-            return                           # карточку сменили / элемент удалили
+            # Карточку сменили / элемент удалили — отдаём результат своему аккаунту
+            # (M7-05), не теряя загрузку. Проверки, зависящие от аккаунта, делает
+            # уже handler; здесь — только аккаунт-независимая валидность.
+            if self._accept_orphan(data, size):
+                self._emit_orphan(account_id, self._orphan_desc(item), data)
+            return
         if not self._accept_image_checked(data, size, pending_placeholder=True):
             self._remove_item_silent(item)   # предупреждение уже показал accept
             return
@@ -913,9 +1016,11 @@ class GalleryWidget(QWidget):
         """Вставка из буфера. Как и загрузка с диска, идёт через отслеживаемую
         задачу (M65-01): Save её дождётся, а завершившаяся вставка проверит
         поколение карточки и не попадёт в чужой аккаунт при переключении."""
-        self._track_upload(self._paste_pipeline(self._data_gen))
+        # Аккаунт снимаем ДО первого await (M7-05) — см. _queue_file_load.
+        aid = self._current_account_id()
+        self._track_upload(self._paste_pipeline(self._data_gen, aid))
 
-    async def _paste_pipeline(self, gen):
+    async def _paste_pipeline(self, gen, account_id=None):
         loop = asyncio.get_running_loop()
         clipboard = QApplication.clipboard()
         mime_data = clipboard.mimeData()
@@ -944,7 +1049,11 @@ class GalleryWidget(QWidget):
             data, size, _ = await loop.run_in_executor(
                 None, _prepare_image_bytes, data, self._downscale_enabled())
             if gen != self._data_gen:
-                return                       # карточку сменили — не добавляем в чужую
+                # Карточку сменили — не добавляем в чужую, а отдаём своему аккаунту
+                # (M7-05). desc пустой: у вставки нет placeholder-элемента.
+                if self._accept_orphan(data, size):
+                    self._emit_orphan(account_id, "", data)
+                return
             if self._accept_image_checked(data, size):
                 self.add_item(data)
         else:
@@ -953,12 +1062,14 @@ class GalleryWidget(QWidget):
                 "В буфере нет изображения!\nСкопируйте картинку или файл картинки.",
             )
 
-    def add_item(self, image_bytes, desc="", image_id=None):
+    def add_item(self, image_bytes, desc="", image_id=None, blob_size=None):
         """Добавить элемент галереи.
 
         image_bytes — байты изображения (уже в памяти); если None и image_id
         задан — показываем placeholder ленивой загрузки (BLOB загрузится при
         клике или при save через get_data).
+        blob_size — размер BLOB ленивого элемента в БД (для учёта в лимите
+        общего объёма, M7-03); None для новых/уже-в-памяти картинок.
         """
         item_widget = QWidget(self)
         # Рамка элемента — полутон между текстом и фоном темы (H-10): видна и на
@@ -1011,7 +1122,8 @@ class GalleryWidget(QWidget):
         self.items_layout.addWidget(item_widget)
 
         item = {"bytes": image_bytes, "desc": desc_edit, "del": del_btn,
-                "widget": item_widget, "thumb": thumb_label, "image_id": image_id}
+                "widget": item_widget, "thumb": thumb_label, "image_id": image_id,
+                "blob_size": blob_size}
         self.items.append(item)
 
         del_btn.clicked.connect(lambda: self.remove_item(item_widget))
@@ -1246,11 +1358,14 @@ class GalleryWidget(QWidget):
         image_id читаем как из ключа "id" (прямой ответ load_account), так и из
         "image_id" (после round-trip через кеш правок to_storage/from_storage,
         H-6) — чтобы контракт «оставить существующий BLOB» не терялся."""
-        # Смена карточки: любой ещё не завершённый импорт (upload/paste) прежней
-        # карточки теперь относится к другому аккаунту — гасим его поколение,
-        # чтобы результат не попал в загружаемую карточку (M65-01/M65-02).
+        # Смена карточки: поднимаем поколение данных, чтобы ещё не завершённый
+        # импорт (upload/paste) прежней карточки не попал в загружаемую карточку
+        # общего виджета (M65-01/M65-02). Сам импорт НЕ отменяем (M7-05): он
+        # доживает в фоне, а его результат уйдёт своему аккаунту через orphan-
+        # handler (см. _upload_pipeline/_paste_pipeline). Отмена осталась только в
+        # cancel_all_tasks — там сессия БД меняется (lock/restore/close) и
+        # продолжать импорт нельзя.
         self._data_gen += 1
-        self._cancel_upload_tasks()
         for it in self.items:
             self.items_layout.removeWidget(it["widget"])
             it["widget"].deleteLater()
@@ -1259,12 +1374,15 @@ class GalleryWidget(QWidget):
             img_id = item.get("id", item.get("image_id"))
             img_data = item.get("data")
             desc = item.get("desc", "")
+            blob_size = item.get("blob_size")
             if img_data is not None:
                 # Байты уже есть — обычный путь.
                 self.add_item(img_data, desc, image_id=img_id)
             elif img_id is not None:
                 # Ленивый элемент из БД: placeholder, загрузка по запросу.
-                self.add_item(None, desc, image_id=img_id)
+                # blob_size — размер BLOB для учёта в лимите общего объёма (M7-03),
+                # пока сами байты не подгружены (bytes=None).
+                self.add_item(None, desc, image_id=img_id, blob_size=blob_size)
             # Элементы без data и без id игнорируются.
 
     def set_editable(self, editable):

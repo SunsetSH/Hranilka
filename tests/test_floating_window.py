@@ -175,6 +175,9 @@ def test_mainwindow_switch_accounts_no_floating_window(qapp, tmp_path, monkeypat
     monkeypatch.setattr(theme, "themed_info", lambda *a, **k: None)
 
     win = main.MainWindow()
+    # «Первый запуск» уже пройден: иначе отложенное обучение (welcome) честно
+    # откроется на processEvents и тест сочтёт его лишним top-level окном.
+    win.config.set("welcome_shown", True)
     spy = _TopLevelSpy()
     qapp.installEventFilter(spy)
     try:

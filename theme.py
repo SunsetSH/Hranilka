@@ -56,8 +56,11 @@ def widget_styles(config):
         QPushButton {{ background-color: {tree_bg}; color: {text_color}; border: 2px outset #808080;
             padding: 5px 15px; font-family: '{font_name}'; font-size: {font_size}px; font-weight: bold; }}
         QPushButton:hover {{ border: 2px inset #808080; background-color: {main_bg}; }}
-        QPushButton:disabled {{ color: #808080; border: 2px outset #585858; background-color: {tree_bg}; }}
-        QPushButton:disabled:hover {{ border: 2px outset #585858; background-color: {tree_bg}; }}
+        QPushButton:disabled {{ color: {mix(text_color, tree_bg, 0.6)};
+            border: 2px outset {mix('#808080', tree_bg, 0.45)};
+            background-color: {mix(tree_bg, main_bg, 0.6)}; }}
+        QPushButton:disabled:hover {{ border: 2px outset {mix('#808080', tree_bg, 0.45)};
+            background-color: {mix(tree_bg, main_bg, 0.6)}; }}
         QPushButton[tabButton="true"]:checked {{ background-color: {main_bg}; border: 2px inset #808080; }}
         QCheckBox, QRadioButton {{ color: {text_color}; font-family: '{font_name}'; font-size: {font_size}px;
             spacing: 8px; background: transparent; }}

@@ -76,6 +76,7 @@ class Config:
             "backup_auto_on_close": False,
             "backup_keep_count": 5,
             "warn_on_exit_unsaved": True,
+            "welcome_shown": False,        # обучение при первом запуске уже показано
             "encryption_enabled": False,
             "argon2_preset": "balanced",
             "image_downscale": True,       # сжимать большие изображения при импорте

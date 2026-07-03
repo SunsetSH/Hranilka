@@ -175,6 +175,20 @@ def test_save_gallery_lazy_item_preserves_blob(db):
     assert rows[0]["description"] == "renamed"       # подпись обновилась
 
 
+def test_load_account_returns_blob_size(db):
+    """load_account отдаёт blob_size (LENGTH(image_data)) для ленивого учёта
+    объёма (M7-03): по нему считается лимит общего объёма, пока байты не
+    подгружены. Для строки с BLOB — фактическая длина."""
+    sid = db.add_service("S")
+    aid = db.add_account(sid, "A")
+    db.save_account(aid, _card([{"desc": "one", "data": b"AAABBBCCCD"}]))  # 10 байт
+    loaded = db.load_account(aid)
+    assert len(loaded["gallery"]) == 1
+    g = loaded["gallery"][0]
+    assert g["data"] is None                 # ленивый: байты не читаются
+    assert g["blob_size"] == 10              # но размер известен без чтения BLOB
+
+
 def test_save_gallery_omitted_id_deletes(db):
     """Строка, чей image_id отсутствует в переданном списке, удаляется."""
     sid = db.add_service("S")
@@ -315,4 +329,116 @@ def test_links_migration_normalizes_old_rows(tmp_db_path):
     assert len(rows) == 1
     assert rows[0]["account_id"] < rows[0]["linked_account_id"]
     assert d2.get_schema_version() == SCHEMA_VERSION
+    d2.close(persist=False)
+
+
+# ─── H7-03: pre-migration copy как надёжная страховка ────────────────────────
+
+import glob  # noqa: E402
+
+from database import PreMigrationBackupError  # noqa: E402
+
+
+def _old_version_db(tmp_db_path):
+    """Создать закрытую БД СТАРОЙ версии схемы (нужна миграция при открытии)."""
+    d = Database(tmp_db_path)
+    d.connect()
+    d.create_tables()
+    d.add_service("S")
+    d.set_schema_version(SCHEMA_VERSION - 1)
+    d._commit()
+    d.close(persist=False)
+
+
+def _copies(tmp_db_path):
+    return glob.glob(tmp_db_path + ".pre-migrate*")
+
+
+def test_premigration_copy_failure_aborts_open(tmp_db_path, monkeypatch):
+    """(a) Сбой создания копии перед миграцией ПРЕРЫВАЕТ открытие; рабочий файл
+    не тронут (миграция не выполнялась)."""
+    _old_version_db(tmp_db_path)
+
+    real_open = open
+
+    def failing_open(file, mode="r", *a, **k):
+        # Копия создаётся эксклюзивной записью ('xb'); обычные чтения не трогаем.
+        if "x" in mode:
+            raise OSError("нет места")
+        return real_open(file, mode, *a, **k)
+
+    monkeypatch.setattr("builtins.open", failing_open)
+    d = Database(tmp_db_path)
+    d.connect()
+    with pytest.raises(PreMigrationBackupError):
+        d.create_tables()
+    # Версия схемы на диске осталась старой — миграция не прошла.
+    assert d.get_schema_version() == SCHEMA_VERSION - 1
+    d.close(persist=False)
+
+
+def test_premigration_copy_unique_name_not_overwritten(tmp_db_path, monkeypatch):
+    """(b) Уцелевшая копия от прошлого прерванного прогона НЕ перезаписывается
+    следующим прогоном — имена уникальны, обе копии сосуществуют."""
+    _old_version_db(tmp_db_path)
+
+    # Первый прогон: миграция падает после создания копии → копия остаётся.
+    def boom():
+        raise RuntimeError("migration crashed")
+    d1 = Database(tmp_db_path)
+    d1.connect()
+    monkeypatch.setattr(d1, "_migrate", boom)
+    with pytest.raises(RuntimeError):
+        d1.create_tables()
+    d1.close(persist=False)
+    first = _copies(tmp_db_path)
+    assert len(first) == 1
+
+    # Версия на диске всё ещё старая (миграция не завершилась) — второй прогон
+    # снова делает копию, но с ДРУГИМ именем (метка времени/страховка). Чтобы имя
+    # гарантированно отличалось (та же секунда), первую копию не трогаем и
+    # проверяем, что после второго прогона исходная копия на месте.
+    d2 = Database(tmp_db_path)
+    d2.connect()
+    monkeypatch.setattr(d2, "_migrate", boom)
+    with pytest.raises(RuntimeError):
+        d2.create_tables()
+    d2.close(persist=False)
+    after = _copies(tmp_db_path)
+    # Исходная копия НЕ перезаписана и НЕ удалена.
+    assert first[0] in after
+
+
+def test_premigration_copy_removed_on_success(tmp_db_path):
+    """(success) При успешной миграции копия этого прогона удаляется."""
+    _old_version_db(tmp_db_path)
+    d = Database(tmp_db_path)
+    d.connect()
+    d.create_tables()
+    assert d.get_schema_version() == SCHEMA_VERSION
+    assert _copies(tmp_db_path) == []
+    d.close(persist=False)
+
+
+def test_destructive_repair_makes_copy_current_version(tmp_db_path, monkeypatch):
+    """(c) Деструктивный dedup на базе АКТУАЛЬНОЙ версии (бит отпечаток) тоже
+    создаёт durable-копию; при сбое она остаётся на диске."""
+    d = Database(tmp_db_path)
+    d.connect()
+    d.create_tables()
+    # Версия актуальна, но отпечаток бит (нет UNIQUE-индекса) → путь ремонта/dedup.
+    d.cursor.execute("DROP INDEX uq_personal_account")
+    d._commit()
+    d.close(persist=False)
+
+    # Валим этап после создания dedup-копии — копия должна остаться.
+    d2 = Database(tmp_db_path)
+    d2.connect()
+
+    def boom():
+        raise RuntimeError("repair crashed")
+    monkeypatch.setattr(d2, "_migrate", boom)
+    with pytest.raises(RuntimeError):
+        d2.create_tables()
+    assert _copies(tmp_db_path)                  # dedup-копия осталась
     d2.close(persist=False)

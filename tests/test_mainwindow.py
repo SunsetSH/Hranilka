@@ -119,3 +119,66 @@ def test_restore_plaintext_backup_no_winerror(window, tmp_path):
     accts = window.db.get_all_accounts()   # name — это полный путь до аккаунта
     assert len(accts) == 1                 # вернулись к состоянию бэкапа (Acc2 нет)
     assert accts[0]["name"].endswith("Acc1")
+
+
+# ─── M7-05: осиротевшая загрузка попадает в черновик правок ───────────────────
+
+def test_orphan_upload_lands_in_edit_cache(window):
+    """Загрузка, стартовавшая для аккаунта, к завершению которой пользователь ушёл
+    с карточки, дописывается в черновик правок этого аккаунта, а сам аккаунт
+    помечается «грязным» (M7-05, путь _edit_cache present)."""
+    db = window.db
+    sid = db.add_service("Сервис")
+    aid = db.add_account(sid, "Acc")
+
+    # У аккаунта уже есть черновик правок (как после ухода в режиме правки).
+    window._edit_cache[aid] = {
+        "storage": {"fields": {}, "personal": {}, "questions": [],
+                    "recovery": {}, "codes": [], "gallery": []},
+        "links": [],
+    }
+    window._current_account_id = None          # мы уже НЕ на этой карточке
+
+    data = b"\x89PNG_orphan_bytes"
+    window._on_gallery_orphan_upload(aid, "подпись", data)
+
+    gallery = window._edit_cache[aid]["storage"]["gallery"]
+    assert len(gallery) == 1
+    assert gallery[0]["data"] == data
+    assert gallery[0]["desc"] == "подпись"
+    assert gallery[0]["image_id"] is None      # новая картинка
+    assert aid in window._dirty_ids            # аккаунт помечен несохранённым
+
+
+def test_orphan_upload_deleted_account_dropped(window):
+    """Если аккаунт удалён к моменту завершения загрузки и черновика нет — картинка
+    роняется, черновик не создаётся, dirty не помечается (M7-05). _on_gallery_orphan_
+    upload запускает _orphan_into_new_draft; без работающего qasync-loop util.fire
+    выполняет корутину синхронно до конца."""
+    missing_aid = 999999                       # такого аккаунта нет
+    window._current_account_id = None
+    window._on_gallery_orphan_upload(missing_aid, "x", b"data")
+
+    assert missing_aid not in window._edit_cache
+    assert missing_aid not in window._dirty_ids
+
+
+def test_orphan_upload_builds_draft_from_db(window):
+    """Черновика ещё нет: _on_gallery_orphan_upload подгружает аккаунт из БД,
+    формирует черновик (формат _stash_current_edits) и дописывает картинку (M7-05)."""
+    db = window.db
+    sid = db.add_service("Сервис")
+    aid = db.add_account(sid, "Acc")
+    window._current_account_id = None          # мы НЕ на этой карточке
+    window._edit_cache.pop(aid, None)          # черновика нет
+
+    data = b"\x89PNG_from_db"
+    window._on_gallery_orphan_upload(aid, "снимок", data)
+
+    assert aid in window._edit_cache
+    gallery = window._edit_cache[aid]["storage"]["gallery"]
+    assert gallery[-1]["data"] == data
+    assert gallery[-1]["desc"] == "снимок"
+    assert gallery[-1]["image_id"] is None
+    assert isinstance(window._edit_cache[aid]["links"], list)
+    assert aid in window._dirty_ids

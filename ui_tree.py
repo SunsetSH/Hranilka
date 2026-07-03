@@ -8,7 +8,7 @@ TreeMixin: построение/перестроение дерева, сорт�
 from PySide6.QtWidgets import (QTreeWidget, QTreeWidgetItem, QMenu,
                                QAbstractItemView)
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QColor, QBrush
+from PySide6.QtGui import QBrush
 
 import theme
 import util
@@ -90,11 +90,13 @@ class TreeMixin:
         font = item.font(0)
         font.setBold(dirty)
         item.setFont(0, font)
-        # Маркер «не сохранено» — самосогласованная пара фон+текст (чёрный на
-        # жёлтом): прежний жёлтый текст поверх фона темы терялся на светлых
-        # темах вроде Windows 95 (H-10).
-        item.setForeground(0, QBrush(QColor("#000000")) if dirty else QBrush())
-        item.setBackground(0, QBrush(QColor("#FFC400")) if dirty else QBrush())
+        # Маркер «не сохранено» — только префикс «● НЕ СОХРАНЕНО ▸» и жирный
+        # шрифт. Цвета текста/фона НЕ переопределяем: элемент рисуется цветами
+        # темы из настроек (как остальные), а выделение — правилами
+        # item:selected из QSS. Жёсткая пара чёрный-на-жёлтом ломала темизацию
+        # невыбранного элемента (текст был чёрным на любой теме).
+        item.setForeground(0, QBrush())
+        item.setBackground(0, QBrush())
 
     def _node(self, item):
         """Возвращает словарь данных (type, id, name, ...) элемента дерева или None."""
@@ -406,40 +408,20 @@ class TreeMixin:
 
     async def _delete_items_async(self, nodes, keep, to_bin):
         session = self.db.current_session()
+        # Всё удаление — ОДНА транзакция БД (M7-04): либо весь набор удалён, либо
+        # ничего. Кэш несохранённых правок чистим ТОЛЬКО после успеха, по списку
+        # реально удалённых/перемещённых в корзину аккаунтов, что возвращает БД.
+        items = [(node["type"], node["id"]) for node in nodes]
         try:
-            for node in nodes:
-                if node["type"] == "folder":
-                    # При полном удалении (не keep) аккаунты внутри тоже исчезают —
-                    # чистим их кэш несохранённых правок, иначе остаётся «мусор» и
-                    # ложное предупреждение о несохранённых данных.
-                    if not keep:
-                        ids = await self.db.run_async(
-                            self.db.get_descendant_account_ids, "folder",
-                            node["id"], _session=session)
-                        self._forget_account_cache(ids)
-                    method = (self.db.delete_folder_keep_content if keep
-                              else self.db.delete_folder)
-                    await self.db.run_async(method, node["id"], _session=session)
-                elif node["type"] == "service":
-                    if not keep:
-                        ids = await self.db.run_async(
-                            self.db.get_descendant_account_ids, "service",
-                            node["id"], _session=session)
-                        self._forget_account_cache(ids)
-                    method = (self.db.delete_service_keep_content if keep
-                              else self.db.delete_service)
-                    await self.db.run_async(method, node["id"], _session=session)
-                else:
-                    # Аккаунты при включённой корзине удаляются мягко (в корзину).
-                    method = (self.db.move_account_to_bin if to_bin
-                              else self.db.delete_account)
-                    await self.db.run_async(method, node["id"], _session=session)
-                    self._forget_account_cache([node["id"]])
+            affected = await self.db.run_async(
+                self.db.delete_items, items, keep, to_bin, _session=session)
         except StaleSessionError:
             return                               # БД сменена (lock/restore) — молча
         except Exception as e:                       # noqa: BLE001
             self._show_card_error("Не удалось удалить", e)
+            self._reload_tree()                  # операция атомарна — ресинк UI (страховка)
             return
+        self._forget_account_cache(affected)
         self._any_db_changes = True
 
         self.current_tree_item = None
@@ -469,6 +451,25 @@ class TreeMixin:
             return                               # БД сменена (lock/restore) — молча
         except Exception as e:                       # noqa: BLE001
             self._show_card_error("Не удалось выполнить операцию", e)
+            self._reload_tree()                  # ресинк UI на случай сбоя (страховка)
+            return
+        self._any_db_changes = True
+        self._reload_tree()
+        if status:
+            self.statusBar().showMessage(status, 2000)
+
+    async def _run_then_reload(self, method, args, err_title, status=None):
+        """Выполнить ОДИН составной DB-метод в фоне и перестроить дерево после
+        завершения (H-8). Составные методы атомарны (M7-04): при сбое БД не
+        меняется, поэтому на ошибке дерево лишь ресинкается (дешёвая страховка)."""
+        session = self.db.current_session()
+        try:
+            await self.db.run_async(method, *args, _session=session)
+        except StaleSessionError:
+            return                               # БД сменена (lock/restore) — молча
+        except Exception as e:                       # noqa: BLE001
+            self._show_card_error(err_title, e)
+            self._reload_tree()
             return
         self._any_db_changes = True
         self._reload_tree()
@@ -476,72 +477,44 @@ class TreeMixin:
             self.statusBar().showMessage(status, 2000)
 
     def _set_favorite(self, selected, value):
-        ops = [(self.db.set_favorite, (node["id"], value))
-               for node in (self._node(i) for i in selected)
+        ids = [node["id"] for node in (self._node(i) for i in selected)
                if node["type"] == "account"]
-        util.fire(self._db_write_then_reload(ops))
+        util.fire(self._run_then_reload(
+            self.db.set_favorites, (ids, value), "Не удалось выполнить операцию"))
 
     def _move_services(self, selected, folder_id):
-        ops = [(self.db.move_service, (node["id"], folder_id))
-               for node in (self._node(i) for i in selected)
+        ids = [node["id"] for node in (self._node(i) for i in selected)
                if node["type"] == "service"]
-        util.fire(self._db_write_then_reload(ops, status="Перемещено"))
+        util.fire(self._run_then_reload(
+            self.db.move_services, (ids, folder_id),
+            "Не удалось переместить", status="Перемещено"))
 
     def _move_services_new_folder(self, selected):
         name, ok = theme.themed_input(self.config, self, "Новая папка", "Название:")
         if ok and name:
-            # Создание папки и перенос — в одной coroutine: перенос зависит от id
-            # созданной папки, поэтому цепочка последовательна (H-8).
+            # Создание папки и перенос — ОДНА транзакция БД (M7-04).
             svc_ids = [self._node(i)["id"] for i in selected
                        if self._node(i)["type"] == "service"]
-            util.fire(self._create_folder_then_move_services(name, svc_ids))
-
-    async def _create_folder_then_move_services(self, name, service_ids):
-        session = self.db.current_session()
-        try:
-            folder_id = await self.db.run_async(
-                self.db.add_folder, name, _session=session)
-            for sid in service_ids:
-                await self.db.run_async(
-                    self.db.move_service, sid, folder_id, _session=session)
-        except StaleSessionError:
-            return
-        except Exception as e:                       # noqa: BLE001
-            self._show_card_error("Не удалось переместить в папку", e)
-            return
-        self._any_db_changes = True
-        self._reload_tree()
-        self.statusBar().showMessage("Перемещено", 2000)
+            util.fire(self._run_then_reload(
+                self.db.move_services_to_new_folder, (name, svc_ids),
+                "Не удалось переместить в папку", status="Перемещено"))
 
     def _move_accounts(self, selected, service_id):
-        ops = [(self.db.move_account, (node["id"], service_id))
-               for node in (self._node(i) for i in selected)
+        ids = [node["id"] for node in (self._node(i) for i in selected)
                if node["type"] == "account"]
-        util.fire(self._db_write_then_reload(ops, status="Перемещено"))
+        util.fire(self._run_then_reload(
+            self.db.move_accounts, (ids, service_id),
+            "Не удалось переместить", status="Перемещено"))
 
     def _move_accounts_new_service(self, selected):
         name, ok = theme.themed_input(self.config, self, "Новый сервис", "Название:")
         if ok and name:
             acc_ids = [self._node(i)["id"] for i in selected
                        if self._node(i)["type"] == "account"]
-            util.fire(self._create_service_then_move_accounts(name, acc_ids))
-
-    async def _create_service_then_move_accounts(self, name, account_ids):
-        session = self.db.current_session()
-        try:
-            service_id = await self.db.run_async(
-                self.db.add_service, name, None, _session=session)
-            for aid in account_ids:
-                await self.db.run_async(
-                    self.db.move_account, aid, service_id, _session=session)
-        except StaleSessionError:
-            return
-        except Exception as e:                       # noqa: BLE001
-            self._show_card_error("Не удалось переместить в сервис", e)
-            return
-        self._any_db_changes = True
-        self._reload_tree()
-        self.statusBar().showMessage("Перемещено", 2000)
+            # Создание сервиса и перенос — ОДНА транзакция БД (M7-04).
+            util.fire(self._run_then_reload(
+                self.db.move_accounts_to_new_service, (name, acc_ids),
+                "Не удалось переместить в сервис", status="Перемещено"))
 
     # ----- Добавление элементов -----
 
@@ -575,6 +548,7 @@ class TreeMixin:
             return
         except Exception as e:                       # noqa: BLE001
             self._show_card_error("Не удалось создать элемент", e)
+            self._reload_tree()                  # ресинк UI на случай сбоя (страховка)
             return
         self._any_db_changes = True
         self._reload_tree()
@@ -604,15 +578,17 @@ class TreeMixin:
 
     async def _add_account_async(self, service_id, name, storage):
         session = self.db.current_session()
+        # Создание аккаунта и запись его карточки — ОДНА транзакция БД (M7-04):
+        # раньше два коммита оставляли полупустой аккаунт при сбое второго.
         try:
             account_id = await self.db.run_async(
-                self.db.add_account, service_id, name, _session=session)
-            await self.db.run_async(
-                self.db.save_account, account_id, storage, _session=session)
+                self.db.add_account_with_card, service_id, name, storage,
+                _session=session)
         except StaleSessionError:
             return
         except Exception as e:                       # noqa: BLE001
             self._show_card_error("Не удалось создать аккаунт", e)
+            self._reload_tree()                  # ресинк UI на случай сбоя (страховка)
             return
         self._any_db_changes = True
         self._reload_tree()

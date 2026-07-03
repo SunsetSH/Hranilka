@@ -7,6 +7,7 @@
   * M65-03 — при неудачном откате rollback-копия сохраняется, а не удаляется;
   * L65-02 — ограниченное чтение файла.
 """
+import glob
 import os
 import sqlite3
 from pathlib import Path
@@ -14,6 +15,11 @@ from pathlib import Path
 import pytest
 
 from database import Database, StaleSessionError, SCHEMA_VERSION
+
+
+def _premigrate_copies(db_path):
+    """Уцелевшие durable-копии перед правкой схемы (уникальные имена, H7-03)."""
+    return glob.glob(db_path + ".pre-migrate*")
 
 
 @pytest.fixture
@@ -72,7 +78,7 @@ def test_premigration_backup_removed_on_success(db, tmp_db_path):
     db._commit()
     db.create_tables()                          # мигрирует до актуальной версии
     assert db.get_schema_version() == SCHEMA_VERSION
-    assert not os.path.exists(tmp_db_path + ".pre-migrate")
+    assert _premigrate_copies(tmp_db_path) == []
 
 
 def test_premigration_backup_kept_on_failure(db, tmp_db_path, monkeypatch):
@@ -86,15 +92,17 @@ def test_premigration_backup_kept_on_failure(db, tmp_db_path, monkeypatch):
     monkeypatch.setattr(db, "_migrate", boom)
     with pytest.raises(RuntimeError):
         db.create_tables()
-    assert os.path.exists(tmp_db_path + ".pre-migrate")
+    assert _premigrate_copies(tmp_db_path)      # уникальная копия осталась на диске
 
 
 def test_no_premigration_backup_when_schema_current(db, tmp_db_path):
-    """Актуальная версия (только ремонт отпечатка) не плодит pre-migration копий."""
-    db.cursor.execute("DROP INDEX uq_personal_account")   # версия та же, отпечаток бит
-    db._commit()
-    db.create_tables()
-    assert not os.path.exists(tmp_db_path + ".pre-migrate")
+    """Быстрый путь (отпечаток цел) не плодит pre-migration копий.
+
+    Ремонт отпечатка (dedup) durable-копию создаёт (H7-03c), но при успехе её
+    снимает; здесь проверяем именно чистый быстрый путь — он не должен трогать
+    диск копиями."""
+    db.create_tables()                          # версия та же, отпечаток цел → быстрый путь
+    assert _premigrate_copies(tmp_db_path) == []
 
 
 # ─── M65-04: backup validation (foreign_key_check) ───────────────────────────

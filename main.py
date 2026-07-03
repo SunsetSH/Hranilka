@@ -8,11 +8,12 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QSplitter, QLabel,
                                QPushButton, QLineEdit,
                                QComboBox, QAbstractItemView)
 from PySide6.QtCore import Qt, QTimer, QDateTime
-from PySide6.QtGui import QFont, QImageReader
+from PySide6.QtGui import QFont, QImageReader, QIcon
 import backup as bk
 
 from config import Config
-from database import Database, FutureSchemaError, VaultConflictError
+from database import (Database, FutureSchemaError, PreMigrationBackupError,
+                      VaultConflictError)
 from vault_controller import VaultController
 from ui_chrome import WindowChromeMixin
 from ui_shortcuts import ShortcutsMixin
@@ -20,7 +21,7 @@ from ui_account import AccountCardMixin
 from ui_tree import AccountTree, TreeMixin
 import instance_lock
 import util
-from paths import BASE_DIR
+from paths import BASE_DIR, RESOURCE_DIR
 from dialogs import SettingsDialog, RecycleBinDialog, ExportDialog
 from tabs import AccountTabs
 from titlebar import TitleBar, ResizableContainer
@@ -32,7 +33,7 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, AccountCardMixin,
     def __init__(self):
         super().__init__()
         self.config = Config()
-        self.setWindowTitle("ХРАНИЛКА v1.0")
+        self.setWindowTitle("ХРАНИЛКА")
         self.setWindowFlag(Qt.FramelessWindowHint, True)
         self.resize(1200, 700)
         self.setMinimumSize(760, 480)
@@ -106,6 +107,26 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, AccountCardMixin,
         self._restore_geometry()
         self.populate_tree()
 
+        # Обучение при первом запуске — после старта event loop (окно уже
+        # видимо, разблокировка БД завершена выше по __init__).
+        QTimer.singleShot(0, self._maybe_show_welcome)
+
+    def _maybe_show_welcome(self):
+        """Показывает обучение при первом запуске (welcome_shown=False).
+
+        Флаг ставится ДО показа: «увидел один раз — больше не навязываемся»,
+        даже если программа закрылась во время обучения. Показ через open()
+        (window-modal, неблокирующий) — блокирующий exec() в стартовой
+        последовательности повесил бы qasync-цикл и тесты с processEvents.
+        Повторный показ — из настроек (Поведение → «Показать обучение»)."""
+        import ui_welcome
+        if not ui_welcome.should_show(self.config):
+            return
+        self.config.set("welcome_shown", True)
+        self.config.save()
+        dlg = ui_welcome.WelcomeDialog(self.config, self)
+        dlg.open()
+
     def closeEvent(self, event):
         # Аккаунты с несохранёнными правками (+ редактируемый сейчас)
         unsaved = set(self._dirty_ids)
@@ -119,6 +140,19 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, AccountCardMixin,
             ):
                 event.ignore()
                 return
+
+        # H7-01: сначала дождаться in-flight run_async-мутаторов (барьер executor'а)
+        # и запустить flush — иначе последний коммит из фонового потока мог бы
+        # случиться уже ПОСЛЕ wait_idle и остаться несохранённым при закрытии.
+        if not self.db.wait_executor_idle():
+            theme.themed_info(
+                self.config, self, "Операции не завершены",
+                "Фоновые операции с базой ещё идут и не завершились вовремя.\n"
+                "Подождите несколько секунд и закройте окно повторно.",
+            )
+            event.ignore()
+            return
+        self.vault.flush()
 
         # Дождаться завершения фоновой записи, чтобы дальнейшее синхронное
         # сохранение/бэкап не конкурировали с воркером за один файл. Если запись
@@ -596,6 +630,17 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, AccountCardMixin,
             self.vault.shutdown()
             self._instance_lock.release()
             sys.exit(1)
+        except PreMigrationBackupError as e:
+            # Не удалось создать резервную копию перед необратимой правкой схемы
+            # (H7-03): база НЕ тронута. Открытие прерываем с понятным сообщением,
+            # чтобы пользователь освободил место/проверил доступ и повторил.
+            logging.error("Отказ открытия: %s", e)
+            theme.themed_info(
+                self.config, self, "Не удалось подготовить базу", str(e),
+            )
+            self.vault.shutdown()
+            self._instance_lock.release()
+            sys.exit(1)
 
     @staticmethod
     def _read_container_async(path):
@@ -636,19 +681,14 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, AccountCardMixin,
                 return True
 
             # Чтение зашифрованного контейнера (может быть крупным) выносим в
-            # фоновый поток и запускаем ДО построения диалога (H-9): тяжёлое
-            # чтение файла перекрывается с созданием/темизацией UnlockDialog и не
-            # блокирует UI-поток в __init__ (event-loop qasync ещё не запущен,
-            # поэтому используем поток, а не run_in_executor). Результат ждём перед
-            # самим показом — попытка разблокировки без контейнера невозможна.
+            # фоновый поток и запускаем ДО построения диалога (H-9/M7-06). Future
+            # передаём в сам диалог: он показывается МОМЕНТАЛЬНО, а тяжёлое чтение
+            # файла перекрывается вводом пароля. Байты берутся лениво, лишь при
+            # первой попытке разблокировки (там же всплывёт OSError чтения). На
+            # повторной итерации цикла создаётся свежий future.
             reader = self._read_container_async(self.db.db_path)
             dlg = UnlockDialog(self.config, b"", parent)
-            try:
-                dlg._container = reader.result()
-            except OSError as e:
-                theme.themed_info(self.config, parent, "Ошибка",
-                                  f"Не удалось прочитать файл базы:\n{e}")
-                return False
+            dlg.set_container_future(reader)
             dlg.exec()
 
             if dlg.result_data is not None:
@@ -718,6 +758,18 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, AccountCardMixin,
         зашифрованным — тогда _open_database спросит пароль)."""
         import os
         from pathlib import Path
+        # H7-01: перед закрытием БД гарантируем, что последние изменения попали в
+        # ФАЙЛ (иначе restore незаметно потерял бы их в шифр. режиме). Порядок важен:
+        #   1) барьер executor'а — дожидаемся всех in-flight run_async-мутаторов; они,
+        #      закоммитив, помечают БД грязной (иначе коммит мог бы случиться уже
+        #      ПОСЛЕ wait_idle и остался бы несохранённым);
+        #   2) синхронный flush — запускает запись, если БД грязная (в т.ч. когда
+        #      сброс был лишь запланирован через QTimer, но ещё не стартовал);
+        #   3) wait_idle — дожидаемся завершения самой фоновой записи.
+        if not self.db.wait_executor_idle():
+            return False, ("Фоновые операции с базой не завершились вовремя.\n"
+                           "Повторите попытку через несколько секунд.")
+        self.vault.flush()
         if not self.vault.wait_idle():
             return False, ("Фоновое сохранение базы не завершилось вовремя.\n"
                            "Повторите попытку через несколько секунд.")
@@ -840,6 +892,15 @@ if __name__ == "__main__":
     )
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+
+    app_icon = QIcon()
+    for size in (16, 32, 48, 64, 128, 256):
+        app_icon.addFile(str(RESOURCE_DIR / "assets" / f"icon_{size}.png"))
+    app.setWindowIcon(app_icon)
+
+    if sys.platform == "win32":
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Hranilka.App")
     # Backstop против «decompression bomb» при декодировании (M3-05): ограничиваем
     # объём памяти на одно изображение. 256 МБ вмещают допустимые ~50 Мп (RGBA
     # ≈200 МБ), но отсекают аномально большие картинки из БД/бэкапа.
