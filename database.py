@@ -22,7 +22,7 @@ from util import best_effort_wipe
 #     актуальна — миграция/дедуп пропускаются).
 # v7: канонизация связей — хранить только пары (min,max) и закрепить инвариант
 #     CHECK(account_id < linked_account_id) пересборкой таблицы linked_accounts.
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 # Обязательные таблицы актуальной схемы. На «быстром пути» create_tables() даже
 # при совпадении версии проверяет их наличие (M6-06): частично повреждённую базу
@@ -548,6 +548,7 @@ class Database:
             CREATE TABLE IF NOT EXISTS personal_data (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 account_id INTEGER NOT NULL,
+                mobile_phone TEXT,
                 first_name TEXT,
                 last_name TEXT,
                 middle_name TEXT,
@@ -699,6 +700,9 @@ class Database:
             "sort_order": "INTEGER DEFAULT 0",
             "deleted_at": "TIMESTAMP",
         },
+        "personal_data": {
+            "mobile_phone": "TEXT",
+        },
     }
 
     def _get_columns(self, table):
@@ -721,8 +725,9 @@ class Database:
         повреждённая (но с актуальной версией) база не будет принята слепо: при
         несовпадении отпечатка вызыватель пройдёт путь восстановления схемы.
         Дёшево — несколько PRAGMA/чтений sqlite_master, без сканирования данных."""
-        if not self._EXPECTED_COLUMNS["accounts"].keys() <= self._get_columns("accounts"):
-            return False
+        for table, columns in self._EXPECTED_COLUMNS.items():
+            if not columns.keys() <= self._get_columns(table):
+                return False
         self.cursor.execute(
             "SELECT name FROM sqlite_master WHERE type='index'")
         indexes = {row["name"] for row in self.cursor.fetchall()}
@@ -1690,7 +1695,8 @@ class Database:
         prow = self.cursor.fetchone()
         personal = {
             k: (prow[k] if prow else None)
-            for k in ("first_name", "last_name", "middle_name", "birth_date", "address")
+            for k in ("mobile_phone", "first_name", "last_name", "middle_name",
+                      "birth_date", "address")
         }
 
         self.cursor.execute(
@@ -1823,10 +1829,11 @@ class Database:
         self.cursor.execute("DELETE FROM personal_data WHERE account_id = ?", (account_id,))
         self.cursor.execute(
             """INSERT INTO personal_data
-               (account_id, first_name, last_name, middle_name, birth_date, address)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (account_id, p["first_name"], p["last_name"], p["middle_name"],
-             p["birth_date"], p["address"]),
+               (account_id, mobile_phone, first_name, last_name, middle_name,
+                birth_date, address)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (account_id, p.get("mobile_phone"), p["first_name"], p["last_name"],
+             p["middle_name"], p["birth_date"], p["address"]),
         )
 
         self.cursor.execute("DELETE FROM secret_questions WHERE account_id = ?", (account_id,))
@@ -1990,7 +1997,8 @@ class Database:
         field_keys = ("account_name", "url", "login", "password", "creation_date",
                       "password_changed_date", "password_change_interval_days",
                       "notes", "ip", "browser", "os", "extra_info")
-        personal_keys = ("first_name", "last_name", "middle_name", "birth_date", "address")
+        personal_keys = ("mobile_phone", "first_name", "last_name", "middle_name",
+                         "birth_date", "address")
 
         for chunk in self._chunks(account_ids):
             ph = ",".join("?" * len(chunk))

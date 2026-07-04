@@ -64,7 +64,7 @@ class AccountCardMixin:
             # ручную правку (при следующем switch попадёт в _stash_current_edits).
             self.tabs.f_gallery_widget.add_item(data, desc)
             self._dirty_ids.add(account_id)
-            self._refresh_dirty_markers()
+            self._refresh_dirty_markers(account_id)
             return
         # Ушли на другую карточку/заглушку (или карточка не в правке) — картинку
         # кладём в черновик правок, чтобы она не потерялась вне режима правки.
@@ -72,7 +72,7 @@ class AccountCardMixin:
             self._edit_cache[account_id]["storage"]["gallery"].append(
                 {"desc": desc, "data": data, "image_id": None, "blob_size": None})
             self._dirty_ids.add(account_id)
-            self._refresh_dirty_markers()
+            self._refresh_dirty_markers(account_id)
             return
         # Черновика ещё нет (edge: пользователь не редактировал этот аккаунт —
         # кнопки загрузки видны только в правке, но карточку могли сменить сразу).
@@ -101,7 +101,7 @@ class AccountCardMixin:
         if account_id == self._current_account_id and self.is_editing:
             self.tabs.f_gallery_widget.add_item(data, desc)
             self._dirty_ids.add(account_id)
-            self._refresh_dirty_markers()
+            self._refresh_dirty_markers(account_id)
             return
         if account_id in self._edit_cache:
             self._edit_cache[account_id]["storage"]["gallery"].append(
@@ -128,7 +128,7 @@ class AccountCardMixin:
             self._edit_cache[account_id] = {
                 "storage": acc.to_storage(), "links": link_ids}
         self._dirty_ids.add(account_id)
-        self._refresh_dirty_markers()
+        self._refresh_dirty_markers(account_id)
 
     def _quiesce_card_async(self):
         """Погасить весь незавершённый async карточки и галереи ПЕРЕД сменой сессии
@@ -163,7 +163,7 @@ class AccountCardMixin:
         if (self.is_editing and self._current_account_id is not None
                 and self._current_account_id != new_id):
             self._stash_current_edits(self._current_account_id)
-            self._refresh_dirty_markers()
+            self._refresh_dirty_markers(self._current_account_id)
 
         # Новое поколение карточки: любой ещё не завершённый async-результат для
         # прежнего аккаунта теперь устарел и не должен трогать UI/кеш.
@@ -282,6 +282,7 @@ class AccountCardMixin:
         d.notes = notes
         d.login = self.tabs.f_login.get_text()
         d.password = new_password
+        d.mobile_phone = self.tabs.f_mobile.get_text()
         d.first_name = self.tabs.f_first.get_text()
         d.last_name = self.tabs.f_last.get_text()
         d.middle_name = self.tabs.f_middle.get_text()
@@ -319,8 +320,14 @@ class AccountCardMixin:
         }
         self._dirty_ids.add(account_id)
 
-    def _refresh_dirty_markers(self):
-        """Обновляет подписи и выделение элементов (метка несохранённых правок)."""
+    def _refresh_dirty_markers(self, account_id=None):
+        """Обновляет подписи и выделение элементов (метка несохранённых правок).
+
+        С account_id — точечно, один элемент (обычный случай: сменился статус
+        одного аккаунта). Без аргумента или если элемент не найден — полный
+        обход, как раньше (безопасный fallback)."""
+        if account_id is not None and self._refresh_account_item(account_id):
+            return
         for it in self._iter_items():
             self._apply_item_style(it, self._node(it))
 
@@ -334,6 +341,7 @@ class AccountCardMixin:
         self.tabs.f_notes.set_text(d.notes)
         self.tabs.f_login.set_text(d.login)
         self.tabs.f_password.set_text(d.password)
+        self.tabs.f_mobile.set_text(d.mobile_phone)
         self.tabs.f_first.set_text(d.first_name)
         self.tabs.f_last.set_text(d.last_name)
         self.tabs.f_middle.set_text(d.middle_name)
@@ -429,7 +437,10 @@ class AccountCardMixin:
             self.save_btn.hide()
             self.cancel_btn.hide()
             self._update_status_info()
-            self._reload_tree()  # убрать метку несохранённых правок
+            # Убрать метку несохранённых правок — точечно, только у этого
+            # аккаунта; имя/порядок в дереве отмена не меняет.
+            if not self._refresh_account_item(aid):
+                self._reload_tree()
         except StaleSessionError:
             return                               # БД закрыта/сменена — молча
         except Exception as e:                   # noqa: BLE001
@@ -484,7 +495,7 @@ class AccountCardMixin:
                 # editable — пользователь остаётся в режиме правки (H65-01).
                 self._edit_cache[aid] = {"storage": storage, "links": link_ids}
                 self._dirty_ids.add(aid)
-                self._refresh_dirty_markers()
+                self._refresh_dirty_markers(aid)
                 self.tabs.set_all_editable(True)
                 self._show_card_error("Не удалось сохранить аккаунт", e)
                 self._set_card_busy(False)
@@ -505,8 +516,10 @@ class AccountCardMixin:
             self.save_btn.hide()
             self.cancel_btn.hide()
             self._set_card_busy(False)
-        # Перестраиваем дерево, чтобы обновить имя/маркеры (избранное, срок пароля)
-        self._reload_tree()
+        # Обновляем узел дерева точечно (имя, метка срока пароля, снятие
+        # маркера правок); полная перестройка — только если сохранение могло
+        # изменить порядок сортировки (внутри метода).
+        self._update_account_item_after_save(aid, storage["fields"])
         self.statusBar().showMessage("СОХРАНЕНО!", 2000)
 
     def generate_password(self):

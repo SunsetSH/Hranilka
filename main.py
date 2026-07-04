@@ -371,7 +371,7 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, AccountCardMixin,
         # Подключаем ВСЕ сигналы копирования к статус-бару
         copy_fields = [
             self.tabs.f_name, self.tabs.f_url, self.tabs.f_login, self.tabs.f_password,
-            self.tabs.f_first, self.tabs.f_last, self.tabs.f_middle, 
+            self.tabs.f_mobile, self.tabs.f_first, self.tabs.f_last, self.tabs.f_middle,
             self.tabs.f_address, self.tabs.f_device_id, self.tabs.f_ip, 
             self.tabs.f_browser, self.tabs.f_os,
             self.tabs.f_creation_date, self.tabs.f_password_date, self.tabs.f_birth,

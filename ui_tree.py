@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (QTreeWidget, QTreeWidgetItem, QMenu,
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QBrush
 
+import domain
 import theme
 import util
 from database import StaleSessionError
@@ -256,6 +257,62 @@ class TreeMixin:
                 self.tree.setCurrentItem(it)
                 self.current_tree_item = it
         self.tree.blockSignals(False)
+
+    # ----- Точечное обновление узла (без перестройки всего дерева) -----
+
+    def _find_account_item(self, account_id):
+        """Элемент дерева аккаунта по id (или None)."""
+        for it in self._iter_items():
+            node = self._node(it)
+            if node and node["type"] == "account" and node["id"] == account_id:
+                return it
+        return None
+
+    def _refresh_account_item(self, account_id):
+        """Точечно перерисовать узел аккаунта (текст/жирность/маркеры) по его
+        текущему node-словарю. True — элемент найден и обновлён; False —
+        вызывающий должен сделать fallback на _reload_tree()."""
+        item = self._find_account_item(account_id)
+        if item is None:
+            return False
+        self._apply_item_style(item, self._node(item))
+        return True
+
+    def _update_account_item_after_save(self, account_id, fields):
+        """Обновить узел аккаунта после сохранения карточки без полной
+        перестройки дерева. fields — storage["fields"] сохранённой карточки.
+
+        Полная перестройка (_reload_tree) выполняется только когда сохранение
+        могло изменить ПОРЯДОК элементов — сортировка по имени/сроку пароля с
+        изменившимся ключом — либо элемент не найден (безопасный fallback)."""
+        item = self._find_account_item(account_id)
+        if item is None:
+            self._reload_tree()
+            return
+        node = self._node(item)
+        new_name = fields["account_name"]
+        new_days = domain.days_until_password_change(
+            fields["password_changed_date"],
+            fields["password_change_interval_days"])
+        name_changed = node["name"] != new_name
+        order_changed = (
+            (self.sort_mode == "name" and name_changed)
+            or (self.sort_mode == "pwd_due"
+                and node.get("pwd_days_left") != new_days))
+        node.update({
+            "name": new_name,
+            "login": fields["login"],
+            "password_changed_date": fields["password_changed_date"],
+            "password_change_interval_days": fields["password_change_interval_days"],
+            "pwd_days_left": new_days,
+        })
+        item.setData(0, Qt.UserRole, node)
+        item.setToolTip(0, new_name)
+        self._apply_item_style(item, node)
+        if order_changed:
+            self._reload_tree()
+        elif name_changed and self.search_text:
+            self._apply_filter()   # видимость под активным поиском зависит от имени
 
         # Восстановление раскрытия могло «свернуть» совпадения — применяем фильтр снова
         if self.search_text:

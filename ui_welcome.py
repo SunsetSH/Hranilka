@@ -9,8 +9,8 @@ WelcomeDialog — слайды с обзором основных функций
 """
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QFrame, QHBoxLayout, QLabel, QLineEdit, QPushButton, QStackedWidget,
-    QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
+    QCheckBox, QFrame, QHBoxLayout, QLabel, QLineEdit, QPushButton,
+    QStackedWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 import config as config_mod
@@ -28,7 +28,7 @@ class WelcomeDialog(ThemedDialog):
     def __init__(self, config, parent=None):
         super().__init__(config, parent)
         self.setWindowTitle("Обучение")
-        self.setFixedSize(660, 520)
+        self.setFixedSize(660, 580)
 
         self._stack = QStackedWidget()
         for build in (self._slide_welcome, self._slide_tree, self._slide_card,
@@ -108,6 +108,36 @@ class WelcomeDialog(ThemedDialog):
                 c.get("text_color", "#000000"), c.get("tree_bg_color", "#FFFFFF"),
                 c.get("main_bg_color", "#F0F0F0"))
 
+    def _feature_row(self, caption: str, widget: QWidget):
+        """Строка-функция: жирная подпись фиксированной ширины + живой виджет."""
+        row = QHBoxLayout()
+        label = QLabel(caption)
+        font = label.font()
+        font.setBold(True)
+        label.setFont(font)
+        label.setFixedWidth(140)
+        row.addWidget(label)
+        row.addWidget(widget, 1)
+        return row
+
+    @staticmethod
+    def _mock_button(text: str) -> QPushButton:
+        """Кнопка-муляж: выглядит как настоящая, действие — в настоящей карточке."""
+        btn = QPushButton(text)
+        btn.setEnabled(False)
+        btn.setToolTip("Пример — работает в настоящей карточке")
+        return btn
+
+    def _chip(self, text: str) -> QLabel:
+        """Плашка-чип: рамка outset, фон как у дерева."""
+        _, _, text_color, tree_bg, _ = self._theme_colors()
+        chip = QLabel(text)
+        chip.setAlignment(Qt.AlignCenter)
+        chip.setStyleSheet(
+            f"QLabel {{ border: 1px outset #808080; background-color: {tree_bg}; "
+            f"color: {text_color}; padding: 2px 6px; }}")
+        return chip
+
     # ----- Слайды -----
 
     def _slide_welcome(self):
@@ -115,29 +145,47 @@ class WelcomeDialog(ThemedDialog):
             "Добро пожаловать в Хранилку",
             "Хранилка — оффлайн-хаб учётных записей. Все данные лежат в одном "
             "файле на вашем компьютере — никаких облаков и интернета.\n\n"
-            "Это короткое обучение можно закрыть в любой момент (крестик, Esc "
-            "или «Пропустить») и открыть позже: Настройки → Поведение.",
+            "Это короткое обучение можно открыть в любой момент:"
+            "Настройки → Поведение.",
         )
         lay.addStretch()
         title = QLabel("ХРАНИЛКА")
         title.setObjectName("appTitle")
         title.setAlignment(Qt.AlignCenter)
         lay.addWidget(title)
-        strip = QLabel("локально · офлайн · ретро")
-        strip.setAlignment(Qt.AlignCenter)
-        lay.addWidget(strip)
+        chips = QHBoxLayout()
+        chips.addStretch()
+        for text in ("БЕЗ ОБЛАКОВ", "ОДИН ФАЙЛ", "РЕТРО UI"):
+            chips.addWidget(self._chip(text))
+        chips.addStretch()
+        lay.addLayout(chips)
         lay.addStretch()
         return page
 
     def _slide_tree(self):
         page, lay = self._slide(
             "Дерево: папки → сервисы → аккаунты",
-            "Слева — дерево. Папка группирует сервисы, сервис — аккаунты. "
-            "Создавайте узлы через правый клик или кнопки над деревом. "
-            "Ищите по имени, отмечайте избранное (*), меняйте порядок "
-            "перетаскиванием.",
+            "Слева — дерево: папка группирует сервисы, сервис — аккаунты.",
         )
         font_name, font_size, text_color, tree_bg, main_bg = self._theme_colors()
+
+        create_box = QWidget()
+        create_lay = QHBoxLayout(create_box)
+        create_lay.setContentsMargins(0, 0, 0, 0)
+        for text in ("[+Папка]", "[+Сервис]", "[+Аккаунт]"):
+            create_lay.addWidget(self._mock_button(text))
+        create_lay.addStretch()
+        lay.addLayout(self._feature_row("Создание", create_box))
+
+        search_box = QWidget()
+        search_lay = QHBoxLayout(search_box)
+        search_lay.setContentsMargins(0, 0, 0, 0)
+        search = QLineEdit("gmail")
+        search.setReadOnly(True)
+        search.setToolTip("Пример — поиск фильтрует настоящее дерево")
+        search_lay.addWidget(search)
+        lay.addLayout(self._feature_row("Поиск", search_box))
+
         tree = QTreeWidget()
         tree.setHeaderHidden(True)
         tree.setSelectionMode(QTreeWidget.NoSelection)
@@ -153,42 +201,72 @@ class WelcomeDialog(ThemedDialog):
         service = QTreeWidgetItem(folder, ["[o] Gmail"])
         QTreeWidgetItem(service, ["* (i) личный@gmail.com"])
         tree.expandAll()
-        tree.setFixedHeight(140)
+        tree.setFixedHeight(110)
         lay.addWidget(tree)
+        hint = QLabel("* — избранное, отображается сверху при автоматических сортировках"
+                      " · порядок меняется перетаскиванием в контексте одного родителя · ")
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
         lay.addStretch()
         return page
 
     def _slide_card(self):
         page, lay = self._slide(
             "Карточка аккаунта",
-            "Справа — карточка: логин и пароль, секретные вопросы, коды, "
-            "личные данные, галерея изображений и связи между аккаунтами. "
-            "Кнопки [КОП] копируют поле в буфер обмена.\n\n"
-            "Несохранённые правки не теряются при переключении, но помечаются "
-            "в дереве — не забывайте нажимать «Сохранить».",
+            "Справа от дерева — карточка выбранного аккаунта: все данные "
+            "в одном месте, каждое поле копируется кнопкой [КОП].",
         )
-        row = QHBoxLayout()
+        login_box = QWidget()
+        login_lay = QHBoxLayout(login_box)
+        login_lay.setContentsMargins(0, 0, 0, 0)
+        login = QLineEdit("личный@gmail.com")
+        login.setReadOnly(True)
+        login_lay.addWidget(login)
+        login_lay.addWidget(self._mock_button("[КОП]"))
+        lay.addLayout(self._feature_row("Логин", login_box))
+
+        pass_box = QWidget()
+        pass_lay = QHBoxLayout(pass_box)
+        pass_lay.setContentsMargins(0, 0, 0, 0)
         field = QLineEdit("hunter2")
         field.setReadOnly(True)
         field.setEchoMode(QLineEdit.Password)
-        row.addWidget(field)
+        pass_lay.addWidget(field)
         reveal = QPushButton("[*]")
         reveal.setFixedWidth(46)
         reveal.setToolTip("Показать/скрыть")
         reveal.clicked.connect(lambda: field.setEchoMode(
             QLineEdit.Normal if field.echoMode() == QLineEdit.Password
             else QLineEdit.Password))
-        row.addWidget(reveal)
-        copy = QPushButton("[КОП]")
-        copy.setEnabled(False)
-        copy.setToolTip("Пример — копирование работает в настоящей карточке")
-        row.addWidget(copy)
-        lay.addLayout(row)
-        marker = QLabel("● НЕ СОХРАНЕНО ▸ (i) личный@gmail.com")
+        pass_lay.addWidget(reveal)
+        pass_lay.addWidget(self._mock_button("[КОП]"))
+        lay.addLayout(self._feature_row("Пароль", pass_box))
+
+        tabs_box = QWidget()
+        tabs_lay = QHBoxLayout(tabs_box)
+        tabs_lay.setContentsMargins(0, 0, 0, 0)
+        tabs_lay.setSpacing(4)
+        for name in ("Данные входа", "Связь аккаунтов", "Коды и секреты", "Галерея", "Телеметрия"):
+            tabs_lay.addWidget(self._chip(name))
+        tabs_lay.addStretch()
+        lay.addLayout(self._feature_row("Можно хранить", tabs_box))
+
+        edits_box = QWidget()
+        edits_lay = QHBoxLayout(edits_box)
+        edits_lay.setContentsMargins(0, 0, 0, 0)
+        marker = QLabel("● НЕ СОХРАНЕНО")
         marker_font = marker.font()
         marker_font.setBold(True)
         marker.setFont(marker_font)
-        lay.addWidget(marker)
+        edits_lay.addWidget(marker)
+        edits_lay.addStretch()
+        edits_lay.addWidget(self._mock_button("Сохранить"))
+        lay.addLayout(self._feature_row("Правки", edits_box))
+
+        hint = QLabel("Несохранённые правки не теряются при переключении, "
+                      "но помечаются в дереве до нажатия «Сохранить».")
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
         lay.addStretch()
         return page
 
@@ -196,10 +274,7 @@ class WelcomeDialog(ThemedDialog):
         page, lay = self._slide(
             "Защитите свои данные",
             "ВАЖНО: по умолчанию шифрование ВЫКЛЮЧЕНО — файл базы прочитает "
-            "любой, кто до него доберётся. Для настоящих секретов включите "
-            "мастер-пароль: Настройки → Безопасность.\n\n"
-            "Там же: код восстановления (показывается один раз!), "
-            "автоблокировка, автоочистка буфера обмена и защита от скриншотов.",
+            "любой, кто до него доберётся.",
         )
         _, _, text_color, tree_bg, _ = self._theme_colors()
         panel = QFrame()
@@ -213,39 +288,93 @@ class WelcomeDialog(ThemedDialog):
         warn.setWordWrap(True)
         panel_lay.addWidget(warn, 1)
         lay.addWidget(panel)
+
+        for text, tip in (
+            ("Мастер-пароль — шифрует файл базы",
+             "Включается в Настройки → Безопасность"),
+            ("Автоблокировка — при простое",
+             "Программа сама запирается без вас"),
+            ("Автоочистка буфера — скопированное не остаётся",
+             "Пароль не висит в буфере обмена"),
+            ("Защита от скриншотов",
+             "Окно не попадает в снимки экрана"),
+        ):
+            box = QCheckBox(text)
+            box.setChecked(True)
+            box.setEnabled(False)
+            box.setToolTip(tip)
+            lay.addWidget(box)
+
+        recovery = QLabel("[!] Код восстановления показывается ОДИН раз — "
+                          "сохраните его.")
+        recovery_font = recovery.font()
+        recovery_font.setBold(True)
+        recovery.setFont(recovery_font)
+        recovery.setWordWrap(True)
+        lay.addWidget(recovery)
+        lay.addWidget(QLabel("Все переключатели: Настройки → Безопасность."))
         lay.addStretch()
         return page
 
     def _slide_tools(self):
         page, lay = self._slide(
             "Инструменты",
-            "Встроенный генератор создаёт стойкие пароли и тестовые личные "
-            "данные (РУ/США). Метка [!] в дереве напоминает сменить "
-            "устаревший пароль. Экспорт — в TXT/CSV/XLSX/HTML; удалённое "
-            "попадает в корзину (если включена).",
+            "Генераторы, напоминания и экспорт — всё встроено.",
         )
-        row = QHBoxLayout()
+        pass_box = QWidget()
+        pass_lay = QHBoxLayout(pass_box)
+        pass_lay.setContentsMargins(0, 0, 0, 0)
         sample = QLineEdit("Kq7#vR2$wLx9")
         sample.setReadOnly(True)
-        row.addWidget(sample)
-        gen = QPushButton("Сгенерировать")
-        gen.setEnabled(False)
-        gen.setToolTip("Пример — генератор работает в настоящей карточке")
-        row.addWidget(gen)
-        lay.addLayout(row)
-        lay.addWidget(QLabel("(i) личный@gmail.com  [!]  ← пора менять пароль"))
+        pass_lay.addWidget(sample)
+        pass_lay.addWidget(self._mock_button("Сгенерировать"))
+        lay.addLayout(self._feature_row("Пароль", pass_box))
+
+        pd_box = QWidget()
+        pd_lay = QHBoxLayout(pd_box)
+        pd_lay.setContentsMargins(0, 0, 0, 0)
+        pd = QLineEdit("Менделеев Дмитрий Иванович, 27.01.1834,+ адрес! ")
+        pd.setReadOnly(True)
+        pd.setToolTip("Тестовые личные данные для регистраций")
+        pd_lay.addWidget(pd)
+        pd_lay.addWidget(self._chip("РУ"))
+        pd_lay.addWidget(self._chip("США"))
+        lay.addLayout(self._feature_row("Личные данные", pd_box))
+
+        stale = QLabel("(i) личный@gmail.com  [!]  ← пора менять пароль")
+        lay.addLayout(self._feature_row("Напоминание", stale))
+
+        export_box = QWidget()
+        export_lay = QHBoxLayout(export_box)
+        export_lay.setContentsMargins(0, 0, 0, 0)
+        for fmt in ("TXT", "CSV", "XLSX", "HTML"):
+            export_lay.addWidget(self._mock_button(f"[{fmt}]"))
+        export_lay.addStretch()
+        lay.addLayout(self._feature_row("Экспорт", export_box))
+
+        hint = QLabel("Удалённое попадает в корзину (если включена) — "
+                      "его можно вернуть.")
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+        bin_box = QCheckBox("Удалять в корзину")
+        bin_box.setChecked(self.config.get("recycle_bin_enabled", False))
+        bin_box.setEnabled(False)
+        bin_box.setToolTip("Пример — настоящий переключатель: "
+                           "Настройки → Поведение")
+        lay.addWidget(bin_box)
         lay.addStretch()
         return page
 
     def _slide_final(self):
         page, lay = self._slide(
             "Настройте под себя",
-            "8 ретро-тем, свой шрифт и цвета — Настройки → Внешний вид. "
-            "Горячие клавиши перечислены в Настройки → Шорткаты.\n\n"
-            "Готово: создайте первую папку — и вперёд.",
+            "Темы, свой шрифт и цвета — Настройки → Внешний вид.",
         )
-        _, _, text_color, _, _ = self._theme_colors()
-        swatches = QHBoxLayout()
+        _, _, text_color, tree_bg, _ = self._theme_colors()
+
+        swatch_box = QWidget()
+        swatches = QHBoxLayout(swatch_box)
+        swatches.setContentsMargins(0, 0, 0, 0)
         for theme_name, colors in config_mod.RETRO_THEMES.items():
             square = QFrame()
             square.setFixedSize(18, 18)
@@ -253,9 +382,28 @@ class WelcomeDialog(ThemedDialog):
             square.setStyleSheet(f"background-color: {colors['main_bg']}; "
                                  f"border: 1px solid {text_color};")
             swatches.addWidget(square)
-        swatches.addStretch()
-        lay.addLayout(swatches)
         current = self.config.get("selected_theme", "")
-        lay.addWidget(QLabel(f"Текущая тема: {current}"))
+        swatches.addWidget(QLabel(f"← текущая: {current}"))
+        swatches.addStretch()
+        lay.addLayout(self._feature_row("Темы", swatch_box))
+
+        keys = QFrame()
+        keys.setStyleSheet(
+            f"QFrame {{ border: 2px inset #808080; background-color: {tree_bg}; }}"
+            f"QLabel {{ border: none; color: {text_color}; }}"
+        )
+        keys_lay = QVBoxLayout(keys)
+        for line in ("Ctrl+F — перейти к поиску", "Ctrl+S — сохранить аккаунт",
+                     "Ctrl+N — создать аккаунт"):
+            keys_lay.addWidget(QLabel(line))
+        lay.addLayout(self._feature_row("Шорткаты", keys))
+        lay.addWidget(QLabel("Полный список и переназначение: "
+                             "Настройки → Шорткаты."))
+
+        ready = QLabel("Готово: создайте первую папку — и вперёд.")
+        ready_font = ready.font()
+        ready_font.setBold(True)
+        ready.setFont(ready_font)
+        lay.addWidget(ready)
         lay.addStretch()
         return page

@@ -18,6 +18,7 @@ class AccountData:
         self.notes = ""
         self.login = ""
         self.password = ""
+        self.mobile_phone = ""
         self.first_name = ""
         self.last_name = ""
         self.middle_name = ""
@@ -90,6 +91,7 @@ class AccountData:
                 "extra_info": self.extra_info,
             },
             "personal": {
+                "mobile_phone": self.mobile_phone,
                 "first_name": self.first_name,
                 "last_name": self.last_name,
                 "middle_name": self.middle_name,
@@ -132,6 +134,7 @@ class AccountData:
         d.extra_info = f.get("extra_info") or ""
 
         p = storage["personal"]
+        d.mobile_phone = p.get("mobile_phone") or ""
         d.first_name = p.get("first_name") or ""
         d.last_name = p.get("last_name") or ""
         d.middle_name = p.get("middle_name") or ""

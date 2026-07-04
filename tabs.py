@@ -74,6 +74,7 @@ class AccountTabs(WrappingTabWidget):
         l = QVBoxLayout(w)
         l.setSpacing(10)
         l.setContentsMargins(0, 8, 0, 0)
+        self.f_mobile = CopyableField()
         self.f_first = CopyableField()
         self.f_last = CopyableField()
         self.f_middle = CopyableField()
@@ -81,6 +82,8 @@ class AccountTabs(WrappingTabWidget):
         self.f_address = CopyableField()
         self.gen_pd_btn = QPushButton("СГЕНЕРИРОВАТЬ (RU/EN)")
 
+        l.addWidget(heading_label("Мобильный номер:"))
+        l.addWidget(self.f_mobile)
         l.addWidget(heading_label("Имя:"))
         l.addWidget(self.f_first)
         l.addWidget(heading_label("Фамилия:"))
@@ -167,8 +170,9 @@ class AccountTabs(WrappingTabWidget):
 
     def set_all_editable(self, editable):
         fields = [self.f_name, self.f_url, self.f_login, self.f_password,
-                  self.f_first, self.f_last, self.f_middle, self.f_address,
-                  self.f_device_id, self.f_ip, self.f_browser, self.f_os]
+                  self.f_mobile, self.f_first, self.f_last, self.f_middle,
+                  self.f_address, self.f_device_id, self.f_ip, self.f_browser,
+                  self.f_os]
         for f in fields:
             f.set_editable(editable)
 
