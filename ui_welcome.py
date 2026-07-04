@@ -333,7 +333,7 @@ class WelcomeDialog(ThemedDialog):
         pd_box = QWidget()
         pd_lay = QHBoxLayout(pd_box)
         pd_lay.setContentsMargins(0, 0, 0, 0)
-        pd = QLineEdit("Менделеев Дмитрий Иванович, 27.01.1834,+ адрес! ")
+        pd = QLineEdit("Менделеев Дмитрий, 27.01.1834,+ адрес! ")
         pd.setReadOnly(True)
         pd.setToolTip("Тестовые личные данные для регистраций")
         pd_lay.addWidget(pd)
