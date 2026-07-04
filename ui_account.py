@@ -159,6 +159,12 @@ class AccountCardMixin:
         node = self._node(current)
         new_id = node["id"] if (node and node["type"] == "account") else None
 
+        # Одноразовый флаг «открыть в правке» действует только для своего
+        # аккаунта: ушли на другой узел — гасим, чтобы правка не включилась
+        # позже на чужой карточке.
+        if self._edit_on_load_id is not None and self._edit_on_load_id != new_id:
+            self._edit_on_load_id = None
+
         # Уходим с аккаунта, который сейчас редактируется → стэшим правки (не теряем их)
         if (self.is_editing and self._current_account_id is not None
                 and self._current_account_id != new_id):
@@ -236,6 +242,14 @@ class AccountCardMixin:
                 self.load_data_to_ui(links=links, other_bytes=other_bytes)
                 self.tabs.set_all_editable(False)
                 self.edit_btn.show(); self.save_btn.hide(); self.cancel_btn.hide()
+                if self._edit_on_load_id == new_id:
+                    # Только что созданный аккаунт — сразу в режим правки.
+                    # Карточка уже в БД; это UI-переключение ПОСЛЕ полной
+                    # загрузки (gen сверен выше), гонок с async нет.
+                    self._edit_on_load_id = None
+                    self.is_editing = True
+                    self.tabs.set_all_editable(True)
+                    self.edit_btn.hide(); self.save_btn.show(); self.cancel_btn.show()
 
             self._update_status_info()
             self._warn_password_due(new_id)

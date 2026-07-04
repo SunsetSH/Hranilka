@@ -2,10 +2,11 @@ import os
 import asyncio
 import logging
 from PySide6.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QLineEdit,
-                               QPushButton, QLabel, QDateEdit, QDateTimeEdit,
+                               QPushButton, QLabel,
                                QTextEdit, QFileDialog, QDialog, QMessageBox,
                                QApplication, QSpinBox, QMenu)
-from PySide6.QtCore import Signal, Qt, QDate, QByteArray, QBuffer, QIODevice
+from PySide6.QtCore import (Signal, Qt, QDate, QDateTime, QTime, QByteArray,
+                            QBuffer, QIODevice)
 from PySide6.QtGui import QPixmap, QImage, QImageReader
 import shiboken6
 from theme import themed_info, themed_confirm, mix
@@ -112,79 +113,79 @@ class CopyableField(QWidget):
                 self.reveal_btn.setVisible(True)
 
 class CopyableDateField(QWidget):
+    """Поле даты с маской ввода дд.мм.гггг (+ чч:мм для is_datetime).
+
+    Обычная строка с маской вместо QDateEdit: без календаря и стрелок.
+    Поведение маски Qt — как режим Ins: цифра перезаписывает позицию под
+    курсором (курсор можно ставить в любое место), Backspace очищает символ,
+    точки/двоеточие фиксированы. Пустое или недописанное значение = «не
+    задано» (None) — как и раньше, дата не подменяется сегодняшним числом.
+    """
     copy_signal = Signal()
-    
+
     def __init__(self, is_datetime=False, parent=None):
         super().__init__(parent)
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(5)
-        
-        self._is_datetime = is_datetime
-        if is_datetime:
-            self.date_widget = QDateTimeEdit()
-            self.date_widget.setDisplayFormat("yyyy-MM-dd HH:mm")
-            self.format = "yyyy-MM-dd HH:mm"
-        else:
-            self.date_widget = QDateEdit()
-            self.date_widget.setDisplayFormat("yyyy-MM-dd")
-            self.format = "yyyy-MM-dd"
 
-        # Календарь-попап для удобного выбора даты; ввод цифрами с клавиатуры
-        # заменяет значение в активной секции (поведение QDateTimeEdit по умолчанию).
-        self.date_widget.setCalendarPopup(True)
+        self._is_datetime = is_datetime
+        self.format = "dd.MM.yyyy HH:mm" if is_datetime else "dd.MM.yyyy"
+
+        self.date_widget = QLineEdit()
+        # «0» — необязательная цифра: допускает частично заполненное поле.
+        self.date_widget.setInputMask("00.00.0000 00:00" if is_datetime
+                                      else "00.00.0000")
+        self.date_widget.setToolTip("Формат: дд.мм.гггг чч:мм" if is_datetime
+                                    else "Формат: дд.мм.гггг")
         self.date_widget.setReadOnly(True)
-        # «Не задано»: минимально возможное значение показываем как пустое, чтобы
-        # отсутствие даты не подменялось сегодняшним числом (ложные данные).
-        self.date_widget.setSpecialValueText("не задано")
         layout.addWidget(self.date_widget)
-        
+
         self.copy_btn = QPushButton("[КОП]")
         self.copy_btn.setFixedWidth(60)
         self.copy_btn.clicked.connect(self.do_copy)
         layout.addWidget(self.copy_btn)
-        
+
     def do_copy(self):
-        if self._is_unset():
+        dt = self.get_date()
+        if dt is None:
             return
-        text = self.date_widget.dateTime().toString(self.format)
-        if text:
-            QApplication.clipboard().setText(text)
-            self.copy_signal.emit()
-
-    def _is_unset(self):
-        """True, если показано «не задано» (значение равно минимальному)."""
-        if self._is_datetime:
-            return self.date_widget.dateTime() == self.date_widget.minimumDateTime()
-        return self.date_widget.date() == self.date_widget.minimumDate()
-
-    def _set_unset(self):
-        if self._is_datetime:
-            self.date_widget.setDateTime(self.date_widget.minimumDateTime())
-        else:
-            self.date_widget.setDate(self.date_widget.minimumDate())
+        QApplication.clipboard().setText(dt.toString(self.format))
+        self.copy_signal.emit()
 
     def set_date(self, date):
         """Принимает QDate, QDateTime, None или строку. None/пусто → «не задано»."""
-        from PySide6.QtCore import QTime, QDateTime
-        if date is None:
-            self._set_unset()
-        elif isinstance(date, QDateTime):
-            self.date_widget.setDateTime(date)
-        elif hasattr(date, 'year'):  # QDate
+        if isinstance(date, QDateTime):
+            self.date_widget.setText(date.toString(self.format))
+        elif isinstance(date, QDate):
             if self._is_datetime:
-                self.date_widget.setDateTime(QDateTime(date, QTime(0, 0)))
+                self.date_widget.setText(
+                    QDateTime(date, QTime(0, 0)).toString(self.format))
             else:
-                self.date_widget.setDate(date)
+                self.date_widget.setText(date.toString(self.format))
         else:
-            # Неизвестный формат — считаем «не задано», а не «сегодня».
-            self._set_unset()
+            # None или неизвестный формат — «не задано», а не «сегодня».
+            self.date_widget.setText("")
 
     def get_date(self):
-        """QDateTime или None, если дата не задана."""
-        if self._is_unset():
+        """QDateTime или None, если дата не задана/не дописана.
+
+        Для is_datetime незаполненное время считается 00:00 — дата без
+        времени не должна пропадать при сохранении."""
+        raw = self.date_widget.text()          # маска: пусто = "..[ :]"
+        date_part = raw[:10].strip(" .")
+        if not date_part:
             return None
-        return self.date_widget.dateTime()
+        d = QDate.fromString(raw[:10], "dd.MM.yyyy")
+        if not d.isValid():
+            return None
+        t = QTime(0, 0)
+        if self._is_datetime:
+            parsed = QTime.fromString(raw[11:16], "HH:mm")
+            if parsed.isValid():
+                t = parsed
+        return QDateTime(d, t)
+
     def set_editable(self, editable):
         self.date_widget.setReadOnly(not editable)
         self.copy_btn.setVisible(not editable)

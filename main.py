@@ -85,6 +85,9 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, AccountCardMixin,
         # трогает UI/кеш чужого аккаунта (H6-01/H6-02).
         self._card_gen = 0
         self._card_busy = False              # идёт async-загрузка/сохранение карточки
+        # id только что созданного аккаунта: его карточка после загрузки сразу
+        # открывается в режиме правки (одноразовый флаг, см. _load_account_into_ui)
+        self._edit_on_load_id = None
 
         # Таймер авто-очистки буфера обмена
         self._clip_timer = QTimer(self)

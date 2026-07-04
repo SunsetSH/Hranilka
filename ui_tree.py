@@ -649,4 +649,8 @@ class TreeMixin:
             return
         self._any_db_changes = True
         self._reload_tree()
+        # Новый аккаунт сразу открываем в режиме правки: карточка уже записана
+        # в БД (add_account_with_card, одна транзакция), поэтому включение
+        # правки — чисто UI-переключение после завершения async-загрузки.
+        self._edit_on_load_id = account_id
         self._select_node("account", account_id)
