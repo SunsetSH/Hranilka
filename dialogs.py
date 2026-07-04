@@ -816,10 +816,14 @@ class SettingsDialog(ThemedDialog):
         self.thumb_preload_combo.setCurrentIndex(
             self._thumb_preload_index(self.config.get("gallery_thumb_preload", "startup")))
         gf2.addRow("Предзагрузка миниатюр в галерее:", self.thumb_preload_combo)
-        gf2.addRow("", QLabel(
-            "«При запуске» подгружает все миниатюры сразу — быстрее просмотр,\n"
-            "но весь объём изображений аккаунта держится в ОЗУ. «По нажатию»\n"
-            "читает изображение только при клике — меньше нагрузка на память."))
+        # Однострочный addRow: подсказка занимает обе колонки формы (на всю
+        # ширину окна), иначе текст начинается от комбобокса и обрезается.
+        thumb_hint = QLabel(
+            "«При запуске» подгружает все миниатюры сразу — быстрее просмотр, "
+            "но весь объём изображений аккаунта держится в ОЗУ. «По нажатию» "
+            "читает изображение только при клике — меньше нагрузка на память.")
+        thumb_hint.setWordWrap(True)
+        gf2.addRow(thumb_hint)
         lay.addWidget(gal_group)
 
         help_group = QGroupBox("Обучение")
