@@ -9,14 +9,14 @@ import logging
 from PySide6.QtCore import QDate, QDateTime
 from PySide6.QtWidgets import QDialog
 
-from database import StaleSessionError
-from models import AccountData
-from ui_generator import GeneratorSettingsDialog
-import password_gen
-import pd_generator
-import util
-import domain
-import theme
+from hranilka.data.database import StaleSessionError
+from hranilka.data.models import AccountData
+from hranilka.ui.generator_dialog import GeneratorSettingsDialog
+from hranilka.generators import password_gen
+from hranilka.generators import pd_generator
+from hranilka import util
+from hranilka import domain
+from hranilka.ui import theme
 
 
 class AccountCardMixin:

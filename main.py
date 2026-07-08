@@ -9,23 +9,23 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QSplitter, QLabel,
                                QComboBox, QAbstractItemView)
 from PySide6.QtCore import Qt, QTimer, QDateTime
 from PySide6.QtGui import QFont, QImageReader, QIcon
-import backup as bk
+from hranilka.data import backup as bk
 
-from config import Config
-from database import (Database, FutureSchemaError, PreMigrationBackupError,
+from hranilka.config import Config
+from hranilka.data.database import (Database, FutureSchemaError, PreMigrationBackupError,
                       VaultConflictError)
-from vault_controller import VaultController
-from ui_chrome import WindowChromeMixin
-from ui_shortcuts import ShortcutsMixin
-from ui_account import AccountCardMixin
-from ui_tree import AccountTree, TreeMixin
-import instance_lock
-import util
-from paths import BASE_DIR, RESOURCE_DIR
-from dialogs import SettingsDialog, RecycleBinDialog, ExportDialog
-from tabs import AccountTabs
-from titlebar import TitleBar, ResizableContainer
-import theme
+from hranilka.ui.vault_controller import VaultController
+from hranilka.ui.chrome import WindowChromeMixin
+from hranilka.ui.shortcuts_mixin import ShortcutsMixin
+from hranilka.ui.account_card import AccountCardMixin
+from hranilka.ui.tree import AccountTree, TreeMixin
+from hranilka import instance_lock
+from hranilka import util
+from hranilka.paths import BASE_DIR, RESOURCE_DIR
+from hranilka.ui.dialogs import SettingsDialog, RecycleBinDialog, ExportDialog
+from hranilka.ui.tabs import AccountTabs
+from hranilka.ui.titlebar import TitleBar, ResizableContainer
+from hranilka.ui import theme
 
 
 class MainWindow(WindowChromeMixin, ShortcutsMixin, AccountCardMixin,
@@ -122,7 +122,7 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, AccountCardMixin,
         (window-modal, неблокирующий) — блокирующий exec() в стартовой
         последовательности повесил бы qasync-цикл и тесты с processEvents.
         Повторный показ — из настроек (Поведение → «Показать обучение»)."""
-        import ui_welcome
+        from hranilka.ui import welcome as ui_welcome
         if not ui_welcome.should_show(self.config):
             return
         self.config.set("welcome_shown", True)
@@ -676,8 +676,8 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, AccountCardMixin,
         _open_and_validate_after_restore с откатом при restore). Так один и тот же
         опенер годится и для сценариев, где ошибку схемы нужно откатить, а не
         завершать программу (H65-05)."""
-        import crypto_store as cs
-        from dialogs import UnlockDialog
+        from hranilka.crypto import store as cs
+        from hranilka.ui.dialogs import UnlockDialog
         while True:
             if not cs.is_encrypted_file(self.db.db_path):
                 self.db.connect()

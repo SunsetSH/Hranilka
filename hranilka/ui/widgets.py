@@ -9,8 +9,8 @@ from PySide6.QtCore import (Signal, Qt, QDate, QDateTime, QTime, QByteArray,
                             QBuffer, QIODevice)
 from PySide6.QtGui import QPixmap, QImage, QImageReader
 import shiboken6
-from theme import themed_info, themed_confirm, mix
-import util
+from hranilka.ui.theme import themed_info, themed_confirm, mix
+from hranilka import util
 
 
 def _supported_image_exts():
@@ -1320,7 +1320,7 @@ class GalleryWidget(QWidget):
             label.setAlignment(Qt.AlignCenter)
         # Единый стиль программы; откат на обычный QDialog, если config недоступен.
         if self.config is not None:
-            from theme import ThemedDialog
+            from hranilka.ui.theme import ThemedDialog
             dialog = ThemedDialog(self.config, self)
             dialog.setWindowTitle("Просмотр изображения")
             dialog.body.addWidget(label)

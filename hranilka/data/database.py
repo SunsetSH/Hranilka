@@ -10,9 +10,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import crypto_store as cs
-from domain import days_until_password_change, canonical_link_pair
-from util import best_effort_wipe
+from hranilka.crypto import store as cs
+from hranilka.domain import days_until_password_change, canonical_link_pair
+from hranilka.util import best_effort_wipe
 
 
 # Версия схемы базы данных. Увеличивается при изменении структуры таблиц,

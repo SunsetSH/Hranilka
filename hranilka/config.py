@@ -4,7 +4,7 @@ import os
 import re
 from typing import Any
 
-from paths import BASE_DIR
+from hranilka.paths import BASE_DIR
 
 logger = logging.getLogger(__name__)
 

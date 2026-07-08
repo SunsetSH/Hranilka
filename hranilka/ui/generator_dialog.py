@@ -10,9 +10,9 @@ password_gen.CONFIG_KEY). Диалог только пишет config — сох
 from PySide6.QtWidgets import (QCheckBox, QHBoxLayout, QLabel, QLineEdit,
                                QPushButton, QSpinBox, QVBoxLayout, QWidget)
 
-import password_gen
-from flowlayout import WrappingTabWidget
-from theme import ThemedDialog
+from hranilka.generators import password_gen
+from hranilka.ui.flowlayout import WrappingTabWidget
+from hranilka.ui.theme import ThemedDialog
 
 
 class GeneratorSettingsDialog(ThemedDialog):

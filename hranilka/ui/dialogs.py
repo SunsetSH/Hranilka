@@ -18,15 +18,15 @@ CODING_FONTS = [
     "Liberation Mono",
 ]
 
-from config import RETRO_THEMES
+from hranilka.config import RETRO_THEMES
 from PySide6.QtWidgets import QColorDialog
-from theme import ThemedDialog, themed_confirm, themed_info, dialog_stylesheet
-from flowlayout import WrappingTabWidget
-import backup as bk
-import crypto_store as cs
-import util
-import export
-import shortcuts
+from hranilka.ui.theme import ThemedDialog, themed_confirm, themed_info, dialog_stylesheet
+from hranilka.ui.flowlayout import WrappingTabWidget
+from hranilka.data import backup as bk
+from hranilka.crypto import store as cs
+from hranilka import util
+from hranilka.data import export
+from hranilka import shortcuts
 
 
 class RecoveryCodeDialog(ThemedDialog):
@@ -762,7 +762,7 @@ class SettingsDialog(ThemedDialog):
         # Локальный импорт — исключает цикл dialogs ↔ ui_welcome.
         # Вложенный модальный диалог — норма кодовой базы (themed_info и т.п.).
         # Флаг welcome_shown здесь не трогаем: он касается только первого запуска.
-        from ui_welcome import WelcomeDialog
+        from hranilka.ui.welcome import WelcomeDialog
         WelcomeDialog(self.config, self).exec()
 
     def _page_behavior(self):

@@ -8,7 +8,7 @@ import random
 from datetime import date, timedelta
 from typing import Optional, Sequence
 
-import pd_data
+from hranilka.generators import pd_data
 
 RandomLike = random.Random
 
