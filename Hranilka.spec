@@ -1,4 +1,49 @@
 # -*- mode: python ; coding: utf-8 -*-
+import sys
+
+from PyInstaller.utils.win32.versioninfo import (
+    FixedFileInfo, StringFileInfo, StringStruct, StringTable,
+    VarFileInfo, VarStruct, VSVersionInfo)
+
+# ЕДИНЫЙ ИСТОЧНИК ВЕРСИИ — hranilka/__init__.py (__version__). Раньше версия
+# дублировалась в четырёх строках version_info.txt; теперь метаданные exe
+# собираются здесь из одной константы. hranilka/__init__.py содержит только
+# докстринг и __version__ — импорт на сборке ничего тяжёлого не тянет.
+sys.path.insert(0, SPECPATH)
+from hranilka import __version__ as APP_VERSION
+
+# Windows требует ровно 4 числа: "1.1" → (1, 1, 0, 0).
+_VER4 = tuple((list(map(int, APP_VERSION.split("."))) + [0, 0, 0])[:4])
+_VER_STR = ".".join(map(str, _VER4))
+
+_VERSION_INFO = VSVersionInfo(
+    ffi=FixedFileInfo(
+        filevers=_VER4,
+        prodvers=_VER4,
+        mask=0x3F,
+        flags=0x0,
+        OS=0x40004,
+        fileType=0x1,
+        subtype=0x0,
+        date=(0, 0),
+    ),
+    kids=[
+        StringFileInfo([
+            StringTable('041904b0', [
+                StringStruct('CompanyName', 'Alexander Kondratyev'),
+                StringStruct('FileDescription',
+                             'ХРАНИЛКА — локальный хаб учётных записей'),
+                StringStruct('FileVersion', _VER_STR),
+                StringStruct('InternalName', 'Hranilka'),
+                StringStruct('OriginalFilename', 'Hranilka.exe'),
+                StringStruct('ProductName', 'ХРАНИЛКА'),
+                StringStruct('ProductVersion', _VER_STR),
+                StringStruct('LegalCopyright', '© 2026 Alexander Kondratyev'),
+            ])
+        ]),
+        VarFileInfo([VarStruct('Translation', [0x0419, 1200])]),
+    ],
+)
 
 # Модули, не используемые приложением (оффлайн, без сети):
 #  - PIL: тянется опциональным импортом openpyxl (нужен только для картинок
@@ -84,5 +129,5 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon='assets/icon.ico',
-    version='version_info.txt',
+    version=_VERSION_INFO,
 )
