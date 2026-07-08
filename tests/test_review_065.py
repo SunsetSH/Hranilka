@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from database import Database, StaleSessionError, SCHEMA_VERSION
+from hranilka.data.database import Database, StaleSessionError, SCHEMA_VERSION
 
 
 def _premigrate_copies(db_path):
@@ -109,7 +109,7 @@ def test_no_premigration_backup_when_schema_current(db, tmp_db_path):
 
 def test_is_valid_db_rejects_foreign_key_violation(tmp_path):
     """Бэкап с битой ссылочной целостностью не проходит проверку (M65-04)."""
-    from backup import _is_valid_db
+    from hranilka.data.backup import _is_valid_db
     p = tmp_path / "candidate.db"
     con = sqlite3.connect(p)
     con.executescript(
@@ -130,7 +130,7 @@ def test_is_valid_db_rejects_foreign_key_violation(tmp_path):
 def test_rollback_or_preserve_keeps_copy_when_swap_fails(tmp_path, monkeypatch):
     """Если сам откат (os.replace) не удался, последняя целая копия прежней БД не
     уничтожается — сохраняется под recovery-именем или остаётся rollback (M65-03)."""
-    import backup
+    from hranilka.data import backup
     dst = tmp_path / "hranilka.db"
     rollback = tmp_path / "hranilka.db.rollback"
     dst.write_bytes(b"broken-candidate")

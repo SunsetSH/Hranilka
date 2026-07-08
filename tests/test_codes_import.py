@@ -3,8 +3,8 @@
 """
 import pytest
 
-import export
-from export import Options
+from hranilka.data import export
+from hranilka.data.export import Options
 # Патч-точки (_warn, QFileDialog) живут в модуле codes пакета widgets (этап 5).
 from hranilka.ui.widgets import codes as widgets
 from hranilka.ui.widgets.codes import CodeListWidget

@@ -1,7 +1,7 @@
 """CopyableDateField: маска дд.мм.гггг[ чч:мм], «не задано», round-trip."""
 from PySide6.QtCore import QDate, QDateTime, QTime
 
-from widgets import CopyableDateField
+from hranilka.ui.widgets import CopyableDateField
 
 
 # ─── Поле «только дата» ───────────────────────────────────────────────────────

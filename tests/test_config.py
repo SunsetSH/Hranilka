@@ -52,7 +52,7 @@ def test_window_geometry_must_be_str(pure_config):
 
 def test_save_load_roundtrip(tmp_path, monkeypatch):
     """Значения переживают save→load через файл (CONFIG_FILE монкипатчится)."""
-    import config
+    from hranilka import config
     cfg_file = tmp_path / "config.json"
     monkeypatch.setattr(config, "CONFIG_FILE", cfg_file)
 
@@ -74,7 +74,7 @@ def test_save_load_roundtrip(tmp_path, monkeypatch):
 def test_load_sanitizes_invalid_file_values(tmp_path, monkeypatch):
     """Некорректные значения в файле чинятся на load: диапазоны/enum/цвет → дефолт,
     неизвестные ключи отбрасываются."""
-    import config
+    from hranilka import config
     cfg_file = tmp_path / "config.json"
     monkeypatch.setattr(config, "CONFIG_FILE", cfg_file)
 

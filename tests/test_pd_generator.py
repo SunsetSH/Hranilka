@@ -3,8 +3,8 @@
 import random
 from datetime import date
 
-import pd_data
-import pd_generator
+from hranilka.generators import pd_data
+from hranilka.generators import pd_generator
 
 
 def test_feminize_surname_rules():

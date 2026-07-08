@@ -8,8 +8,8 @@ import os
 
 import pytest
 
-import crypto_store as cs
-from database import Database, VaultConflictError
+from hranilka.crypto import store as cs
+from hranilka.data.database import Database, VaultConflictError
 
 _PW = "correct horse battery staple"
 _PRESET = "fast"   # быстрый Argon2 для тестов

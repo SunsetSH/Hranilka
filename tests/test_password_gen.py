@@ -5,11 +5,11 @@ import string
 
 import pytest
 
-import password_gen
-from password_gen import (GeneratorSettings, PassphraseOptions,
-                          PasswordOptions, generate_passphrase,
-                          generate_password, settings_from_config,
-                          settings_to_config)
+from hranilka.generators import password_gen
+from hranilka.generators.password_gen import (
+    GeneratorSettings, PassphraseOptions, PasswordOptions,
+    generate_passphrase, generate_password, settings_from_config,
+    settings_to_config)
 
 
 # ─── Пароль ──────────────────────────────────────────────────────────────────
@@ -135,7 +135,7 @@ def test_generate_from_config_defaults():
 
 @pytest.fixture
 def dialog(qapp, pure_config):
-    from ui_generator import GeneratorSettingsDialog
+    from hranilka.ui.generator_dialog import GeneratorSettingsDialog
     d = GeneratorSettingsDialog(pure_config)
     yield d
     d.deleteLater()

@@ -4,9 +4,9 @@ import pytest
 from PySide6.QtCore import Qt, QEvent
 from PySide6.QtGui import QKeyEvent
 
-import config as config_mod
-import ui_welcome
-from ui_welcome import WelcomeDialog, should_show
+from hranilka import config as config_mod
+from hranilka.ui import welcome as ui_welcome
+from hranilka.ui.welcome import WelcomeDialog, should_show
 
 
 @pytest.fixture
@@ -104,7 +104,7 @@ def test_first_run_wiring(qapp, tmp_path, monkeypatch):
 
 
 def test_settings_button_exists(qapp, pure_config):
-    from dialogs import SettingsDialog
+    from hranilka.ui.dialogs import SettingsDialog
     d = SettingsDialog(pure_config)
     assert d.show_welcome_btn.text() == "Показать обучение"
     d.deleteLater()
