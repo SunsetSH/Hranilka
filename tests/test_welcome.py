@@ -77,7 +77,7 @@ def test_should_show(pure_config):
 
 def test_first_run_wiring(qapp, tmp_path, monkeypatch):
     monkeypatch.setattr(config_mod, "CONFIG_FILE", tmp_path / "config.json")
-    import main
+    from hranilka.ui import main_window as main
     monkeypatch.setattr(main, "BASE_DIR", tmp_path)
 
     opened = []
