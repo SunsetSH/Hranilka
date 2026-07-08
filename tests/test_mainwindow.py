@@ -14,7 +14,7 @@ import pytest
 def window(qapp, tmp_path, monkeypatch):
     import config
     monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "config.json")
-    import main
+    from hranilka.ui import main_window as main
     monkeypatch.setattr(main, "BASE_DIR", tmp_path)
     win = main.MainWindow()
     yield win

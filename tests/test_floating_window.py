@@ -168,7 +168,7 @@ def test_accounttabs_build_no_floating_window(qapp, tmp_path, monkeypatch):
 def test_mainwindow_switch_accounts_no_floating_window(qapp, tmp_path, monkeypatch):
     import config
     monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "config.json")
-    import main
+    from hranilka.ui import main_window as main
     monkeypatch.setattr(main, "BASE_DIR", tmp_path)
     # Глушим возможные модальные предупреждения (например, срок пароля).
     import theme
