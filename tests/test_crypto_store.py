@@ -1,7 +1,7 @@
 """Шифр-контейнер: roundtrip, строгий разбор заголовка (H-04), неверный секрет."""
 import pytest
 
-import crypto_store as cs
+from hranilka.crypto import store as cs
 
 # Быстрый preset, чтобы Argon2 не тормозил тесты.
 _PW = "correct horse battery staple"

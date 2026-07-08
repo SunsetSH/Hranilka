@@ -1,8 +1,8 @@
 """Общие фикстуры для тестов Хранилки.
 
-Модули программы лежат в корне проекта (import database, config, ...), поэтому
-добавляем корень в sys.path. Все тесты работают в temp-каталогах и НЕ трогают
-рабочие hranilka.db / config.json.
+Код программы — пакет hranilka/ в корне проекта; корень добавляется в
+sys.path (плюс pythonpath в pytest.ini). Все тесты работают в temp-каталогах
+и НЕ трогают рабочие hranilka.db / config.json.
 """
 import os
 import sys
@@ -42,7 +42,7 @@ def tmp_db_path(tmp_path):
 @pytest.fixture
 def db(tmp_db_path):
     """Открытая обычная (незашифрованная) БД Хранилки со всеми таблицами."""
-    from database import Database
+    from hranilka.data.database import Database
     d = Database(tmp_db_path)
     d.connect()
     d.create_tables()
@@ -59,6 +59,6 @@ def pure_config(tmp_path, monkeypatch):
 
     Указываем config.CONFIG_FILE на несуществующий путь, чтобы тесты не зависели
     от config.json на машине и не перезаписывали его."""
-    import config
+    from hranilka import config
     monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "config.json")
     return config.Config()

@@ -2,8 +2,8 @@
 
 PDF удалён в 0.4 — FORMATS должен содержать только txt/csv/xlsx/html.
 """
-import export
-from export import Options
+from hranilka.data import export
+from hranilka.data.export import Options
 
 
 def _theme():

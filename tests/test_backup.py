@@ -4,11 +4,11 @@ from pathlib import Path
 
 import pytest
 
-import backup
+from hranilka.data import backup
 
 
 def _make_db(path):
-    from database import Database
+    from hranilka.data.database import Database
     d = Database(str(path))
     d.connect()
     d.create_tables()
@@ -98,7 +98,7 @@ def test_rotate_keep_count_zero_is_noop(tmp_path):
 def test_is_valid_db_accepts_encrypted_container(tmp_path):
     """Валидный зашифрованный контейнер (из crypto_store.create_vault на настоящих
     байтах БД) проходит валидацию бэкапа — структурный разбор заголовка успешен."""
-    import crypto_store
+    from hranilka.crypto import store as crypto_store
 
     real = tmp_path / "real.db"
     _make_db(real)

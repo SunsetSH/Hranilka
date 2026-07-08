@@ -5,8 +5,8 @@
 """
 import pytest
 
-from database import Database
-from vault_controller import VaultController
+from hranilka.data.database import Database
+from hranilka.ui.vault_controller import VaultController
 
 # Общий session-qapp живёт в conftest.py (M-16).
 
@@ -74,8 +74,8 @@ def test_barrier_flush_persists_inflight_mutation(qapp, tmp_db_path, pure_config
     после неё расшифрованный контейнер содержит правку."""
     import threading
 
-    import crypto_store as cs
-    from database import Database
+    from hranilka.crypto import store as cs
+    from hranilka.data.database import Database
 
     db = Database(tmp_db_path)
     db.connect()

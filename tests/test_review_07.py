@@ -7,8 +7,9 @@ import concurrent.futures
 
 import pytest
 
-import dialogs
-from dialogs import UnlockDialog
+# Патч-точка cs — в модуле unlock (этап 7: реэкспорт cs из пакета убран).
+from hranilka.ui.dialogs import unlock
+from hranilka.ui.dialogs.unlock import UnlockDialog
 
 # Общий session-qapp живёт в conftest.py (offscreen).
 
@@ -41,7 +42,7 @@ def test_unlock_dialog_reads_container_lazily_on_attempt(qapp, pure_config, monk
         seen["secret"] = secret
         return ("db", "dek", "header")          # result_data
 
-    monkeypatch.setattr(dialogs.cs, "unlock", fake_unlock)
+    monkeypatch.setattr(unlock.cs, "unlock", fake_unlock)
 
     dlg = UnlockDialog(pure_config, b"")
     dlg.set_container_future(_future(value=b"CONTAINER-BYTES", delay=0.05))
@@ -61,7 +62,7 @@ def test_unlock_dialog_shows_error_on_read_failure(qapp, pure_config, monkeypatc
         called["unlock"] = True
         return ("db", "dek", "header")
 
-    monkeypatch.setattr(dialogs.cs, "unlock", fake_unlock)
+    monkeypatch.setattr(unlock.cs, "unlock", fake_unlock)
 
     dlg = UnlockDialog(pure_config, b"")
     dlg.set_container_future(_future(exc=OSError("нет доступа")))
@@ -81,7 +82,7 @@ def test_unlock_dialog_ready_container_without_future(qapp, pure_config, monkeyp
         seen["container"] = container
         return ("db", "dek", "header")
 
-    monkeypatch.setattr(dialogs.cs, "unlock", fake_unlock)
+    monkeypatch.setattr(unlock.cs, "unlock", fake_unlock)
 
     dlg = UnlockDialog(pure_config, b"READY")
     dlg._field.setText("secret")

@@ -15,7 +15,7 @@ import threading
 
 import pytest
 
-from database import Database, StaleSessionError
+from hranilka.data.database import Database, StaleSessionError
 
 
 @pytest.fixture

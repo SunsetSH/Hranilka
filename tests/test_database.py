@@ -4,7 +4,7 @@ import sqlite3
 
 import pytest
 
-from database import Database, SCHEMA_VERSION, FutureSchemaError
+from hranilka.data.database import Database, SCHEMA_VERSION, FutureSchemaError
 
 
 def test_fresh_db_has_current_schema(db):
@@ -150,7 +150,7 @@ def _gallery_rows(db, account_id):
 def test_serialize_db_stays_lock_wrapped():
     """serialize_db не должен попасть в _DB_NO_LOCK (иначе сериализация БД шла бы
     без лока параллельно записи в conn — гонка)."""
-    import database
+    from hranilka.data import database
     assert "serialize_db" not in database._DB_NO_LOCK
 
 
@@ -336,7 +336,7 @@ def test_links_migration_normalizes_old_rows(tmp_db_path):
 
 import glob  # noqa: E402
 
-from database import PreMigrationBackupError  # noqa: E402
+from hranilka.data.database import PreMigrationBackupError  # noqa: E402
 
 
 def _old_version_db(tmp_db_path):

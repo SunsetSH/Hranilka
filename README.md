@@ -164,12 +164,21 @@ Remove-Item -Recurse -Force build, dist -ErrorAction SilentlyContinue
 ## Структура проекта
 
 ```
-main.py            — окно приложения, точка входа
-database.py        — слой SQLite: схема, миграции, CRUD, async-координация
-crypto_store.py    — конвертное шифрование документа (Argon2id + AES-GCM)
-vault_controller.py— фоновая запись контейнера, монопольные операции
-backup.py          — бэкапы с ротацией и проверяемое восстановление
-export.py          — экспорт TXT/CSV/XLSX/HTML
-dialogs.py, widgets.py, ui_*.py, theme.py — интерфейс и темизация
-tests/             — pytest-сюита
+main.py                    — тонкая точка входа (python main.py / PyInstaller)
+hranilka/                  — код приложения (пакет)
+├── app.py                 — bootstrap: QApplication + qasync-цикл
+├── config.py, paths.py, util.py, domain.py, shortcuts.py, instance_lock.py
+├── crypto/store.py        — конвертное шифрование (Argon2id + AES-256-GCM)
+├── data/                  — слой данных (Qt-free)
+│   ├── database.py        — Database: CRUD + сборка из mixin-модулей
+│   ├── concurrency.py / persistence.py / schema.py / errors.py
+│   ├── migrations/        — нумерованные миграции схемы (runner + реестр)
+│   ├── backup.py          — бэкапы с ротацией и проверяемое восстановление
+│   └── export.py          — экспорт TXT/CSV/XLSX/HTML
+├── generators/            — генерация паролей, парольных фраз, ПД
+└── ui/                    — интерфейс и темизация
+    ├── main_window.py     — MainWindow, vault_controller.py — фоновая запись
+    ├── widgets/           — поля карточки, галерея, коды 2FA
+    └── dialogs/           — настройки, разблокировка, экспорт, корзина
+tests/                     — pytest-сюита
 ```
