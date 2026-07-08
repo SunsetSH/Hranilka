@@ -4,9 +4,10 @@
 import pytest
 
 import export
-import widgets
 from export import Options
-from widgets import CodeListWidget
+# Патч-точки (_warn, QFileDialog) живут в модуле codes пакета widgets (этап 5).
+from hranilka.ui.widgets import codes as widgets
+from hranilka.ui.widgets.codes import CodeListWidget
 
 
 # ─── Импорт кодов из файла ────────────────────────────────────────────────────

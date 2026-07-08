@@ -14,8 +14,8 @@ from PySide6.QtWidgets import QApplication
 from PySide6.QtCore import QByteArray, QBuffer, QIODevice
 from PySide6.QtGui import QImage, QImageReader
 
-import widgets
-from widgets import GalleryWidget
+from hranilka.ui.widgets import gallery as widgets
+from hranilka.ui.widgets.gallery import GalleryWidget
 
 
 # Общий session-qapp живёт в conftest.py (M-16). setAllocationLimit —
