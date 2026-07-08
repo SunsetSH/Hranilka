@@ -5,6 +5,9 @@ from pathlib import Path
 from datetime import datetime
 
 from hranilka.crypto import store as crypto_store
+# Раньше SCHEMA_VERSION импортировался отложенно (разрыв цикла backup↔database);
+# после выноса схемы в schema.py цикла нет — импорт обычный.
+from hranilka.data.schema import SCHEMA_VERSION
 from hranilka.util import best_effort_wipe
 
 
@@ -93,7 +96,6 @@ def _is_valid_db(path: Path) -> bool:
         except Exception:
             return False
     try:
-        from hranilka.data.database import SCHEMA_VERSION
         con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
         try:
             row = con.execute("PRAGMA quick_check").fetchone()
