@@ -1,8 +1,8 @@
 ﻿from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                                QScrollArea)
 from PySide6.QtCore import Qt
-from flowlayout import WrappingTabWidget
-from widgets import (CopyableField, CopyableDateField, CopyableTextEdit,
+from hranilka.ui.flowlayout import WrappingTabWidget
+from hranilka.ui.widgets import (CopyableField, CopyableDateField, CopyableTextEdit,
                      SecretQuestionsWidget, CodeListWidget, GalleryWidget,
                      IntervalField, LinkedAccountsWidget, heading_label)
 

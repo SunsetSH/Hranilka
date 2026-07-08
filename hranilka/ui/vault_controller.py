@@ -15,8 +15,8 @@ import logging
 from PySide6.QtCore import (Qt, QObject, QThread, QEventLoop, QTimer,
                             Signal, Slot)
 
-import theme
-from database import VaultConflictError
+from hranilka.ui import theme
+from hranilka.data.database import VaultConflictError
 
 
 class _VaultWriter(QObject):

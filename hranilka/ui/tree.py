@@ -10,11 +10,11 @@ from PySide6.QtWidgets import (QTreeWidget, QTreeWidgetItem, QMenu,
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QBrush
 
-import domain
-import theme
-import util
-from database import StaleSessionError
-from models import AccountData
+from hranilka import domain
+from hranilka.ui import theme
+from hranilka import util
+from hranilka.data.database import StaleSessionError
+from hranilka.data.models import AccountData
 
 
 class AccountTree(QTreeWidget):

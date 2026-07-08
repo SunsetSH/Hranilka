@@ -13,8 +13,8 @@ from PySide6.QtWidgets import (
     QStackedWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
-import config as config_mod
-from theme import ThemedDialog
+from hranilka import config as config_mod
+from hranilka.ui.theme import ThemedDialog
 
 
 def should_show(config) -> bool:

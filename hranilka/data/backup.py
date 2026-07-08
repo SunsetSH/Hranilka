@@ -4,8 +4,8 @@ import sqlite3
 from pathlib import Path
 from datetime import datetime
 
-import crypto_store
-from util import best_effort_wipe
+from hranilka.crypto import store as crypto_store
+from hranilka.util import best_effort_wipe
 
 
 _GLOB = "hranilka_backup_*.db"
@@ -93,7 +93,7 @@ def _is_valid_db(path: Path) -> bool:
         except Exception:
             return False
     try:
-        from database import SCHEMA_VERSION
+        from hranilka.data.database import SCHEMA_VERSION
         con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
         try:
             row = con.execute("PRAGMA quick_check").fetchone()

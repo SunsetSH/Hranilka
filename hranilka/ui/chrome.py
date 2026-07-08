@@ -14,9 +14,9 @@ from PySide6.QtWidgets import QApplication
 from PySide6.QtCore import Qt, QEvent, QDateTime, QByteArray
 from PySide6.QtGui import QKeySequence
 
-import theme
-import shortcuts
-from database import VaultConflictError
+from hranilka.ui import theme
+from hranilka import shortcuts
+from hranilka.data.database import VaultConflictError
 
 
 class WindowChromeMixin:
