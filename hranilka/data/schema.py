@@ -177,6 +177,12 @@ class DbSchemaMixin(DbBase):
             premigrate_dedup = self._make_durable_copy(
                 _ver, "восстановление/нормализация схемы (dedup)")
 
+        # Недостающие колонки старых баз — ДО создания индексов ниже: индекс
+        # idx_accounts_deleted ссылается на accounts(deleted_at), и на базе без
+        # этой колонки CREATE INDEX падал (латентный баг: diff колонок раньше
+        # выполнялся только в _migrate(), уже ПОСЛЕ индексов).
+        self._add_missing_columns()
+
         # Дедуп + (пере)создание индексов — ОДНОЙ транзакцией (M65-05): при сбое
         # посередине (диск/исключение) `with self.conn` откатит и удаление дублей,
         # и создание индексов целиком, не оставив промежуточного состояния (дубли
@@ -229,8 +235,20 @@ class DbSchemaMixin(DbBase):
         self._finish_premigration_backup(premigrate)
         self._finish_premigration_backup(premigrate_dedup)
 
+    def _add_missing_columns(self):
+        """Добавить в старые базы недостающие колонки из _EXPECTED_COLUMNS
+        (ALTER TABLE ADD COLUMN идемпотентен в рамках проверки). Вызывается из
+        create_tables (до индексов) и из migrations.runner (legacy-diff)."""
+        for table, columns in self._EXPECTED_COLUMNS.items():
+            existing = self._get_columns(table)
+            for name, definition in columns.items():
+                if name not in existing:
+                    self.cursor.execute(
+                        f"ALTER TABLE {table} ADD COLUMN {name} {definition}"
+                    )
+
     # Ожидаемые колонки таблиц для добавления в старые базы (имя -> SQL-определение).
-    # Используется только в _migrate(); новые базы создаются полными в create_tables().
+    # Используется в _add_missing_columns; новые базы создаются полными в create_tables().
     _EXPECTED_COLUMNS = {
         "accounts": {
             "url": "TEXT",
@@ -382,33 +400,12 @@ class DbSchemaMixin(DbBase):
     def _migrate(self):
         """Приводит существующую базу к актуальной версии схемы.
 
-        Добавляет недостающие колонки в старые базы (ALTER TABLE ADD COLUMN
-        идемпотентен в рамках проверки) и обновляет версию схемы в app_meta.
-        """
-        current = self.get_schema_version()
-        if current == SCHEMA_VERSION:
-            return
-        if current > SCHEMA_VERSION:
-            # База создана более новой версией программы. Молчаливая «миграция»
-            # вниз записала бы устаревшую версию схемы и могла бы необратимо
-            # повредить данные — поэтому отказываемся открывать.
-            raise FutureSchemaError(current, SCHEMA_VERSION)
-
-        for table, columns in self._EXPECTED_COLUMNS.items():
-            existing = self._get_columns(table)
-            for name, definition in columns.items():
-                if name not in existing:
-                    self.cursor.execute(
-                        f"ALTER TABLE {table} ADD COLUMN {name} {definition}"
-                    )
-
-        self._migrate_accounts_service_nullable()
-        # Чинит базы, испорченные старой (ошибочной) версией миграции,
-        # где ссылки внешних ключей указывали на несуществующую accounts_old.
-        self._repair_accounts_old_refs()
-
-        self.set_schema_version(SCHEMA_VERSION)
-        self._commit()
+        Тонкая обёртка над migrations.runner (этап 3): legacy-diff колонок +
+        нумерованные шаги из реестра MIGRATIONS. Имя и сигнатура сохранены —
+        тесты патчат метод на экземпляре. Импорт отложенный: runner импортирует
+        SCHEMA_VERSION из этого модуля (разрыв цикла schema↔runner)."""
+        from hranilka.data.migrations import runner
+        runner.run(self)
 
     @staticmethod
     def _accounts_create_sql(table_name):
