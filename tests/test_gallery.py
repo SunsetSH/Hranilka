@@ -13,8 +13,10 @@ from PySide6.QtWidgets import QApplication
 from PySide6.QtGui import QImage, QImageReader
 from PySide6.QtCore import QBuffer, QByteArray, QIODevice
 
-import widgets
-from widgets import GalleryWidget
+# Патч-точки (_warn, QFileDialog, конвейер картинок) живут в модуле gallery
+# пакета widgets (этап 5 реструктуризации).
+from hranilka.ui.widgets import gallery as widgets
+from hranilka.ui.widgets.gallery import GalleryWidget
 
 
 # Общий session-qapp живёт в conftest.py (M-16). setAllocationLimit —
@@ -123,7 +125,7 @@ def test_decode_image_none_for_garbage(qapp):
 # ─── Баг 3: сжатие больших изображений при импорте ──────────────────────────
 
 def test_downscale_reduces_large_image(qapp):
-    from widgets import _downscale_image_bytes
+    from hranilka.ui.widgets.gallery import _downscale_image_bytes
     big = _gradient_png(3000, 2000)         # длинная сторона > 2560, объёмный PNG
     out = _downscale_image_bytes(big, 2560, 90)
     assert out is not None
@@ -133,7 +135,7 @@ def test_downscale_reduces_large_image(qapp):
 
 
 def test_downscale_skips_small_image(qapp):
-    from widgets import _downscale_image_bytes
+    from hranilka.ui.widgets.gallery import _downscale_image_bytes
     small = _png_bytes(800, 600)            # в пределах — не трогаем
     assert _downscale_image_bytes(small, 2560, 90) is None
 
@@ -147,7 +149,7 @@ def test_gallery_item_has_parent(qapp):
 
 
 def test_secret_question_row_has_parent(qapp):
-    from widgets import SecretQuestionsWidget
+    from hranilka.ui.widgets import SecretQuestionsWidget
     w = SecretQuestionsWidget()
     w.add_row("q", "a")
     row_widget = w.rows[0][0].parent()
@@ -157,7 +159,7 @@ def test_secret_question_row_has_parent(qapp):
 # ─── Баг 4: пустые строки вопросов/кодов не сохраняются ─────────────────────
 
 def test_secret_questions_skip_empty(qapp):
-    from widgets import SecretQuestionsWidget
+    from hranilka.ui.widgets import SecretQuestionsWidget
     w = SecretQuestionsWidget()
     w.set_editable(True)
     w.add_row("q1", "a1")
@@ -171,7 +173,7 @@ def test_secret_questions_skip_empty(qapp):
 
 
 def test_codes_skip_empty(qapp):
-    from widgets import CodeListWidget
+    from hranilka.ui.widgets import CodeListWidget
     w = CodeListWidget()
     w.set_editable(True)
     w.add_code("abc")
@@ -231,7 +233,7 @@ async def test_pending_uploads_tracked(qapp, tmp_path):
 def test_prepare_respects_downscale_flag(qapp):
     """Настройка image_downscale реально влияет на конвейер (M6-02): при
     downscale=False крупное изображение не уменьшается и не перекодируется."""
-    from widgets import _prepare_image_bytes
+    from hranilka.ui.widgets.gallery import _prepare_image_bytes
     big = _gradient_png(3000, 2000)
     _, size_on, _ = _prepare_image_bytes(big, downscale=True)
     data_off, size_off, _ = _prepare_image_bytes(big, downscale=False)

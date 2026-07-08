@@ -151,14 +151,14 @@ def test_rollback_or_preserve_keeps_copy_when_swap_fails(tmp_path, monkeypatch):
 # ─── L65-02: bounded file read ───────────────────────────────────────────────
 
 def test_read_file_within_limit(tmp_path):
-    from widgets import _read_file
+    from hranilka.ui.widgets.common import _read_file
     p = tmp_path / "f.bin"
     p.write_bytes(b"x" * 100)
     assert _read_file(str(p), 100) == b"x" * 100
 
 
 def test_read_file_rejects_oversize(tmp_path):
-    from widgets import _read_file, FileTooLargeError
+    from hranilka.ui.widgets.common import _read_file, FileTooLargeError
     p = tmp_path / "f.bin"
     p.write_bytes(b"x" * 100)
     with pytest.raises(FileTooLargeError):

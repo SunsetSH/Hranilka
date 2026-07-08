@@ -16,8 +16,8 @@ from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout
 from PySide6.QtCore import QObject, QEvent, QBuffer, QByteArray, QIODevice
 from PySide6.QtGui import QImage
 
-import widgets
-from widgets import GalleryWidget
+from hranilka.ui.widgets import gallery as widgets
+from hranilka.ui.widgets.gallery import GalleryWidget
 
 
 # Общий session-qapp живёт в conftest.py (M-16).
