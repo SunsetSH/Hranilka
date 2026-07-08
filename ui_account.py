@@ -7,9 +7,12 @@
 import logging
 
 from PySide6.QtCore import QDate, QDateTime
+from PySide6.QtWidgets import QDialog
 
 from database import StaleSessionError
 from models import AccountData
+from ui_generator import GeneratorSettingsDialog
+import password_gen
 import pd_generator
 import util
 import domain
@@ -537,8 +540,20 @@ class AccountCardMixin:
         self.statusBar().showMessage("СОХРАНЕНО!", 2000)
 
     def generate_password(self):
-        self.tabs.f_password.set_text(util.generate_password())
+        self.tabs.f_password.set_text(
+            password_gen.generate_from_config(self.config))
         self.statusBar().showMessage("ПАРОЛЬ СГЕНЕРИРОВАН", 2000)
+
+    def open_password_generator_settings(self):
+        """Диалог «ПАРАМЕТРЫ ГЕНЕРАЦИИ»: при OK диалог уже записал настройки
+        в config — сохраняем файл и подставляем пароль из предпросмотра в поле
+        пароля карточки (кнопка доступна только в режиме редактирования)."""
+        dlg = GeneratorSettingsDialog(self.config, self)
+        if dlg.exec() == QDialog.Accepted:
+            self.config.save()
+            self.tabs.f_password.set_text(dlg.preview_text())
+            self.statusBar().showMessage(
+                "НАСТРОЙКИ СОХРАНЕНЫ, ПАРОЛЬ ПОДСТАВЛЕН", 2000)
 
     def generate_personal_data(self):
         choice, ok = theme.themed_choice(

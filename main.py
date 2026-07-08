@@ -412,6 +412,8 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, AccountCardMixin,
         
         # Кнопки генерации
         self.tabs.gen_pass_btn.clicked.connect(self.generate_password)
+        self.tabs.gen_pass_cfg_btn.clicked.connect(
+            self.open_password_generator_settings)
         self.tabs.gen_pd_btn.clicked.connect(self.generate_personal_data)
 
         # Горячие клавиши (после создания дерева и поля поиска — они нужны как

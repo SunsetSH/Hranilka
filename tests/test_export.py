@@ -51,6 +51,40 @@ def test_export_empty_tree_no_crash(db, tmp_path):
         assert out.exists(), fmt             # файл создан (может быть с заголовком)
 
 
+# ─── HTML: галерея карточками «картинка + описание» ──────────────────────────
+
+def _tree_with_gallery(gallery):
+    return [{"type": "account", "name": "Акк", "links": [], "children": [],
+             "card": {"fields": {"account_name": "Акк"}, "gallery": gallery}}]
+
+
+def test_html_gallery_cards():
+    gallery = [{"data": b"\x89PNG_fake", "desc": "Скрин <главной>"},
+               {"data": b"\xff\xd8\xff_fake", "desc": ""}]
+    html = export._html_document(_tree_with_gallery(gallery),
+                                 Options(theme=_theme(), title="Т"))
+    # С описанием — растягиваемая карточка, без — сжатая до картинки (nocap).
+    assert html.count("<div class='gitem'>") == 1
+    assert html.count("<div class='gitem nocap'>") == 1
+    # Описание HTML-экранировано; пустое — не выводится.
+    assert html.count("class='cap'") == 1
+    assert "Скрин &lt;главной&gt;" in html
+    # Несколько колонок; текст обтекает картинку (float), ниже — во всю ширину.
+    assert "flex-wrap:wrap" in html
+    assert "float:left" in html
+    assert "flow-root" in html
+    assert f"flex:1 1 {export.HTML_GALLERY_CARD_BASE_PX}px" in html
+    assert f"max-width:{export.HTML_GALLERY_IMG_MAX_PX}px" in html
+
+
+def test_html_gallery_excluded():
+    gallery = [{"data": b"\x89PNG_fake", "desc": "x"}]
+    html = export._html_document(_tree_with_gallery(gallery),
+                                 Options(theme=_theme(), title="Т",
+                                         include_gallery=False))
+    assert "<div class='gitem" not in html
+
+
 def test_export_account_with_empty_fields(db, tmp_path):
     """Аккаунт с password=None и пустыми полями экспортируется без исключений."""
     sid = db.add_service("Сервис")

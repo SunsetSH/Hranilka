@@ -311,6 +311,11 @@ class SecretQuestionsWidget(QWidget):
 class CodeListWidget(QWidget):
     copy_signal = Signal()
 
+    # Лимиты импорта из файла: список кодов заведомо мал, всё сверх — защита
+    # от случайно выбранного «не того» файла (OOM / тысячи виджетов).
+    _MAX_IMPORT_BYTES = 1024 * 1024
+    _MAX_IMPORT_CODES = 100
+
     def __init__(self, config=None, parent=None):
         super().__init__(parent)
         self.config = config
@@ -320,9 +325,22 @@ class CodeListWidget(QWidget):
         self.rows = []
         self._editable = False
 
+        btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(5)
         self.add_btn = QPushButton("+ ДОБАВИТЬ КОД")
         self.add_btn.clicked.connect(lambda: self.add_code())
-        self.layout.addWidget(self.add_btn)
+        btn_layout.addWidget(self.add_btn)
+        self.import_btn = QPushButton("ИМПОРТ")
+        self.import_btn.clicked.connect(self.import_codes)
+        btn_layout.addWidget(self.import_btn)
+        self.layout.addLayout(btn_layout)
+
+        self.import_hint = QLabel(
+            "Импорт: текстовый документ (.txt), в котором коды разделены "
+            "новой строкой (абзацем) — один код станет одним полем.")
+        self.import_hint.setWordWrap(True)
+        self.layout.addWidget(self.import_hint)
+
         self.empty_label = QLabel("Резервных кодов нет")
         self.layout.addWidget(self.empty_label)
         self.layout.addStretch()
@@ -357,6 +375,43 @@ class CodeListWidget(QWidget):
         self.rows.append((code_edit, del_btn, row_widget))
         self._update_empty()
 
+    def import_codes(self):
+        """Импорт кодов из текстового файла: одна непустая строка — одно поле."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Импорт резервных кодов", "",
+            "Текстовые файлы (*.txt);;Все файлы (*)")
+        if not path:
+            return
+        try:
+            data = _read_file(path, self._MAX_IMPORT_BYTES)
+        except FileTooLargeError:
+            _warn(self.config, self, "Слишком большой файл",
+                  f"Файл больше {self._MAX_IMPORT_BYTES // (1024 * 1024)} МБ — "
+                  f"это не похоже на список кодов.")
+            return
+        except OSError as e:
+            logging.warning("Импорт кодов: не удалось прочитать %s: %s", path, e)
+            _warn(self.config, self, "Ошибка",
+                  f"Не удалось прочитать файл:\n{e}")
+            return
+        try:
+            text = data.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            # Файл из старого блокнота/Windows — пробуем системную кириллицу.
+            text = data.decode("cp1251", errors="replace")
+        codes = [line.strip() for line in text.splitlines() if line.strip()]
+        if not codes:
+            _warn(self.config, self, "Импорт",
+                  "В файле не найдено ни одного кода.")
+            return
+        if len(codes) > self._MAX_IMPORT_CODES:
+            _warn(self.config, self, "Импорт",
+                  f"В файле {len(codes)} строк — больше лимита "
+                  f"{self._MAX_IMPORT_CODES}. Импорт отменён.")
+            return
+        for code in codes:
+            self.add_code(code)
+
     def copy_code(self, text):
         if text:
             QApplication.clipboard().setText(text)
@@ -389,6 +444,8 @@ class CodeListWidget(QWidget):
     def set_editable(self, editable):
         self._editable = editable
         self.add_btn.setVisible(editable)
+        self.import_btn.setVisible(editable)
+        self.import_hint.setVisible(editable)
         for code_edit, del_btn, _w in self.rows:
             code_edit.setReadOnly(not editable)
             del_btn.setVisible(editable)

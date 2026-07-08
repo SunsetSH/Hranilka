@@ -29,10 +29,13 @@ GROUP_BASIC = [
     "Логин", "Пароль", "Пароль сменён", "Сменять пароль каждые",
     "Заметки", "Связанные аккаунты",
 ]
+# Метка резервных кодов — в HTML рендерится особо (многоколоночный список).
+LABEL_2FA_CODES = "Резервные коды 2FA"
+
 GROUP_OTHER = [
     "Мобильный номер", "Имя", "Фамилия", "Отчество", "Дата рождения", "Адрес",
     "Секретные вопросы", "Фраза восстановления", "ID устройства",
-    "Резервные коды 2FA", "IP адрес", "Браузер", "ОС",
+    LABEL_2FA_CODES, "IP адрес", "Браузер", "ОС",
 ]
 
 CSV_DELIM = ";"  # разделитель для русского Excel
@@ -129,7 +132,7 @@ def _account_rows(card, links, opts, skip_empty=True):
     add("ID устройства", card.get("recovery", {}).get("device_id"))
 
     codes = [_s(c) for c in card.get("codes", []) if _s(c).strip()]
-    add("Резервные коды 2FA", "\n".join(codes))
+    add(LABEL_2FA_CODES, "\n".join(codes))
 
     add("IP адрес", f.get("ip"))
     add("Браузер", f.get("browser"))
@@ -248,6 +251,31 @@ def _table_row(node, path_parts, cols, opts):
 
 # ─── HTML ────────────────────────────────────────────────────────────────────
 
+# Максимум колонок для резервных кодов 2FA в HTML.
+HTML_CODES_MAX_COLS = 3
+
+# Галерея в HTML: карточка «картинка + описание» с тонкой рамкой; текст
+# обтекает картинку справа, а ниже её — идёт во всю ширину карточки.
+# IMG_MAX — потолок миниатюры (обе стороны), CARD_BASE — базовая ширина
+# карточки с текстом: сколько карточек влезет в ряд, решает браузер
+# (flex-wrap); карточка без описания сжимается до размеров картинки.
+HTML_GALLERY_IMG_MAX_PX = 300
+HTML_GALLERY_CARD_BASE_PX = 500
+
+
+def _codes_cell_html(value):
+    """Разметка ячейки резервных кодов: список в CSS-колонках.
+
+    column-count задаёт потолок (HTML_CODES_MAX_COLS), а column-width — по
+    самому длинному коду — минимальную ширину колонки: браузер сам уменьшает
+    число колонок вплоть до одной, если они не влезают в ширину страницы."""
+    codes = value.split("\n")
+    width_ch = max(len(c) for c in codes) + 2
+    items = "".join(f"<div>{esc(c)}</div>" for c in codes)
+    return (f"<div class='codes' style='column-width:{width_ch}ch'>"
+            f"{items}</div>")
+
+
 def _default_img_tag(data):
     src = f"data:{_img_mime(data)};base64," + base64.b64encode(data).decode("ascii")
     return f"<img class='shot' src='{src}'>"
@@ -279,9 +307,26 @@ def _html_document(tree, opts, render_img=_default_img_tag):
     p.append("table.card td{border:1px solid #808080;padding:4px 8px;vertical-align:top;}")
     p.append("td.label{font-weight:bold;white-space:nowrap;width:200px;}")
     p.append("td.value{white-space:pre-wrap;}")
-    p.append(".gallery{margin-top:8px;}")
-    p.append("img.shot{max-width:480px;border:2px outset #808080;margin:6px 0;display:block;}")
-    p.append(".cap{font-style:italic;margin-bottom:6px;}")
+    p.append(f".codes{{column-count:{HTML_CODES_MAX_COLS};column-gap:24px;}}")
+    p.append(".codes div{break-inside:avoid;}")
+    # Галерея: flex-wrap раскладывает карточки в несколько колонок по ширине
+    # окна; align-items:flex-start — рамка каждой карточки по своему содержимому
+    # (не тянется до высоты соседей). Внутри карточки картинка — float:left,
+    # поэтому текст идёт справа от неё, а ниже картинки — во всю ширину;
+    # flow-root не даёт float «выпасть» из рамки.
+    p.append(".gallery{margin-top:8px;display:flex;flex-wrap:wrap;"
+             "gap:10px;align-items:flex-start;}")
+    p.append(f".gitem{{display:flow-root;"
+             f"border:1px solid #808080;background:{tree_bg};padding:8px;"
+             f"box-sizing:border-box;max-width:100%;"
+             f"flex:1 1 {HTML_GALLERY_CARD_BASE_PX}px;}}")
+    # Без описания карточка сжимается до картинки — пустого места нет.
+    p.append(".gitem.nocap{flex:0 0 auto;}")
+    p.append(f"img.shot{{max-width:{HTML_GALLERY_IMG_MAX_PX}px;"
+             f"max-height:{HTML_GALLERY_IMG_MAX_PX}px;"
+             f"border:2px outset #808080;float:left;margin:0 12px 8px 0;}}")
+    p.append(".cap{font-style:italic;line-height:1.45;margin:0;"
+             "white-space:pre-wrap;overflow-wrap:anywhere;}")
     p.append("</style></head><body>")
     p.append(f"<div class='banner'><h1>ХРАНИЛКА — ЭКСПОРТ</h1>"
              f"{esc(opts.title)} &nbsp;&nbsp; {now}</div>")
@@ -290,18 +335,23 @@ def _html_document(tree, opts, render_img=_default_img_tag):
         p.append("<div class='account'>")
         p.append(f"<h3>(i) {esc(node['name'])}</h3><table class='card'>")
         for label, value in _account_rows(node["card"], node.get("links"), opts):
+            cell = (_codes_cell_html(value) if label == LABEL_2FA_CODES
+                    else esc(value))
             p.append(f"<tr><td class='label'>{esc(label)}</td>"
-                     f"<td class='value'>{esc(value)}</td></tr>")
+                     f"<td class='value'>{cell}</td></tr>")
         p.append("</table>")
         if opts.include_gallery:
             gal = _gallery(node)
             if gal:
                 p.append("<div class='gallery'>")
                 for g in gal:
-                    p.append(render_img(g["data"]))
                     desc = esc(_s(g.get("desc")))
+                    cls = "gitem" if desc else "gitem nocap"
+                    p.append(f"<div class='{cls}'>")
+                    p.append(render_img(g["data"]))
                     if desc:
                         p.append(f"<div class='cap'>{desc}</div>")
+                    p.append("</div>")
                 p.append("</div>")
         p.append("</div>")
 

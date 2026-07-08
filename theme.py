@@ -40,10 +40,15 @@ def widget_styles(config):
         QLabel {{ color: {text_color}; background: transparent;
             font-family: '{font_name}'; font-size: {font_size}px; }}
         QLabel[heading="true"] {{ font-size: {font_size + 2}px; font-weight: bold; }}
+        QLabel:disabled {{ color: {mix(text_color, main_bg, 0.6)}; }}
         QLineEdit, QTextEdit, QListWidget, QDateTimeEdit, QDateEdit, QSpinBox, QComboBox {{
             background-color: {tree_bg}; color: {text_color}; border: 2px inset #808080;
             padding: 5px; font-family: '{font_name}'; font-size: {font_size}px;
         }}
+        QLineEdit:disabled, QTextEdit:disabled, QSpinBox:disabled, QComboBox:disabled {{
+            color: {mix(text_color, tree_bg, 0.6)};
+            background-color: {mix(tree_bg, main_bg, 0.6)};
+            border: 2px inset {mix('#808080', tree_bg, 0.45)}; }}
         QComboBox QAbstractItemView {{
             background-color: {tree_bg}; color: {text_color};
             selection-background-color: {main_bg}; selection-color: {text_color};

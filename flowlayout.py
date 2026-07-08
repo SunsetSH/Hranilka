@@ -2,7 +2,7 @@
 ширины (стандартный приём Qt). WrappingTabWidget использует её, чтобы кнопки
 вкладок выстраивались в 2+ ряда при сжатии окна."""
 
-from PySide6.QtCore import Qt, QPoint, QRect, QSize
+from PySide6.QtCore import Qt, QPoint, QRect, QSize, Signal
 from PySide6.QtWidgets import QLayout, QWidget, QVBoxLayout, QPushButton, QStackedWidget
 
 
@@ -79,6 +79,8 @@ class WrappingTabWidget(QWidget):
     """Замена QTabWidget: панель кнопок-вкладок на FlowLayout (переносятся в
     несколько рядов) + QStackedWidget со страницами."""
 
+    currentChanged = Signal(int)   # как у QTabWidget: смена активной вкладки
+
     def __init__(self, parent=None):
         super().__init__(parent)
         outer = QVBoxLayout(self)
@@ -109,9 +111,12 @@ class WrappingTabWidget(QWidget):
 
     def setCurrentIndex(self, index):
         if 0 <= index < self._stack.count():
+            changed = index != self._stack.currentIndex()
             self._stack.setCurrentIndex(index)
             for i, b in enumerate(self._buttons):
                 b.setChecked(i == index)
+            if changed:
+                self.currentChanged.emit(index)
 
     def currentIndex(self):
         return self._stack.currentIndex()

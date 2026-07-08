@@ -1,4 +1,5 @@
-﻿from PySide6.QtWidgets import QWidget, QVBoxLayout, QPushButton, QScrollArea
+﻿from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
+                               QScrollArea)
 from PySide6.QtCore import Qt
 from flowlayout import WrappingTabWidget
 from widgets import (CopyableField, CopyableDateField, CopyableTextEdit,
@@ -54,6 +55,8 @@ class AccountTabs(WrappingTabWidget):
         self.f_login = CopyableField()
         self.f_password = CopyableField(is_password=True)
         self.gen_pass_btn = QPushButton("СГЕНЕРИРОВАТЬ ПАРОЛЬ")
+        self.gen_pass_cfg_btn = QPushButton("ПАРАМЕТРЫ ГЕНЕРАЦИИ")
+        self.gen_pass_cfg_btn.setToolTip("Настройки генерации пароля")
         self.f_password_date = CopyableDateField(is_datetime=False)
         self.f_pwd_interval = IntervalField()
 
@@ -61,7 +64,11 @@ class AccountTabs(WrappingTabWidget):
         l.addWidget(self.f_login)
         l.addWidget(heading_label("Пароль:"))
         l.addWidget(self.f_password)
-        l.addWidget(self.gen_pass_btn)
+        gen_row = QHBoxLayout()
+        gen_row.setSpacing(5)
+        gen_row.addWidget(self.gen_pass_btn)
+        gen_row.addWidget(self.gen_pass_cfg_btn)
+        l.addLayout(gen_row)
         l.addWidget(heading_label("Пароль сменён:"))
         l.addWidget(self.f_password_date)
         l.addWidget(heading_label("Сменять пароль каждые:"))
@@ -185,6 +192,7 @@ class AccountTabs(WrappingTabWidget):
         self.f_linked.set_editable(editable)
 
         self.gen_pass_btn.setVisible(editable)
+        self.gen_pass_cfg_btn.setVisible(editable)
         self.gen_pd_btn.setVisible(editable)
 
         self.f_questions_widget.set_editable(editable)
