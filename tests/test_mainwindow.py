@@ -12,7 +12,7 @@ import pytest
 
 @pytest.fixture
 def window(qapp, tmp_path, monkeypatch):
-    from hranilka import config
+    from hranilka.core import config
     monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "config.json")
     from hranilka.ui import main_window as main
     monkeypatch.setattr(main, "BASE_DIR", tmp_path)
@@ -104,7 +104,7 @@ def test_idle_check_locks_plaintext_card(window, monkeypatch):
 def test_restore_plaintext_backup_no_winerror(window, tmp_path):
     """Баг 1: восстановление обычной (незашифрованной) БД из бэкапа. Соединение
     закрывается ДО замены файла, поэтому os.replace не падает с WinError 5."""
-    from hranilka.data import backup as bk
+    from hranilka.services import backup as bk
     db = window.db
     fid = db.add_folder("Папка")
     sid = db.add_service("Сервис", fid)

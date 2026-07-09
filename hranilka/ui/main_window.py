@@ -10,9 +10,9 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QSplitter, QLabel,
                                QComboBox, QAbstractItemView)
 from PySide6.QtCore import Qt, QTimer, QDateTime
 from PySide6.QtGui import QFont
-from hranilka.data import backup as bk
+from hranilka.services import backup as bk
 
-from hranilka.config import Config
+from hranilka.core.config import Config
 from hranilka.data.database import (Database, FutureSchemaError, PreMigrationBackupError,
                       VaultConflictError)
 from hranilka.ui.vault_controller import VaultController
@@ -20,9 +20,9 @@ from hranilka.ui.chrome import WindowChromeMixin
 from hranilka.ui.shortcuts_mixin import ShortcutsMixin
 from hranilka.ui.account_card import AccountCardMixin
 from hranilka.ui.tree import AccountTree, TreeMixin
-from hranilka import instance_lock
-from hranilka import util
-from hranilka.paths import BASE_DIR
+from hranilka.core import instance_lock
+from hranilka.core import util
+from hranilka.core.paths import BASE_DIR
 from hranilka.ui.dialogs import SettingsDialog, RecycleBinDialog, ExportDialog
 from hranilka.ui.tabs import AccountTabs
 from hranilka.ui.titlebar import TitleBar, ResizableContainer

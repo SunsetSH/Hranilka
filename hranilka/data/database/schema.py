@@ -6,8 +6,8 @@ import os
 from datetime import datetime
 
 from hranilka.data.errors import FutureSchemaError, PreMigrationBackupError
-from hranilka.data.state import DbBase
-from hranilka.util import best_effort_wipe
+from hranilka.data.database.state import DbBase
+from hranilka.core.util import best_effort_wipe
 
 # Версия схемы базы данных. Увеличивается при изменении структуры таблиц,
 # чтобы _migrate() мог обновить существующие документы пользователей.
@@ -404,7 +404,7 @@ class DbSchemaMixin(DbBase):
         нумерованные шаги из реестра MIGRATIONS. Имя и сигнатура сохранены —
         тесты патчат метод на экземпляре. Импорт отложенный: runner импортирует
         SCHEMA_VERSION из этого модуля (разрыв цикла schema↔runner)."""
-        from hranilka.data.migrations import runner
+        from hranilka.data.database.migrations import runner
         runner.run(self)
 
     @staticmethod

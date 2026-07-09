@@ -5,7 +5,7 @@ import asyncio
 import logging
 
 from hranilka.data.errors import StaleSessionError
-from hranilka.data.state import DbBase
+from hranilka.data.database.state import DbBase
 
 
 class DbConcurrencyMixin(DbBase):

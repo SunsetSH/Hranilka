@@ -150,7 +150,7 @@ def _gallery_rows(db, account_id):
 def test_serialize_db_stays_lock_wrapped():
     """serialize_db не должен попасть в _DB_NO_LOCK (иначе сериализация БД шла бы
     без лока параллельно записи в conn — гонка)."""
-    from hranilka.data import database
+    from hranilka.data.database import database
     assert "serialize_db" not in database._DB_NO_LOCK
 
 

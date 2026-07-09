@@ -14,8 +14,8 @@ from hranilka.data.models import AccountData
 from hranilka.ui.generator_dialog import GeneratorSettingsDialog
 from hranilka.generators import password_gen
 from hranilka.generators import pd_generator
-from hranilka import util
-from hranilka import domain
+from hranilka.core import util
+from hranilka.core import domain
 from hranilka.ui import theme
 
 

@@ -109,7 +109,7 @@ def test_gallery_add_item_no_floating_window(qapp):
 def test_accounttabs_build_no_floating_window(qapp, tmp_path, monkeypatch):
     """Строим AccountTabs (WrappingTabWidget + FlowLayout) как в живом окне и
     наполняем галерею/коды/вопросы/связи — ловим лишние top-level окна."""
-    from hranilka import config
+    from hranilka.core import config
     monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "config.json")
     cfg = config.Config()
     from hranilka.ui.tabs import AccountTabs
@@ -166,7 +166,7 @@ def test_accounttabs_build_no_floating_window(qapp, tmp_path, monkeypatch):
 
 
 def test_mainwindow_switch_accounts_no_floating_window(qapp, tmp_path, monkeypatch):
-    from hranilka import config
+    from hranilka.core import config
     monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "config.json")
     from hranilka.ui import main_window as main
     monkeypatch.setattr(main, "BASE_DIR", tmp_path)

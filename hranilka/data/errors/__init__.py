@@ -1,46 +1,9 @@
-"""Доменные исключения слоя данных (вынесены из database.py, этап 2)."""
+"""Доменные исключения слоя данных: по файлу на класс, публичные имена
+реэкспортируются здесь."""
+from hranilka.data.errors.future_schema import FutureSchemaError
+from hranilka.data.errors.premigration_backup import PreMigrationBackupError
+from hranilka.data.errors.stale_session import StaleSessionError
+from hranilka.data.errors.vault_conflict import VaultConflictError
 
-
-class FutureSchemaError(Exception):
-    """База создана более новой версией программы (её схема новее поддерживаемой).
-    Открывать такую базу нельзя: «миграция вниз» повредила бы данные."""
-
-    def __init__(self, found, supported):
-        self.found = found
-        self.supported = supported
-        super().__init__(
-            f"База создана более новой версией Хранилки (схема {found}, "
-            f"поддерживается {supported}). Обновите программу."
-        )
-
-
-class VaultConflictError(Exception):
-    """Файл-БД на диске изменился извне (другой программой, синхронизацией,
-    восстановлением) с момента, как мы его открыли/последний раз сохранили.
-    Перезапись затёрла бы чужие изменения — поэтому требуется решение пользователя."""
-
-
-class PreMigrationBackupError(Exception):
-    """Не удалось создать durable-копию БД перед необратимой правкой схемы
-    (миграция версии или деструктивный dedup + пересборка UNIQUE-индексов).
-
-    Без резервной копии продолжать нельзя: сбой в процессе оставил бы базу в
-    промежуточном (частично мигрированном) состоянии без пути к откату.
-    Открытие прерывается так же, как при FutureSchemaError — с понятным
-    сообщением пользователю (см. _create_tables_or_exit в main.py)."""
-
-    def __init__(self, path, cause):
-        self.path = path
-        self.cause = cause
-        super().__init__(
-            f"Не удалось создать резервную копию базы перед изменением "
-            f"схемы ({path}): {cause}. Изменение отменено, база не тронута. "
-            f"Освободите место на диске/проверьте доступ к папке и повторите."
-        )
-
-
-class StaleSessionError(Exception):
-    """Фоновая run_async-операция относится к уже закрытой/сменённой сессии БД
-    (между постановкой в очередь и выполнением произошёл close/lock/restore).
-    Вызыватель должен трактовать это как устаревший результат и не применять его."""
-
+__all__ = ["FutureSchemaError", "PreMigrationBackupError",
+           "StaleSessionError", "VaultConflictError"]

@@ -18,14 +18,14 @@ CODING_FONTS = [
     "Liberation Mono",
 ]
 
-from hranilka.config import RETRO_THEMES
-from hranilka.paths import BASE_DIR
+from hranilka.core.config import RETRO_THEMES
+from hranilka.core.paths import BASE_DIR
 from PySide6.QtWidgets import QColorDialog
 from hranilka.ui.theme import ThemedDialog, themed_confirm, themed_info, dialog_stylesheet
 from hranilka.ui.flowlayout import WrappingTabWidget
-from hranilka.data import backup as bk
-from hranilka import util
-from hranilka import shortcuts
+from hranilka.services import backup as bk
+from hranilka.core import util
+from hranilka.core import shortcuts
 
 from hranilka.ui.dialogs.key_capture import KeyCaptureDialog
 from hranilka.ui.dialogs.recovery import RecoveryCodeDialog

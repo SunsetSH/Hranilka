@@ -165,14 +165,16 @@ Remove-Item -Recurse -Force build, dist -ErrorAction SilentlyContinue
 
 ```
 main.py                    — тонкая точка входа (python main.py / PyInstaller)
-hranilka/                  — код приложения (пакет)
+hranilka/                  — код приложения (__version__ — версия релиза)
 ├── app.py                 — bootstrap: QApplication + qasync-цикл
-├── config.py, paths.py, util.py, domain.py, shortcuts.py, instance_lock.py
+├── core/                  — конфиг, пути, утилиты, доменные правила, хоткеи
 ├── crypto/store.py        — конвертное шифрование (Argon2id + AES-256-GCM)
 ├── data/                  — слой данных (Qt-free)
-│   ├── database.py        — Database: CRUD + сборка из mixin-модулей
-│   ├── concurrency.py / persistence.py / schema.py / errors.py
-│   ├── migrations/        — нумерованные миграции схемы (runner + реестр)
+│   ├── database/          — Database: CRUD + concurrency/persistence/schema
+│   │   └── migrations/    — нумерованные миграции схемы (runner + реестр)
+│   ├── errors/            — исключения слоя данных (файл на класс)
+│   └── models/            — модели данных (файл на модель)
+├── services/              — прикладные сервисы над данными
 │   ├── backup.py          — бэкапы с ротацией и проверяемое восстановление
 │   └── export.py          — экспорт TXT/CSV/XLSX/HTML
 ├── generators/            — генерация паролей, парольных фраз, ПД

@@ -17,8 +17,8 @@ schema.py (create_tables) — вызываются ДО этого конвей�
 from typing import TYPE_CHECKING
 
 from hranilka.data.errors import FutureSchemaError
-from hranilka.data.migrations import LEGACY_BASE, MIGRATIONS
-from hranilka.data.schema import SCHEMA_VERSION
+from hranilka.data.database.migrations import LEGACY_BASE, MIGRATIONS
+from hranilka.data.database.schema import SCHEMA_VERSION
 
 if TYPE_CHECKING:
     from hranilka.data.database import Database
@@ -34,7 +34,7 @@ def _check_registry() -> None:
         raise RuntimeError(
             f"Реестр миграций не совпадает со SCHEMA_VERSION: "
             f"зарегистрированы {sorted(MIGRATIONS)}, ожидались {sorted(expected)}. "
-            f"См. hranilka/data/migrations/__init__.py.")
+            f"См. hranilka/data/database/migrations/__init__.py.")
 
 
 def run(db: "Database") -> None:

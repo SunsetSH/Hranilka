@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from hranilka.data import backup
+from hranilka.services import backup
 
 
 def _make_db(path):

@@ -13,7 +13,7 @@ from PySide6.QtCore import (Signal, Qt, QDate, QDateTime, QTime, QByteArray,
 from PySide6.QtGui import QPixmap, QImage, QImageReader
 import shiboken6
 from hranilka.ui.theme import themed_info, themed_confirm, mix
-from hranilka import util
+from hranilka.core import util
 
 from hranilka.ui.widgets.common import (FileTooLargeError, _confirm,
                                         _read_file, _warn)

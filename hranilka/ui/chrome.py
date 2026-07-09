@@ -15,7 +15,7 @@ from PySide6.QtCore import Qt, QEvent, QDateTime, QByteArray
 from PySide6.QtGui import QKeySequence
 
 from hranilka.ui import theme
-from hranilka import shortcuts
+from hranilka.core import shortcuts
 from hranilka.data.database import VaultConflictError
 
 

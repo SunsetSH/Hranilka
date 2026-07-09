@@ -6,7 +6,7 @@
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QShortcut, QKeySequence
 
-from hranilka import shortcuts
+from hranilka.core import shortcuts
 
 
 class ShortcutsMixin:

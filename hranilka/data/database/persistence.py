@@ -11,7 +11,7 @@ import tempfile
 
 from hranilka.crypto import store as cs
 from hranilka.data.errors import VaultConflictError
-from hranilka.data.state import DbBase
+from hranilka.data.database.state import DbBase
 
 
 class DbPersistenceMixin(DbBase):

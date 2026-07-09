@@ -19,13 +19,13 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Any
 
-from hranilka.domain import days_until_password_change, canonical_link_pair
+from hranilka.core.domain import days_until_password_change, canonical_link_pair
 
-from hranilka.data.concurrency import DbConcurrencyMixin
+from hranilka.data.database.concurrency import DbConcurrencyMixin
 from hranilka.data.errors import (FutureSchemaError, PreMigrationBackupError,
                                   StaleSessionError, VaultConflictError)
-from hranilka.data.persistence import DbPersistenceMixin
-from hranilka.data.schema import (SCHEMA_VERSION, _REQUIRED_TABLES,
+from hranilka.data.database.persistence import DbPersistenceMixin
+from hranilka.data.database.schema import (SCHEMA_VERSION, _REQUIRED_TABLES,
                                   DbSchemaMixin)
 
 __all__ = ["Database", "SCHEMA_VERSION", "FutureSchemaError",

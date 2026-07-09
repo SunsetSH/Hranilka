@@ -1,7 +1,7 @@
 """Доменная логика (Эпик 4.3): канонизация связей, история паролей, сроки."""
 from datetime import date, timedelta
 
-from hranilka import domain
+from hranilka.core import domain
 
 
 def test_canonical_link_pair_orders_min_max():

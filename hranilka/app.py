@@ -9,7 +9,7 @@ import qasync
 from PySide6.QtGui import QIcon, QImageReader
 from PySide6.QtWidgets import QApplication
 
-from hranilka.paths import RESOURCE_DIR
+from hranilka.core.paths import RESOURCE_DIR
 from hranilka.ui.main_window import MainWindow
 
 

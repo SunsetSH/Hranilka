@@ -7,8 +7,8 @@ from datetime import datetime
 from hranilka.crypto import store as crypto_store
 # Раньше SCHEMA_VERSION импортировался отложенно (разрыв цикла backup↔database);
 # после выноса схемы в schema.py цикла нет — импорт обычный.
-from hranilka.data.schema import SCHEMA_VERSION
-from hranilka.util import best_effort_wipe
+from hranilka.data.database.schema import SCHEMA_VERSION
+from hranilka.core.util import best_effort_wipe
 
 
 _GLOB = "hranilka_backup_*.db"

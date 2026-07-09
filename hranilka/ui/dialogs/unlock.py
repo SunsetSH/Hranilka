@@ -6,7 +6,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog, QFileDialog,
                                QListWidgetItem, QPushButton)
 
 from hranilka.crypto import store as cs
-from hranilka.data import backup as bk
+from hranilka.services import backup as bk
 from hranilka.ui.theme import ThemedDialog, themed_confirm
 
 

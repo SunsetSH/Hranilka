@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
     QStackedWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
-from hranilka import config as config_mod
+from hranilka.core import config as config_mod
 from hranilka.ui.theme import ThemedDialog
 
 

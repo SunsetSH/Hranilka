@@ -59,6 +59,6 @@ def pure_config(tmp_path, monkeypatch):
 
     Указываем config.CONFIG_FILE на несуществующий путь, чтобы тесты не зависели
     от config.json на машине и не перезаписывали его."""
-    from hranilka import config
+    from hranilka.core import config
     monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "config.json")
     return config.Config()

@@ -3,7 +3,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QKeySequence
 from PySide6.QtWidgets import QLabel
 
-from hranilka import shortcuts
+from hranilka.core import shortcuts
 from hranilka.ui.theme import ThemedDialog
 
 

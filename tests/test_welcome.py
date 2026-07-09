@@ -4,7 +4,7 @@ import pytest
 from PySide6.QtCore import Qt, QEvent
 from PySide6.QtGui import QKeyEvent
 
-from hranilka import config as config_mod
+from hranilka.core import config as config_mod
 from hranilka.ui import welcome as ui_welcome
 from hranilka.ui.welcome import WelcomeDialog, should_show
 

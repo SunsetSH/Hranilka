@@ -6,7 +6,7 @@
 ставится вручную тем же номером (v1.1). Формат: "MAJOR.MINOR" или
 "MAJOR.MINOR.PATCH" — Windows дополнит нулями до четырёх чисел.
 
-Не путать со SCHEMA_VERSION (hranilka/data/schema.py) — это версия схемы БД
+Не путать со SCHEMA_VERSION (hranilka/data/database/schema.py) — это версия схемы БД
 для миграций, она меняется независимо."""
 
 __version__ = "1.1"

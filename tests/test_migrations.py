@@ -1,12 +1,12 @@
-"""Пакет миграций (hranilka/data/migrations): реестр нумерованных шагов,
-конвейер runner, совместимость legacy-diff.
+"""Пакет миграций (hranilka/data/database/migrations): реестр нумерованных
+шагов, конвейер runner, совместимость legacy-diff.
 """
 import pytest
 
-from hranilka.data import migrations
+from hranilka.data.database import migrations
+from hranilka.data.database.migrations import runner
+from hranilka.data.database.schema import SCHEMA_VERSION
 from hranilka.data.errors import FutureSchemaError
-from hranilka.data.migrations import runner
-from hranilka.data.schema import SCHEMA_VERSION
 
 
 def test_registry_empty_at_legacy_base():

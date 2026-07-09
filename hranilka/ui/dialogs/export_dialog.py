@@ -3,7 +3,7 @@ from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QFileDialog, QGroupBox,
                                QHBoxLayout, QLabel, QPushButton, QRadioButton,
                                QVBoxLayout)
 
-from hranilka.data import export
+from hranilka.services import export
 from hranilka.ui.theme import ThemedDialog, themed_info
 
 

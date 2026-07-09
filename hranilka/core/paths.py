@@ -10,9 +10,10 @@ from pathlib import Path
 if getattr(sys, "frozen", False):
     BASE_DIR = Path(sys.executable).resolve().parent
 else:
-    # Файл живёт в пакете hranilka/ — корень проекта на уровень выше
-    # (parents[1]); parent завёл бы вторую БД/конфиг внутри пакета.
-    BASE_DIR = Path(__file__).resolve().parents[1]
+    # Файл живёт в hranilka/core/ — корень проекта на ДВА уровня выше
+    # (parents[2]); меньший индекс завёл бы вторую БД/конфиг внутри пакета.
+    # При переносе файла глубже/выше — пересчитать индекс!
+    BASE_DIR = Path(__file__).resolve().parents[2]
 
 # Каталог для бандловых ресурсов (assets/), зашитых в exe через PyInstaller
 # datas. В onefile-сборке они распаковываются во временный _MEIPASS, а не
