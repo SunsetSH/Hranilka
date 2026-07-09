@@ -34,3 +34,29 @@ class DbBase:
 
     def _mark_dirty(self) -> None:
         raise NotImplementedError
+
+    def _write(self, sql: str, params: tuple = ()) -> None:   # persistence
+        raise NotImplementedError
+
+    def _invalidate_gallery_bytes(self) -> None:              # gallery_ops
+        raise NotImplementedError
+
+    def _save_gallery_rows(self, account_id: int,             # gallery_ops
+                           items: list) -> list:
+        raise NotImplementedError
+
+    def _add_account_rows(self, service_id: Optional[int],    # tree_ops
+                          account_name: str, login: Optional[str] = None,
+                          password: Optional[str] = None) -> int:
+        raise NotImplementedError
+
+    def _name_maps(self) -> tuple[dict, dict, dict]:          # bulk
+        raise NotImplementedError
+
+    def _path_from_maps(self, account_id: int, acc: dict,     # bulk (static)
+                        svc: dict, fld: dict) -> str:
+        raise NotImplementedError
+
+    def get_tree_structure(self, sort_mode: str = "manual",   # tree_ops
+                           descending: bool = False) -> list:
+        raise NotImplementedError
