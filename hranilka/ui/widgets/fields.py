@@ -1,7 +1,9 @@
 """Поля карточки аккаунта: копируемые строка/дата/текст и интервал в днях
 (вынесены из widgets.py, этап 5)."""
+import datetime as dt
+
 from PySide6.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QLineEdit, QPushButton, QTextEdit, QApplication, QSpinBox)
-from PySide6.QtCore import Signal, Qt, QDate, QDateTime, QTime
+from PySide6.QtCore import Signal, Qt
 
 
 class CopyableField(QWidget):
@@ -86,7 +88,9 @@ class CopyableDateField(QWidget):
         layout.setSpacing(5)
 
         self._is_datetime = is_datetime
-        self.format = "dd.MM.yyyy HH:mm" if is_datetime else "dd.MM.yyyy"
+        # strftime-формат отображения (модель дат — стандартный datetime;
+        # это граница Qt: AccountData о Qt-типах не знает).
+        self.format = "%d.%m.%Y %H:%M" if is_datetime else "%d.%m.%Y"
 
         self.date_widget = QLineEdit()
         # «0» — необязательная цифра: допускает частично заполненное поле.
@@ -103,28 +107,30 @@ class CopyableDateField(QWidget):
         layout.addWidget(self.copy_btn)
 
     def do_copy(self):
-        dt = self.get_date()
-        if dt is None:
+        value = self.get_date()
+        if value is None:
             return
-        QApplication.clipboard().setText(dt.toString(self.format))
+        QApplication.clipboard().setText(value.strftime(self.format))
         self.copy_signal.emit()
 
-    def set_date(self, date):
-        """Принимает QDate, QDateTime, None или строку. None/пусто → «не задано»."""
-        if isinstance(date, QDateTime):
-            self.date_widget.setText(date.toString(self.format))
-        elif isinstance(date, QDate):
+    def set_date(self, value):
+        """Принимает datetime.datetime, datetime.date или None.
+        None/пусто/неизвестный тип → «не задано».
+
+        datetime — подкласс date, поэтому проверяется первым."""
+        if isinstance(value, dt.datetime):
+            text = value.strftime(self.format)
+        elif isinstance(value, dt.date):
+            text = value.strftime("%d.%m.%Y")
             if self._is_datetime:
-                self.date_widget.setText(
-                    QDateTime(date, QTime(0, 0)).toString(self.format))
-            else:
-                self.date_widget.setText(date.toString(self.format))
+                text += " 00:00"
         else:
             # None или неизвестный формат — «не задано», а не «сегодня».
-            self.date_widget.setText("")
+            text = ""
+        self.date_widget.setText(text)
 
     def get_date(self):
-        """QDateTime или None, если дата не задана/не дописана.
+        """datetime.datetime или None, если дата не задана/не дописана.
 
         Для is_datetime незаполненное время считается 00:00 — дата без
         времени не должна пропадать при сохранении."""
@@ -132,15 +138,17 @@ class CopyableDateField(QWidget):
         date_part = raw[:10].strip(" .")
         if not date_part:
             return None
-        d = QDate.fromString(raw[:10], "dd.MM.yyyy")
-        if not d.isValid():
+        try:
+            d = dt.datetime.strptime(raw[:10], "%d.%m.%Y").date()
+        except ValueError:
             return None
-        t = QTime(0, 0)
+        t = dt.time(0, 0)
         if self._is_datetime:
-            parsed = QTime.fromString(raw[11:16], "HH:mm")
-            if parsed.isValid():
-                t = parsed
-        return QDateTime(d, t)
+            try:
+                t = dt.datetime.strptime(raw[11:16], "%H:%M").time()
+            except ValueError:
+                pass                           # время пустое/недописано → 00:00
+        return dt.datetime.combine(d, t)
 
     def set_editable(self, editable):
         self.date_widget.setReadOnly(not editable)

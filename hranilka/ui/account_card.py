@@ -6,7 +6,7 @@
 поведение идентично прежнему. Подмешивается в MainWindow перед QMainWindow."""
 import logging
 
-from PySide6.QtCore import QDate, QDateTime
+from PySide6.QtCore import QDateTime
 from PySide6.QtWidgets import QDialog
 
 from hranilka.data.database import StaleSessionError
@@ -353,7 +353,7 @@ class AccountCardMixin:
         self.tabs.f_name.set_text(d.name)
         self.tabs.f_url.set_text(d.url)
         self.tabs.f_creation_date.set_date(d.creation_date)
-        self.tabs.f_password_date.set_date(d.password_changed_date)  # Теперь просто передаем QDate
+        self.tabs.f_password_date.set_date(d.password_changed_date)
         self.tabs.f_pwd_interval.set_value(d.password_change_interval_days)
         self.tabs.f_notes.set_text(d.notes)
         self.tabs.f_login.set_text(d.login)
@@ -362,7 +362,7 @@ class AccountCardMixin:
         self.tabs.f_first.set_text(d.first_name)
         self.tabs.f_last.set_text(d.last_name)
         self.tabs.f_middle.set_text(d.middle_name)
-        self.tabs.f_birth.set_date(d.birth_date)  # Теперь просто передаем QDate
+        self.tabs.f_birth.set_date(d.birth_date)
         self.tabs.f_address.set_text(d.address)
         self.tabs.f_recovery.set_text(d.recovery_phrase)
         self.tabs.f_device_id.set_text(d.device_id)
@@ -568,8 +568,9 @@ class AccountCardMixin:
         self.tabs.f_first.set_text(person["first"])
         self.tabs.f_last.set_text(person["last"])
         self.tabs.f_middle.set_text(person["middle"])
-        bd = person["birth_date"]
-        self.tabs.f_birth.set_date(QDate(bd.year, bd.month, bd.day))
+        # birth_date из генератора — стандартный datetime.date, поле теперь
+        # принимает его напрямую (граница Qt — внутри CopyableDateField).
+        self.tabs.f_birth.set_date(person["birth_date"])
         self.tabs.f_address.set_text(person["address"])
         self.statusBar().showMessage("ПД СГЕНЕРИРОВАНЫ", 2000)
 

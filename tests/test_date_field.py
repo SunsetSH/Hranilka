@@ -1,15 +1,18 @@
-"""CopyableDateField: маска дд.мм.гггг[ чч:мм], «не задано», round-trip."""
-from PySide6.QtCore import QDate, QDateTime, QTime
+"""CopyableDateField: маска дд.мм.гггг[ чч:мм], «не задано», round-trip.
+
+Поле принимает и возвращает стандартные datetime (граница Qt-типов —
+внутри виджета; AccountData о Qt не знает)."""
+from datetime import date, datetime
 
 from hranilka.ui.widgets import CopyableDateField
 
 
 # ─── Поле «только дата» ───────────────────────────────────────────────────────
 
-def test_roundtrip_qdate(qapp):
+def test_roundtrip_date(qapp):
     f = CopyableDateField(is_datetime=False)
-    f.set_date(QDate(2026, 7, 4))
-    assert f.get_date() == QDateTime(QDate(2026, 7, 4), QTime(0, 0))
+    f.set_date(date(2026, 7, 4))
+    assert f.get_date() == datetime(2026, 7, 4, 0, 0)
     assert f.date_widget.text() == "04.07.2026"
 
 
@@ -40,25 +43,25 @@ def test_invalid_date_is_unset(qapp):
 
 # ─── Поле «дата + время» ──────────────────────────────────────────────────────
 
-def test_roundtrip_qdatetime(qapp):
+def test_roundtrip_datetime(qapp):
     f = CopyableDateField(is_datetime=True)
-    dt = QDateTime(QDate(2026, 7, 4), QTime(14, 30))
-    f.set_date(dt)
-    assert f.get_date() == dt
+    value = datetime(2026, 7, 4, 14, 30)
+    f.set_date(value)
+    assert f.get_date() == value
     assert f.date_widget.text() == "04.07.2026 14:30"
 
 
-def test_datetime_qdate_becomes_midnight(qapp):
+def test_datetime_date_becomes_midnight(qapp):
     f = CopyableDateField(is_datetime=True)
-    f.set_date(QDate(2026, 7, 4))
-    assert f.get_date() == QDateTime(QDate(2026, 7, 4), QTime(0, 0))
+    f.set_date(date(2026, 7, 4))
+    assert f.get_date() == datetime(2026, 7, 4, 0, 0)
 
 
 def test_datetime_without_time_is_midnight(qapp):
     """Дата введена, время пустое — дата не пропадает, время 00:00."""
     f = CopyableDateField(is_datetime=True)
     f.date_widget.setText("04.07.2026")
-    assert f.get_date() == QDateTime(QDate(2026, 7, 4), QTime(0, 0))
+    assert f.get_date() == datetime(2026, 7, 4, 0, 0)
 
 
 def test_datetime_time_without_date_is_unset(qapp):
@@ -75,12 +78,12 @@ def test_mask_overwrite_and_backspace(qapp):
 
     f = CopyableDateField(is_datetime=False)
     f.set_editable(True)
-    f.set_date(QDate(2026, 7, 4))      # 04.07.2026
+    f.set_date(date(2026, 7, 4))       # 04.07.2026
 
     # Курсор на позицию месяца, печатаем "12" — перезапись, не вставка
     f.date_widget.setCursorPosition(3)
     QTest.keyClicks(f.date_widget, "12")
-    assert f.get_date().date() == QDate(2026, 12, 4)
+    assert f.get_date().date() == date(2026, 12, 4)
 
     # Backspace очищает последний символ года → дата недописана → None
     f.date_widget.setCursorPosition(10)

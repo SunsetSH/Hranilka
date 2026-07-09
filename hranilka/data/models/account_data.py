@@ -1,10 +1,17 @@
-import uuid
-import platform
-from typing import Any, Optional
-from PySide6.QtCore import QDateTime, QDate, QTime
+"""AccountData — модель карточки аккаунта (примитивы + datetime, БЕЗ Qt).
 
-_DT_FORMAT = "yyyy-MM-dd HH:mm:ss"
-_DATE_FORMAT = "yyyy-MM-dd"
+Даты хранятся стандартными datetime/date; сериализация в строки формата
+SQLite CURRENT_TIMESTAMP («ГГГГ-ММ-ДД ЧЧ:ММ:СС») — тот же формат, что и
+раньше при Qt-типах, поэтому данные в БД полностью совместимы. Конвертация
+в Qt-типы для отображения происходит на границе UI
+(hranilka/ui/widgets/fields.py, CopyableDateField)."""
+import platform
+import uuid
+from datetime import date, datetime, time
+from typing import Any, Optional
+
+_DT_FORMAT = "%Y-%m-%d %H:%M:%S"
+_DATE_FORMAT = "%Y-%m-%d"
 
 
 class AccountData:
@@ -12,8 +19,9 @@ class AccountData:
         self.name = "Новый аккаунт"
         self.url = ""
         # даты «не заданы» → None; creation_date по умолчанию — момент создания
-        self.creation_date: Optional[QDateTime] = QDateTime.currentDateTime()
-        self.password_changed_date: Optional[QDate] = None
+        self.creation_date: Optional[datetime] = \
+            datetime.now().replace(microsecond=0)
+        self.password_changed_date: Optional[date] = None
         self.password_change_interval_days: Optional[int] = None
         self.notes = ""
         self.login = ""
@@ -22,7 +30,7 @@ class AccountData:
         self.first_name = ""
         self.last_name = ""
         self.middle_name = ""
-        self.birth_date: Optional[QDate] = None
+        self.birth_date: Optional[date] = None
         self.address = ""
         self.secret_questions: list[dict[str, str]] = []  # [{"q": "", "a": ""}]
         self.recovery_phrase = ""
@@ -35,41 +43,45 @@ class AccountData:
         self.extra_info = ""
         self.linked_accounts: list[int] = []
 
-    # ----- Конвертация дат Qt <-> строка для хранения -----
+    # ----- Конвертация дат datetime <-> строка для хранения -----
+    # datetime — подкласс date, поэтому isinstance-проверки идут от частного
+    # к общему (сначала datetime, затем date).
 
     @staticmethod
     def _dt_to_str(value: Any) -> Optional[str]:
-        if isinstance(value, QDateTime):
-            return value.toString(_DT_FORMAT)
-        if isinstance(value, QDate):
-            return QDateTime(value, QTime(0, 0)).toString(_DT_FORMAT)
+        if isinstance(value, datetime):
+            return value.strftime(_DT_FORMAT)
+        if isinstance(value, date):
+            return datetime.combine(value, time(0, 0)).strftime(_DT_FORMAT)
         return None
 
     @staticmethod
     def _date_to_str(value: Any) -> Optional[str]:
-        if isinstance(value, QDateTime):
-            return value.date().toString(_DATE_FORMAT)
-        if isinstance(value, QDate):
-            return value.toString(_DATE_FORMAT)
+        if isinstance(value, datetime):
+            return value.date().strftime(_DATE_FORMAT)
+        if isinstance(value, date):
+            return value.strftime(_DATE_FORMAT)
         return None
 
     @staticmethod
-    def _str_to_dt(value: Any) -> Optional[QDateTime]:
-        """Строка → QDateTime; None, если значение пусто/некорректно
+    def _str_to_dt(value: Any) -> Optional[datetime]:
+        """Строка → datetime; None, если значение пусто/некорректно
         (раньше подменялось текущим моментом — ложные данные)."""
         if value:
-            dt = QDateTime.fromString(value, _DT_FORMAT)
-            if dt.isValid():
-                return dt
+            try:
+                return datetime.strptime(value, _DT_FORMAT)
+            except (TypeError, ValueError):
+                pass
         return None
 
     @staticmethod
-    def _str_to_date(value: Any) -> Optional[QDate]:
-        """Строка → QDate; None, если значение пусто/некорректно."""
+    def _str_to_date(value: Any) -> Optional[date]:
+        """Строка → date; None, если значение пусто/некорректно."""
         if value:
-            d = QDate.fromString(value, _DATE_FORMAT)
-            if d.isValid():
-                return d
+            try:
+                return datetime.strptime(value, _DATE_FORMAT).date()
+            except (TypeError, ValueError):
+                pass
         return None
 
     # ----- Сериализация для слоя БД (примитивы) -----
