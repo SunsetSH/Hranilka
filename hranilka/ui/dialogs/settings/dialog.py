@@ -20,14 +20,15 @@ from hranilka.ui.dialogs.settings.appearance import SettingsAppearanceMixin
 from hranilka.ui.dialogs.settings.backup_page import SettingsBackupPageMixin
 from hranilka.ui.dialogs.settings.behavior import SettingsBehaviorMixin
 from hranilka.ui.dialogs.settings.data_page import SettingsDataPageMixin
+from hranilka.ui.dialogs.settings.options import SettingsOptionsMixin
 from hranilka.ui.dialogs.settings.security import SettingsSecurityMixin
 from hranilka.ui.dialogs.settings.shortcuts_page import SettingsShortcutsMixin
 
 
 class SettingsDialog(SettingsAppearanceMixin, SettingsSecurityMixin,
                      SettingsBackupPageMixin, SettingsDataPageMixin,
-                     SettingsBehaviorMixin, SettingsShortcutsMixin,
-                     ThemedDialog):
+                     SettingsOptionsMixin, SettingsBehaviorMixin,
+                     SettingsShortcutsMixin, ThemedDialog):
     settings_applied = Signal()      # финальное «Применить» (полная переинициализация)
     appearance_changed = Signal()    # живой предпросмотр шрифта/темы/цвета (только стили)
 
@@ -110,6 +111,7 @@ class SettingsDialog(SettingsAppearanceMixin, SettingsSecurityMixin,
         self._tabs.addTab(self._page_security(),   "Безопасность")
         self._tabs.addTab(self._page_backup(),     "Бэкапы")
         self._tabs.addTab(self._page_data(),       "Данные")
+        self._tabs.addTab(self._page_options(),    "Опции")
         self._tabs.addTab(self._page_behavior(),   "Поведение")
         self._tabs.addTab(self._page_shortcuts(),  "Шорткаты")
         self.body.addWidget(self._tabs, 1)
@@ -130,6 +132,11 @@ class SettingsDialog(SettingsAppearanceMixin, SettingsSecurityMixin,
         self.body.addLayout(btn_row)
 
         self._apply_group_fonts()
+        # Шрифт QGroupBox наследуется вложенными полями и меняет их sizeHint.
+        # Обновляем защитный минимум после финального применения шрифтов, иначе
+        # поле очистки буфера сохраняет высоту, рассчитанную до стилизации.
+        self.clip_clear_secs.setMinimumHeight(
+            self.clip_clear_secs.sizeHint().height())
         self._fit_width_to_tabs()
         # Снимок значений всех настроек для определения несохранённых изменений
         # при закрытии (блок шифрования сюда не входит — он применяется сразу).
@@ -191,6 +198,7 @@ class SettingsDialog(SettingsAppearanceMixin, SettingsSecurityMixin,
             "clipboard_clear_secs": int(self.clip_clear_secs.text() or "0"),
             "clipboard_clear_on_exit": self.clip_clear_exit_check.isChecked(),
             "recycle_bin_enabled": self.recycle_bin_check.isChecked(),
+            "show_fin_instruments": self.show_fin_check.isChecked(),
             "gallery_thumb_preload": self._thumb_preload_value(),
             "text_color": self.config.get("text_color"),
             "tree_bg_color": self.config.get("tree_bg_color"),
@@ -347,6 +355,24 @@ class SettingsDialog(SettingsAppearanceMixin, SettingsSecurityMixin,
         self._delete_all_confirmed = True
         self.accept()
 
+    def _resolve_show_fin(self) -> bool:
+        """Значение show_fin_instruments для применения. При переходе True→False
+        с существующими фин-записями (включая корзину) — themed-подтверждение;
+        отказ возвращает чекбокс в True (остальные настройки применяются)."""
+        new_val = self.show_fin_check.isChecked()
+        old_val = self.config.get("show_fin_instruments", False)
+        if (old_val and not new_val and self._db is not None
+                and self._db.count_fin_items() > 0):
+            if not themed_confirm(
+                    self.config, self, "Скрыть финансовые инструменты",
+                    "Фин-инструменты будут скрыты из интерфейса (дерево, связи, "
+                    "экспорт, создание). Записи останутся в БД, корзина продолжит "
+                    "их показывать. Несохранённые правки фин-записей будут "
+                    "сброшены. Продолжить?"):
+                self.show_fin_check.setChecked(True)
+                return True
+        return new_val
+
     def _apply_settings(self):
         self.config.set("font",              self.font_combo.currentText())
         self.config.set("font_size",         int(self.font_size_combo.currentText()))
@@ -361,6 +387,9 @@ class SettingsDialog(SettingsAppearanceMixin, SettingsSecurityMixin,
         self.config.set("clipboard_clear_secs",    int(self.clip_clear_secs.text() or "0"))
         self.config.set("clipboard_clear_on_exit", self.clip_clear_exit_check.isChecked())
         self.config.set("recycle_bin_enabled",     self.recycle_bin_check.isChecked())
+        # show_fin_instruments — с предупреждением при переходе True→False с
+        # существующими фин-записями (до записи нового значения).
+        self.config.set("show_fin_instruments",    self._resolve_show_fin())
         self.config.set("image_downscale",         self.image_downscale_check.isChecked())
         self.config.set("gallery_thumb_preload",   self._thumb_preload_value())
         # Шорткаты: в конфиг кладём только отличия от дефолтов (компактно и

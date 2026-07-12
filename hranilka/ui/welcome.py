@@ -25,14 +25,22 @@ def should_show(config) -> bool:
 class WelcomeDialog(ThemedDialog):
     """Слайдовое обучение: заголовок + короткий текст + живой мини-виджет."""
 
-    def __init__(self, config, parent=None):
+    def __init__(self, config, parent=None, on_fin_instruments_changed=None,
+                 on_recycle_bin_changed=None):
         super().__init__(config, parent)
         self.setWindowTitle("Обучение")
         self.setFixedSize(660, 580)
+        # Изменение применяем только при завершении обучения. В главном окне
+        # callback дополнительно проверяет безопасное отключение записей.
+        self._on_fin_instruments_changed = on_fin_instruments_changed
+        self._on_recycle_bin_changed = on_recycle_bin_changed
+        self._initial_fin_instruments = config.get("show_fin_instruments", False)
+        self._initial_recycle_bin = config.get("recycle_bin_enabled", False)
 
         self._stack = QStackedWidget()
         for build in (self._slide_welcome, self._slide_tree, self._slide_card,
-                      self._slide_security, self._slide_tools, self._slide_final):
+                      self._slide_fin_instruments, self._slide_security,
+                      self._slide_tools, self._slide_final):
             self._stack.addWidget(build())
         self.body.addWidget(self._stack, 1)
 
@@ -65,6 +73,26 @@ class WelcomeDialog(ThemedDialog):
 
     def _on_next(self):
         if self._stack.currentIndex() == self._stack.count() - 1:
+            fin_selected = self.fin_instruments_check.isChecked()
+            if fin_selected != self._initial_fin_instruments:
+                if self._on_fin_instruments_changed is not None:
+                    if not self._on_fin_instruments_changed(fin_selected):
+                        self.fin_instruments_check.setChecked(
+                            self._initial_fin_instruments)
+                        return
+                else:
+                    self.config.set("show_fin_instruments", fin_selected)
+                    self.config.save()
+            recycle_selected = self.recycle_bin_check.isChecked()
+            if recycle_selected != self._initial_recycle_bin:
+                if self._on_recycle_bin_changed is not None:
+                    if not self._on_recycle_bin_changed(recycle_selected):
+                        self.recycle_bin_check.setChecked(
+                            self._initial_recycle_bin)
+                        return
+                else:
+                    self.config.set("recycle_bin_enabled", recycle_selected)
+                    self.config.save()
             self.accept()
         else:
             self._go(+1)
@@ -137,6 +165,44 @@ class WelcomeDialog(ThemedDialog):
             f"QLabel {{ border: 1px outset #808080; background-color: {tree_bg}; "
             f"color: {text_color}; padding: 2px 6px; }}")
         return chip
+
+    def _choice_panel(self, question: str, checkbox_text: str, checked: bool,
+                      enabled_text: str, disabled_text: str):
+        """Наглядный выбор: вопрос, активный чекбокс и явная расшифровка."""
+        _, _, text_color, tree_bg, _ = self._theme_colors()
+        panel = QFrame()
+        panel.setStyleSheet(
+            f"QFrame {{ border: 2px inset #808080; background-color: {tree_bg}; }}"
+            f"QLabel {{ border: none; color: {text_color}; }}"
+            f"QCheckBox {{ border: none; }}")
+        panel_lay = QVBoxLayout(panel)
+        panel_lay.setSpacing(8)
+
+        prompt = QLabel(question)
+        prompt_font = prompt.font()
+        prompt_font.setBold(True)
+        prompt.setFont(prompt_font)
+        prompt.setWordWrap(True)
+        panel_lay.addWidget(prompt)
+
+        checkbox = QCheckBox(checkbox_text)
+        checkbox.setChecked(checked)
+        panel_lay.addWidget(checkbox)
+
+        status = QLabel()
+        status_font = status.font()
+        status_font.setBold(True)
+        status.setFont(status_font)
+        status.setWordWrap(True)
+
+        def sync_status(is_checked):
+            choice = enabled_text if is_checked else disabled_text
+            status.setText(f"ВАШ ВЫБОР: {choice}")
+
+        checkbox.toggled.connect(sync_status)
+        sync_status(checked)
+        panel_lay.addWidget(status)
+        return panel, checkbox, status
 
     # ----- Слайды -----
 
@@ -270,6 +336,42 @@ class WelcomeDialog(ThemedDialog):
         lay.addStretch()
         return page
 
+    def _slide_fin_instruments(self):
+        page, lay = self._slide(
+            "Нужны ли вам финансовые инструменты?",
+            "Хранилка умеет хранить банковские карты и криптокошельки рядом "
+            "с аккаунтами. Выберите, показывать ли эти возможности в интерфейсе.",
+        )
+
+        preview = QFrame()
+        preview.setFrameShape(QFrame.StyledPanel)
+        preview_lay = QVBoxLayout(preview)
+        preview_lay.setSpacing(8)
+        preview_lay.addWidget(QLabel("[КАРТА]  •••• 6588   |   [КОШЕЛЁК] 0x7A…91"))
+        linked = QLabel("Свяжите инструмент с аккаунтом — переход работает в обе стороны.")
+        linked.setWordWrap(True)
+        preview_lay.addWidget(linked)
+        lay.addWidget(preview)
+
+        choice, self.fin_instruments_check, self._fin_choice_status = (
+            self._choice_panel(
+                "Использовать карты и криптокошельки?",
+                "Да, использовать финансовые инструменты",
+                self._initial_fin_instruments,
+                "ИСПОЛЬЗОВАТЬ — разделы карт и кошельков будут доступны.",
+                "НЕ ИСПОЛЬЗОВАТЬ — эти разделы будут скрыты."))
+        self.fin_instruments_check.setToolTip(
+            "После завершения обучения настройка сразу применится к интерфейсу.")
+        lay.addWidget(choice)
+
+        hint = QLabel(
+            "Если позже передумаете: Настройки → Опции. Отключение только "
+            "скрывает финансовые записи из интерфейса и не удаляет их из базы.")
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+        lay.addStretch()
+        return page
+
     def _slide_security(self):
         page, lay = self._slide(
             "Защитите свои данные",
@@ -352,16 +454,19 @@ class WelcomeDialog(ThemedDialog):
         export_lay.addStretch()
         lay.addLayout(self._feature_row("Экспорт", export_box))
 
-        hint = QLabel("Удалённое попадает в корзину (если включена) — "
-                      "его можно вернуть.")
-        hint.setWordWrap(True)
-        lay.addWidget(hint)
-        bin_box = QCheckBox("Удалять в корзину")
-        bin_box.setChecked(self.config.get("recycle_bin_enabled", False))
-        bin_box.setEnabled(False)
-        bin_box.setToolTip("Пример — настоящий переключатель: "
-                           "Настройки → Поведение")
-        lay.addWidget(bin_box)
+        choice, self.recycle_bin_check, self._recycle_choice_status = (
+            self._choice_panel(
+                "Нужна ли вам корзина для удалённых записей?",
+                "Да, использовать корзину",
+                self._initial_recycle_bin,
+                "ИСПОЛЬЗОВАТЬ — удалённые записи можно будет восстановить.",
+                "НЕ ИСПОЛЬЗОВАТЬ — записи будут удаляться сразу и безвозвратно."))
+        self.recycle_bin_check.setToolTip(
+            "После завершения обучения настройка сразу применится к интерфейсу.")
+        lay.addWidget(choice)
+        location = QLabel("Изменить позже: Настройки → Опции.")
+        location.setWordWrap(True)
+        lay.addWidget(location)
         lay.addStretch()
         return page
 

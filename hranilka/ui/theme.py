@@ -4,7 +4,7 @@ QMessageBox/QInputDialog."""
 
 from PySide6.QtWidgets import (QDialog, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                                QLineEdit, QPushButton, QComboBox, QListWidget,
-                               QListWidgetItem)
+                               QListWidgetItem, QLayout)
 from PySide6.QtGui import QColor
 from PySide6.QtCore import Qt, QTimer
 
@@ -214,6 +214,31 @@ class ThemedDialog(QDialog):
                 ctypes.windll.user32.SetWindowDisplayAffinity(int(self.winId()), 0x00000011)
             except Exception:
                 pass
+        # Windows иногда подменяет запрошенную геометрию окна УЖЕ ПОСЛЕ того,
+        # как Qt разложил формы под старый размер (см. предупреждение
+        # QWindowsWindow::setGeometry на мониторах с нестандартным DPI/масштабом —
+        # запрошенный размер отличается от «Resulting geometry»). До следующего
+        # пересчёта раскладки (например, при перетаскивании окна) некоторые поля
+        # формы остаются сжатыми — их sizeHint был посчитан под неактуальный
+        # размер. Пересчитываем раскладку один раз, когда событийный цикл
+        # освободится и система уже применит финальную геометрию.
+        QTimer.singleShot(0, self._relayout_after_show)
+
+    def _relayout_after_show(self):
+        """Принудительно пересчитать все вложенные layout'ы под текущую
+        (уже финальную) геометрию окна — см. showEvent.
+
+        Некоторые диалоги (SettingsDialog) фиксируют высоту явным resize() при
+        открытии — под тогдашние, ещё не пересчитанные sizeHint'ы полей. Раз
+        содержимому теперь может требоваться больше места, отдаём его: высоту
+        окна увеличиваем до актуального sizeHint (никогда не уменьшаем — окно
+        не должно «прыгать» меньше того, что пользователь мог уже увидеть)."""
+        for layout in self.findChildren(QLayout):
+            layout.invalidate()
+            layout.activate()
+        hint = self.sizeHint()
+        if hint.height() > self.height():
+            self.resize(self.width(), hint.height())
 
     def closeEvent(self, e):
         super().closeEvent(e)
@@ -254,7 +279,12 @@ def themed_confirm(config, parent, title, text):
     d = ThemedDialog(config, parent)
     d.setWindowTitle(title)
     lay = d.body
-    lay.addWidget(QLabel(text))
+    label = QLabel(text)
+    # Длинные подтверждения не должны растягивать диалог до ширины всей
+    # строки: ограничиваем текстовую область и даём QLabel перенести текст.
+    label.setWordWrap(True)
+    label.setMaximumWidth(720)
+    lay.addWidget(label)
     _buttons_row(lay, d, "Да", "Нет")
     return d.exec() == QDialog.Accepted
 
@@ -274,7 +304,8 @@ def themed_input(config, parent, title, label, text=""):
     return edit.text(), ok
 
 
-def themed_choice(config, parent, title, label, options):
+def themed_combo_choice(config, parent, title, label, options):
+    """Выбор одного варианта из выпадающего списка. Возвращает (текст, ok)."""
     d = ThemedDialog(config, parent)
     d.setWindowTitle(title)
     d.setMinimumWidth(320)
@@ -286,6 +317,36 @@ def themed_choice(config, parent, title, label, options):
     _buttons_row(lay, d, "OK", "Отмена")
     ok = d.exec() == QDialog.Accepted
     return combo.currentText(), ok
+
+
+def themed_choice(config, parent, title, text, buttons, default_index=-1):
+    """Диалог с произвольным рядом кнопок. Возвращает индекс нажатой кнопки
+    или None при закрытии без выбора (Esc/крестик).
+    default_index — кнопка по умолчанию (Enter); -1 — последняя."""
+    d = ThemedDialog(config, parent)
+    d.setWindowTitle(title)
+    lay = d.body
+    lbl = QLabel(text)
+    lbl.setWordWrap(True)
+    lbl.setMaximumWidth(560)
+    lay.addWidget(lbl)
+    result = {"index": None}
+
+    def choose(i):
+        result["index"] = i
+        d.accept()
+
+    row = QHBoxLayout()
+    row.addStretch()
+    default = default_index if default_index >= 0 else len(buttons) - 1
+    for i, caption in enumerate(buttons):
+        btn = QPushButton(caption)
+        btn.setDefault(i == default)
+        btn.clicked.connect(lambda checked=False, idx=i: choose(idx))
+        row.addWidget(btn)
+    lay.addLayout(row)
+    d.exec()
+    return result["index"]
 
 
 def themed_multiselect(config, parent, title, items, preselected=None):

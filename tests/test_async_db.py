@@ -52,6 +52,16 @@ async def test_async_method_matches_sync(adb):
     assert card["fields"]["account_name"] == "Акк"
 
 
+async def test_invalidate_async_session_aborts_old_requests(adb):
+    """Разрушительная операция инвалидирует queued run_async старой сессии."""
+    old_session = adb.current_session()
+    adb.invalidate_async_session()
+    with pytest.raises(StaleSessionError):
+        await adb.run_async(adb.add_service, "не должна появиться",
+                            _session=old_session)
+    assert adb.get_services() == []
+
+
 async def test_concurrent_async_inserts_no_corruption(adb):
     sid = adb.add_service("S")
 

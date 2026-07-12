@@ -106,6 +106,17 @@ def test_reject_total_bytes_limit(qapp):
     assert gw._accept_image(_png_bytes(10, 10)) is False
 
 
+def test_orphan_rechecks_count_and_total_limits(qapp):
+    """Смена карточки не должна позволить импорту обойти видимые лимиты."""
+    gw = GalleryWidget()
+    data = _png_bytes(10, 10)
+    gw._MAX_IMAGES_PER_ACCOUNT = 1
+    assert gw._accept_orphan(data, (10, 10), (0, 0, 1)) is False
+    gw._MAX_IMAGES_PER_ACCOUNT = 2
+    assert gw._accept_orphan(data, (10, 10),
+                             (gw._MAX_TOTAL_BYTES, 0, 0)) is False
+
+
 def test_add_item_keeps_bytes_for_corrupt(qapp):
     # Повреждённые байты НЕ теряются: элемент добавляется (placeholder), а данные
     # остаются в get_data(), чтобы сохранение не выкидывало вложение.

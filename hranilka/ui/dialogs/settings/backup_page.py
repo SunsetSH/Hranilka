@@ -2,6 +2,11 @@
 Часть SettingsDialog (dialog.py) — методы вынесены дословно (backlog-разрез по страницам)."""
 from PySide6.QtWidgets import (QVBoxLayout, QHBoxLayout, QGroupBox, QFormLayout, QPushButton, QLabel, QCheckBox, QSpinBox, QLineEdit, QListWidget, QWidget)
 
+# Прямой импорт из модуля диалога (не из пакета hranilka.ui.dialogs — тот
+# реэкспортирует SettingsDialog, собираемый из этого миксина: цикл импорта).
+# Фикс NameError: раньше имя ExportDialog использовалось без импорта.
+from hranilka.ui.dialogs.export_dialog import ExportDialog
+
 
 class SettingsBackupPageMixin:
     # ─── Вкладка: Бэкапы ────────────────────────────────────────────────────
@@ -58,6 +63,7 @@ class SettingsBackupPageMixin:
         if not self._db:
             return
         tree = self._db.export_subtree()
-        dlg = ExportDialog(self.config, tree, "Вся база", self)
+        dlg = ExportDialog(self.config, tree, "Вся база", self,
+                           show_fin=self.config.get("show_fin_instruments", False))
         dlg.exec()
 

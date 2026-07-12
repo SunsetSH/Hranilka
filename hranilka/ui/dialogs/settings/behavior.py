@@ -1,10 +1,14 @@
 """Вкладка «Поведение»: подтверждения, буфер обмена, корзина, галерея,
 повторный показ обучения.
 Часть SettingsDialog (dialog.py) — методы вынесены дословно (backlog-разрез по страницам)."""
-from PySide6.QtWidgets import (QVBoxLayout, QHBoxLayout, QGroupBox, QFormLayout, QComboBox, QPushButton, QLabel, QCheckBox, QLineEdit, QWidget)
+from PySide6.QtWidgets import (QVBoxLayout, QHBoxLayout, QGroupBox, QFormLayout, QComboBox, QPushButton, QLabel, QCheckBox, QLineEdit, QSizePolicy, QWidget)
 from PySide6.QtGui import QIntValidator
 from hranilka.ui.theme import themed_info
 from hranilka.ui.welcome import WelcomeDialog
+
+# Минимальная ширина числовых полей настроек (пикс.): чтобы на стилях без
+# растяжения полей формы значение не сжималось и текст не обрезался.
+_NUM_FIELD_MIN_W = 120
 
 
 class SettingsBehaviorMixin:
@@ -13,7 +17,27 @@ class SettingsBehaviorMixin:
     def _show_welcome(self):
         # Вложенный модальный диалог — норма кодовой базы (themed_info и т.п.).
         # Флаг welcome_shown здесь не трогаем: он касается только первого запуска.
-        WelcomeDialog(self.config, self).exec()
+        WelcomeDialog(
+            self.config, self, self._apply_welcome_fin_instruments,
+            self._apply_welcome_recycle_bin).exec()
+
+    def _apply_welcome_fin_instruments(self, show: bool) -> bool:
+        """Передать выбор учебного слайда главному окну и синхронизировать UI."""
+        main_window = self.window()
+        apply_choice = getattr(main_window, "_apply_welcome_fin_instruments", None)
+        if apply_choice is None or not apply_choice(show):
+            return False
+        self.show_fin_check.setChecked(show)
+        return True
+
+    def _apply_welcome_recycle_bin(self, enabled: bool) -> bool:
+        """Передать выбор корзины главному окну и синхронизировать вкладку."""
+        main_window = self.window()
+        apply_choice = getattr(main_window, "_apply_welcome_recycle_bin", None)
+        if apply_choice is None or not apply_choice(enabled):
+            return False
+        self.recycle_bin_check.setChecked(enabled)
+        return True
 
     def _page_behavior(self):
         w = QWidget()
@@ -30,8 +54,19 @@ class SettingsBehaviorMixin:
 
         clip_group = QGroupBox("Буфер обмена")
         cf = QFormLayout(clip_group)
+        # Не полагаемся на стиль платформы: некоторые стили оставляют поля
+        # формы размером sizeHint до следующего перерасчёта геометрии окна.
+        cf.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
         self.clip_clear_secs = QLineEdit(str(self.config.get("clipboard_clear_secs", 0)))
         self.clip_clear_secs.setValidator(QIntValidator(0, 3600, self))
+        # Пол ширины: на стилях, где поле формы не растягивается (FieldsStayAtSizeHint),
+        # числовое поле сжималось и текст обрезался. Выравниваем по прочим числовым
+        # полям настроек (idle-минуты).
+        self.clip_clear_secs.setMinimumWidth(_NUM_FIELD_MIN_W)
+        # Высота — по sizeHint (Fixed), пересчитывается ThemedDialog.showEvent
+        # после того, как система применит финальную геометрию окна (иначе на
+        # некоторых мониторах поле оставалось сжато до перемещения окна).
+        self.clip_clear_secs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         cf.addRow("Очистка буфера:", self.clip_clear_secs)
         cf.addRow("", QLabel("в секундах, 0 — не очищать"))
         self.clip_clear_exit_check = QCheckBox(

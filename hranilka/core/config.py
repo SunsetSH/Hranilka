@@ -70,6 +70,10 @@ class Config:
             "clipboard_clear_secs": 0,
             "clipboard_clear_on_exit": False,
             "recycle_bin_enabled": False,
+            # Показывать финансовые инструменты (карты/кошельки) в интерфейсе:
+            # дерево, связи, экспорт, кнопки создания. Записи в БД и корзина
+            # видны всегда. bool — _coerce_bool подхватит автоматически.
+            "show_fin_instruments": False,
             "screenshot_protect": False,
             "idle_lock_mins": 0,
             "backup_folder": "",

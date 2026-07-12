@@ -22,15 +22,19 @@ class ExportDialog(ThemedDialog):
     """Окно экспорта поддерева/всей базы в TXT/CSV/HTML/XLSX.
 
     tree — структура из Database.export_subtree(); title — что экспортируется
-    (путь узла или «Вся база»)."""
+    (путь узла или «Вся база»); show_fin — показ фин-инструментов включён
+    (опция настроек): при False чекбоксы фин-записей/секретов скрыты и записи
+    в экспорт не попадают (include_fin=False жёстко)."""
 
-    def __init__(self, config, tree, title="Вся база", parent=None):
+    def __init__(self, config, tree, title="Вся база", parent=None,
+                 show_fin=True):
         super().__init__(config, parent)
         self.setWindowTitle("Экспорт")
         self.setModal(True)
         self.setMinimumWidth(460)
         self._tree = tree
         self._title = title
+        self._show_fin = show_fin
 
         lay = self.body
         what = QLabel(f"Что: {title}")
@@ -63,6 +67,23 @@ class ExportDialog(ThemedDialog):
         for c in (self._chk_basic, self._chk_other, self._chk_gallery):
             c.setChecked(True)
             ol.addWidget(c)
+
+        # Финансовые инструменты (карты/кошельки) — отдельная группа. Секреты
+        # (CVV/PIN/seed/ключи) ВЫКЛ по умолчанию и доступны только когда сами
+        # фин-записи включены. При show_fin=False оба чекбокса скрыты и сняты —
+        # фин-записи в экспорт не попадают.
+        self._chk_fin = QCheckBox("Финансовые инструменты")
+        self._chk_fin.setChecked(show_fin)
+        ol.addWidget(self._chk_fin)
+        self._chk_fin_secrets = QCheckBox(
+            "Включить критичные секреты (CVV, PIN, seed-фразы, приватные ключи)")
+        self._chk_fin_secrets.setChecked(False)
+        ol.addWidget(self._chk_fin_secrets)
+        self._chk_fin.toggled.connect(self._on_fin_toggled)
+        self._on_fin_toggled(self._chk_fin.isChecked())
+        if not show_fin:
+            self._chk_fin.setVisible(False)
+            self._chk_fin_secrets.setVisible(False)
         lay.addWidget(opt_group)
 
         warn = QLabel(
@@ -91,6 +112,10 @@ class ExportDialog(ThemedDialog):
         row.addWidget(cancel)
         lay.addLayout(row)
 
+    def _on_fin_toggled(self, checked):
+        # Критичные секреты имеют смысл только при включённых фин-записях.
+        self._chk_fin_secrets.setEnabled(checked)
+
     def _current_format(self):
         return self._fmt_btns.checkedButton().property("fmt")
 
@@ -110,7 +135,8 @@ class ExportDialog(ThemedDialog):
         fmt = self._current_format()
         func, ext, flt = export.FORMATS[fmt]
         if not (self._chk_basic.isChecked() or self._chk_other.isChecked()
-                or (self._chk_gallery.isEnabled() and self._chk_gallery.isChecked())):
+                or (self._chk_gallery.isEnabled() and self._chk_gallery.isChecked())
+                or (self._show_fin and self._chk_fin.isChecked())):
             themed_info(self.config, self, "Экспорт",
                         "Выберите хотя бы один пункт в разделе «Что включить».")
             return
@@ -124,6 +150,9 @@ class ExportDialog(ThemedDialog):
             include_basic=self._chk_basic.isChecked(),
             include_other=self._chk_other.isChecked(),
             include_gallery=self._chk_gallery.isEnabled() and self._chk_gallery.isChecked(),
+            include_fin=self._show_fin and self._chk_fin.isChecked(),
+            include_fin_secrets=(self._show_fin and self._chk_fin.isChecked()
+                                 and self._chk_fin_secrets.isChecked()),
             title=self._title,
             theme=theme_dict(self.config),
         )

@@ -4,7 +4,8 @@ from PySide6.QtCore import Qt
 from hranilka.ui.flowlayout import WrappingTabWidget
 from hranilka.ui.widgets import (CopyableField, CopyableDateField, CopyableTextEdit,
                      SecretQuestionsWidget, CodeListWidget, GalleryWidget,
-                     IntervalField, LinkedAccountsWidget, heading_label)
+                     IntervalField, LinkedAccountsWidget, LinkedFinItemsWidget,
+                     heading_label)
 
 
 class AccountTabs(WrappingTabWidget):
@@ -33,6 +34,7 @@ class AccountTabs(WrappingTabWidget):
         self.f_creation_date = CopyableDateField(is_datetime=True)
         self.f_notes = CopyableTextEdit()
         self.f_linked = LinkedAccountsWidget()
+        self.f_fin_linked = LinkedFinItemsWidget()
 
         l.addWidget(heading_label("Название аккаунта:"))
         l.addWidget(self.f_name)
@@ -44,8 +46,20 @@ class AccountTabs(WrappingTabWidget):
         l.addWidget(self.f_notes)
         l.addWidget(heading_label("Связанные аккаунты:"))
         l.addWidget(self.f_linked)
+        # Секция привязанных карт/кошельков — скрывается при выключенной опции
+        # «Показывать фин. инструменты» (заголовок + виджет, см.
+        # set_fin_section_visible).
+        self.f_fin_linked_heading = heading_label("ПРИВЯЗАННЫЕ КАРТЫ И КОШЕЛЬКИ:")
+        l.addWidget(self.f_fin_linked_heading)
+        l.addWidget(self.f_fin_linked)
         l.addStretch()
         return w
+
+    def set_fin_section_visible(self, visible):
+        """Показать/скрыть секцию «Привязанные карты и кошельки» на карточке
+        аккаунта (заголовок + виджет)."""
+        self.f_fin_linked_heading.setVisible(visible)
+        self.f_fin_linked.setVisible(visible)
 
     def create_tab_login(self):
         w = QWidget(self)
@@ -190,6 +204,7 @@ class AccountTabs(WrappingTabWidget):
         self.f_birth.set_editable(editable)
         self.f_pwd_interval.set_editable(editable)
         self.f_linked.set_editable(editable)
+        self.f_fin_linked.set_editable(editable)
 
         self.gen_pass_btn.setVisible(editable)
         self.gen_pass_cfg_btn.setVisible(editable)

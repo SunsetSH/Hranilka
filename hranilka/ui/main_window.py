@@ -4,9 +4,10 @@
 import sys
 import atexit
 import logging
+from collections import Counter
 from PySide6.QtWidgets import (QApplication, QMainWindow, QSplitter, QLabel,
                                QVBoxLayout, QWidget, QHBoxLayout,
-                               QPushButton, QLineEdit,
+                               QPushButton, QLineEdit, QStackedWidget,
                                QComboBox, QAbstractItemView)
 from PySide6.QtCore import Qt, QTimer, QDateTime
 from PySide6.QtGui import QFont
@@ -19,18 +20,22 @@ from hranilka.ui.vault_controller import VaultController
 from hranilka.ui.chrome import WindowChromeMixin
 from hranilka.ui.shortcuts_mixin import ShortcutsMixin
 from hranilka.ui.account_card import AccountCardMixin
+from hranilka.ui.fin_card import FinCardMixin
 from hranilka.ui.tree import AccountTree, TreeMixin
 from hranilka.core import instance_lock
 from hranilka.core import util
+from hranilka.core.nodetypes import ACCOUNT, FIN_LEAF_TYPES
+from hranilka.core.fin_types import FIN_TYPES
 from hranilka.core.paths import BASE_DIR
 from hranilka.ui.dialogs import SettingsDialog, RecycleBinDialog, ExportDialog
 from hranilka.ui.tabs import AccountTabs
+from hranilka.ui.fin_tabs import FinItemTabs
 from hranilka.ui.titlebar import TitleBar, ResizableContainer
 from hranilka.ui import theme
 
 
-class MainWindow(WindowChromeMixin, ShortcutsMixin, AccountCardMixin,
-                 TreeMixin, QMainWindow):
+class MainWindow(WindowChromeMixin, ShortcutsMixin, FinCardMixin,
+                 AccountCardMixin, TreeMixin, QMainWindow):
     def __init__(self):
         super().__init__()
         self.config = Config()
@@ -78,8 +83,17 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, AccountCardMixin,
         self.search_text = ""
 
         self._current_account_id = None      # id аккаунта в правой панели
-        self._edit_cache = {}                # id -> {"storage":..., "links":[...]} несохранённые правки
-        self._dirty_ids = set()              # аккаунты с несохранёнными правками
+        # Открытая фин-запись правой панели: (node_type, id) | None. Аккаунт и
+        # запись не открыты одновременно (одна правая панель).
+        self._current_fin = None
+        self.current_fin_data = None
+        # id только что созданной записи: карточка после загрузки открывается в
+        # правке (одноразовый флаг (node_type, id), см. _load_fin_into_ui).
+        self._fin_edit_on_load = None
+        # Ключ несохранённых правок — кортеж (node_type, id): id-пространства
+        # аккаунтов и фин-записей раздельны, голый id их бы столкнул.
+        self._edit_cache = {}                # (type, id) -> {"storage":..., "links":[...]}
+        self._dirty_ids = set()              # {(type, id)} — записи с несохранёнными правками
         self._any_db_changes = False         # True если в этой сессии что-то было записано в БД
         # Поколение карточки: растёт при каждом переключении аккаунта. Async-загрузка
         # и async-сохранение сверяют свой gen с текущим — устаревший результат не
@@ -128,20 +142,117 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, AccountCardMixin,
             return
         self.config.set("welcome_shown", True)
         self.config.save()
-        dlg = ui_welcome.WelcomeDialog(self.config, self)
+        dlg = ui_welcome.WelcomeDialog(
+            self.config, self, self._apply_welcome_fin_instruments,
+            self._apply_welcome_recycle_bin)
         dlg.open()
 
-    def closeEvent(self, event):
-        # Аккаунты с несохранёнными правками (+ редактируемый сейчас)
+    def _apply_welcome_fin_instruments(self, show: bool) -> bool:
+        """Применить выбор фин-инструментов из приветственного обучения.
+
+        Отключение использует те же гарантии, что и вкладка «Опции»: записи
+        остаются в базе, но пользователь подтверждает скрытие, если они есть.
+        Возвращаем False, чтобы финальный слайд остался открытым при отказе.
+        """
+        old = self.config.get("show_fin_instruments", False)
+        if old == show:
+            return True
+        if old and not show and self.db.count_fin_items() > 0:
+            if not theme.themed_confirm(
+                    self.config, self, "Скрыть финансовые инструменты",
+                    "Фин-инструменты будут скрыты из интерфейса (дерево, связи, "
+                    "экспорт, создание). Записи останутся в БД, корзина продолжит "
+                    "их показывать. Несохранённые правки фин-записей будут "
+                    "сброшены. Продолжить?"):
+                return False
+        self.config.set("show_fin_instruments", show)
+        self.config.save()
+        self.apply_config()
+        return True
+
+    def _apply_welcome_recycle_bin(self, enabled: bool) -> bool:
+        """Сохранить и сразу применить выбор корзины из обучения."""
+        self.config.set("recycle_bin_enabled", enabled)
+        self.config.save()
+        self.apply_config()
+        return True
+
+    # Подписи типизированного подсчёта несохранённых записей в диалоге закрытия.
+    # Фин-часть строится из реестра (spec.unsaved_label) — новый тип получает
+    # свою строку подсчёта автоматически, без правки MainWindow.
+    _UNSAVED_LABELS = ((ACCOUNT, "Аккаунтов"),) + tuple(
+        (spec.node_type, spec.unsaved_label) for spec in FIN_TYPES.values())
+
+    def _unsaved_keys(self):
+        """Ключи (node_type, id) записей с несохранёнными правками, включая
+        редактируемую сейчас (аккаунт или фин-запись — открыта одна из них)."""
         unsaved = set(self._dirty_ids)
         if self.is_editing and self._current_account_id is not None:
-            unsaved.add(self._current_account_id)
+            unsaved.add((ACCOUNT, self._current_account_id))
+        if self.is_editing and self._current_fin is not None:
+            unsaved.add(self._current_fin)
+        return unsaved
+
+    def _unsaved_summary(self, unsaved):
+        """Текст диалога закрытия: типизированный подсчёт (только ненулевые)."""
+        counts = Counter(node_type for node_type, _id in unsaved)
+        lines = [f"{label}: {counts[t]}" for t, label in self._UNSAVED_LABELS
+                 if counts[t]]
+        return "Есть несохранённые изменения.\n" + "\n".join(lines)
+
+    def _save_unsaved_before_exit(self):
+        """«Сохранить и выйти»: снести текущую карточку в кеш (общий stash) и
+        синхронно записать все черновики _edit_cache в БД (методы под RLock;
+        wait_executor_idle идёт следом по существующему коду закрытия).
+        True — всё записано (кеш очищен); False — ошибка (показана, не выходим)."""
+        if self.is_editing and self._current_fin is not None:
+            self._stash_current_fin_edits()
+        elif self.is_editing and self._current_account_id is not None:
+            self._stash_current_edits(self._current_account_id)
+        show_fin = self.config.get("show_fin_instruments", False)
+        for (node_type, rec_id), cached in list(self._edit_cache.items()):
+            # Защита: при выключенной опции фин-правок в кеше быть не должно
+            # (сброшены при выключении) — пропускаем, не записываем вслепую.
+            if node_type in FIN_LEAF_TYPES and not show_fin:
+                continue
+            try:
+                if node_type == ACCOUNT:
+                    self.db.save_account_with_links(
+                        rec_id, cached["storage"], cached.get("links") or [],
+                        cached.get("fin_links") if show_fin else None)
+                elif node_type in FIN_LEAF_TYPES:
+                    self.db.save_fin_item_with_links(
+                        rec_id, cached["storage"], cached.get("links") or [])
+            except Exception as e:                   # noqa: BLE001 — показать и не выходить
+                storage = cached.get("storage") or {}
+                name = (storage.get("fields", {}).get("account_name")
+                        if node_type == ACCOUNT else storage.get("name")) or "?"
+                logging.error("Не удалось сохранить запись «%s» при выходе: %s",
+                              name, e, exc_info=e)
+                theme.themed_info(
+                    self.config, self, "Ошибка сохранения",
+                    f"Не удалось сохранить запись «{name}».\n"
+                    f"Выход отменён. Подробности — в логе программы.")
+                return False
+        self._any_db_changes = True
+        self._dirty_ids.clear()
+        self._edit_cache.clear()
+        self.is_editing = False
+        return True
+
+    def closeEvent(self, event):
+        # Записи с несохранёнными правками — типизированный подсчёт и три
+        # варианта: сохранить и выйти / выйти без сохранения / вернуться.
+        unsaved = self._unsaved_keys()
         if unsaved and self.config.get("warn_on_exit_unsaved", True):
-            n = len(unsaved)
-            if not theme.themed_confirm(
+            choice = theme.themed_choice(
                 self.config, self, "Несохранённые данные",
-                f"Есть несохранённые изменения (аккаунтов: {n}).\nВыйти без сохранения?",
-            ):
+                self._unsaved_summary(unsaved),
+                ["Сохранить и выйти", "Выйти", "Вернуться"])
+            if choice is None or choice == 2:        # Esc/крестик = «Вернуться»
+                event.ignore()
+                return
+            if choice == 0 and not self._save_unsaved_before_exit():
                 event.ignore()
                 return
 
@@ -281,6 +392,8 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, AccountCardMixin,
         left_layout = QVBoxLayout(left_panel)
         left_layout.setContentsMargins(0, 0, 0, 0)
 
+        # Ряд 1: контейнеры и аккаунт. «+ АККАУНТ» — прямой вызов add_account
+        # (шорткат «добавить аккаунт» тоже на add_account, см. shortcuts_mixin).
         btn_layout = QHBoxLayout()
         self.add_folder_btn = QPushButton(" + ПАПКА ")
         self.add_service_btn = QPushButton(" + СЕРВИС ")
@@ -292,6 +405,19 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, AccountCardMixin,
         btn_layout.addWidget(self.add_service_btn)
         btn_layout.addWidget(self.add_account_btn)
         left_layout.addLayout(btn_layout)
+
+        # Ряд 2: кнопки создания фин-записей из реестра FIN_TYPES (короткая
+        # подпись spec.short_title). Виден только при включённой опции
+        # «Показывать фин. инструменты» — видимость задаётся в apply_config.
+        self.fin_buttons_widget = QWidget()
+        fin_btn_layout = QHBoxLayout(self.fin_buttons_widget)
+        fin_btn_layout.setContentsMargins(0, 0, 0, 0)
+        for type_id, spec in FIN_TYPES.items():
+            fin_btn = QPushButton(f" + {spec.short_title} ")
+            fin_btn.clicked.connect(
+                lambda checked=False, tid=type_id: self.add_fin_record(tid))
+            fin_btn_layout.addWidget(fin_btn)
+        left_layout.addWidget(self.fin_buttons_widget)
 
         # Строка поиска (живой фильтр по названиям)
         self.search_box = QLineEdit()
@@ -350,19 +476,46 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, AccountCardMixin,
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
         right_layout.setContentsMargins(10, 0, 10, 5)
-        
-        self.placeholder_label = QLabel("\n\n[ ВЫБЕРИТЕ АККАУНТ ИЗ ДЕРЕВА ]\n\n")
+
+        # Плашка срока действия карты (над вкладками), скрыта по умолчанию.
+        self.fin_banner = QLabel("")
+        self.fin_banner.setProperty("heading", "true")
+        self.fin_banner.setAlignment(Qt.AlignCenter)
+        self.fin_banner.hide()
+        right_layout.addWidget(self.fin_banner)
+
+        self.placeholder_label = QLabel("\n\n[ ВЫБЕРИТЕ ЗАПИСЬ ИЗ ДЕРЕВА ]\n\n")
         self.placeholder_label.setProperty("heading", "true")
         self.placeholder_label.setAlignment(Qt.AlignCenter)
-        right_layout.addWidget(self.placeholder_label)
-        
+
         self.tabs = AccountTabs(config=self.config)
-        self.tabs.hide()
-        right_layout.addWidget(self.tabs)
+        # Вкладки финансовых карточек — по FinItemTabs на тип из реестра (ключ —
+        # node_type узла дерева: узел несёт только его, не type_id; уникальность
+        # проверена при загрузке реестра — см. fin_types._check_unique_node_types).
+        # fin_tabs — текущая открытая карточка, переключается в _open_fin_card;
+        # до открытия первой карточки — любая (или None, если реестр пуст),
+        # никогда не читается до присваивания в _open_fin_card.
+        self.fin_tabs_by_type = {
+            spec.node_type: FinItemTabs(spec, config=self.config)
+            for spec in FIN_TYPES.values()}
+        self.fin_tabs = next(iter(self.fin_tabs_by_type.values()), None)
+
+        # Правая панель — стек: заглушка / карточка аккаунта / карточки записей.
+        self.right_stack = QStackedWidget()
+        self.right_stack.addWidget(self.placeholder_label)
+        self.right_stack.addWidget(self.tabs)
+        for fin_tabs in self.fin_tabs_by_type.values():
+            self.right_stack.addWidget(fin_tabs)
+        self.right_stack.setCurrentWidget(self.placeholder_label)
+        right_layout.addWidget(self.right_stack)
 
         # Связанные аккаунты: навигация и добавление
         self.tabs.f_linked.navigate_requested.connect(self.on_link_navigate)
         self.tabs.f_linked.add_requested.connect(self.on_add_link_requested)
+
+        # Привязанные карты/кошельки на карточке аккаунта (§8)
+        self.tabs.f_fin_linked.navigate_requested.connect(self.on_fin_link_navigate)
+        self.tabs.f_fin_linked.add_requested.connect(self.on_add_fin_link_requested)
 
         # Индикатор загрузки картинки в галерею (статус-бар)
         self.tabs.f_gallery_widget.upload_status_changed.connect(
@@ -384,18 +537,36 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, AccountCardMixin,
         ]
         for field in copy_fields:
             field.copy_signal.connect(self._on_field_copied)
-        
-        # КНОПКИ РЕДАКТИРОВАНИЯ (Они на месте и работают)
+
+        # Копируемые поля фин-карточек (вкл. секретные — автоочистка буфера
+        # обязательна для всех). Итерация по дескрипторам, без ручных списков;
+        # плюс сигналы вкладки «Связи» каждой карточки.
+        for fin_tabs in self.fin_tabs_by_type.values():
+            fin_tabs.f_name.copy_signal.connect(self._on_field_copied)
+            for _key, widget in fin_tabs.fields():
+                widget.copy_signal.connect(self._on_field_copied)
+            for _key, widget in fin_tabs.list_fields():
+                widget.copy_signal.connect(self._on_field_copied)
+            fin_tabs.f_linked_accounts.navigate_requested.connect(
+                self.on_link_navigate)
+            fin_tabs.f_linked_accounts.add_requested.connect(
+                self.on_add_fin_account_link_requested)
+            # Индикатор загрузки картинки в галерею записи (статус-бар, §5).
+            fin_tabs.f_gallery_widget.upload_status_changed.connect(
+                self._on_gallery_upload_status)
+
+        # КНОПКИ РЕДАКТИРОВАНИЯ — общие для аккаунта и фин-записи, роутинг по
+        # типу открытого узла (edit/save/cancel_current в FinCardMixin).
         self.action_layout = QHBoxLayout()
-        
+
         self.edit_btn = QPushButton(" РЕДАКТИРОВАТЬ ")
-        self.edit_btn.clicked.connect(self.toggle_edit_mode)
-        
+        self.edit_btn.clicked.connect(self.edit_current)
+
         self.save_btn = QPushButton(" СОХРАНИТЬ ")
-        self.save_btn.clicked.connect(self.save_account)
-        
+        self.save_btn.clicked.connect(self.save_current)
+
         self.cancel_btn = QPushButton(" ОТМЕНА ")
-        self.cancel_btn.clicked.connect(self.cancel_edit)
+        self.cancel_btn.clicked.connect(self.cancel_current)
         
         self.action_layout.addWidget(self.edit_btn)
         self.action_layout.addWidget(self.save_btn)
@@ -553,13 +724,46 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, AccountCardMixin,
         # Кнопка корзины (видимость/счётчик зависят от настройки и содержимого)
         self._update_bin_button()
 
+        # Показ финансовых инструментов (кнопки ряда 2, секция карточки аккаунта,
+        # дерево). При выключении — скрыть отовсюду, кроме корзины.
+        self._apply_fin_visibility()
+
+    def _apply_fin_visibility(self):
+        """Применить опцию «Показывать фин. инструменты»: видимость кнопок ряда 2
+        и секции привязанных карт на карточке аккаунта. При изменении опции —
+        очистить открытую фин-карточку/кеш и перестроить дерево."""
+        show = self.config.get("show_fin_instruments", False)
+        self.fin_buttons_widget.setVisible(show)
+        self.tabs.set_fin_section_visible(show)
+        prev = getattr(self, "_fin_shown", None)
+        self._fin_shown = show
+        if prev is None or prev == show:
+            return                    # первый вызов (дерево строит __init__) / без изменений
+        if not show:
+            self._hide_fin_everywhere()
+        self._reload_tree()
+
+    def _hide_fin_everywhere(self):
+        """Скрытие фин-инструментов: закрыть открытую фин-карточку и вычистить
+        несохранённые правки фин-записей из кеша (в UI они больше недоступны).
+        Корзина не затрагивается — фин-записи там видны всегда."""
+        if self._current_fin is not None:
+            self._current_fin = None
+            self.current_fin_data = None
+            self.is_editing = False
+            self._show_placeholder()
+        for key in [k for k in self._edit_cache if k[0] in FIN_LEAF_TYPES]:
+            self._edit_cache.pop(key, None)
+        self._dirty_ids = {k for k in self._dirty_ids if k[0] not in FIN_LEAF_TYPES}
+
     def export_all(self):
         """Экспорт всей базы — то же, что кнопка «Экспортировать всё» в настройках."""
         tree = self.db.export_subtree()
         if not tree:
             self.statusBar().showMessage("Нечего экспортировать", 3000)
             return
-        ExportDialog(self.config, tree, "Вся база", self).exec()
+        ExportDialog(self.config, tree, "Вся база", self,
+                     show_fin=self.config.get("show_fin_instruments", False)).exec()
 
     def open_settings(self):
         dialog = SettingsDialog(self.config, self)
@@ -582,7 +786,7 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, AccountCardMixin,
     def open_export(self, node):
         """Экспорт поддерева (папка/сервис/аккаунт) в выбранный формат.
         Данные берутся из текущей БД (в шифр. режиме — из памяти)."""
-        if node["type"] == "account":
+        if node["type"] == ACCOUNT:
             title = self.db.get_account_path(node["id"])
         else:
             title = node["name"]
@@ -590,7 +794,8 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, AccountCardMixin,
         if not tree:
             self.statusBar().showMessage("Нечего экспортировать", 3000)
             return
-        ExportDialog(self.config, tree, title, self).exec()
+        ExportDialog(self.config, tree, title, self,
+                     show_fin=self.config.get("show_fin_instruments", False)).exec()
 
     def _update_bin_button(self):
         """Синхронизирует кнопку корзины в заголовке с числом аккаунтов в
@@ -854,6 +1059,7 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, AccountCardMixin,
     def _after_db_reopened(self, message):
         """Сброс состояния и UI после переоткрытия БД (восстановление бэкапа)."""
         self._current_account_id = None
+        self._current_fin = None
         self._edit_cache.clear()
         self._dirty_ids.clear()
         self.current_account_data = None
@@ -868,7 +1074,27 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, AccountCardMixin,
     # ─── Удаление всех данных ────────────────────────────────────────────────
 
     def _wipe_all_data(self):
-        self.db.wipe_all_data()
+        # Останавливаем операции карточек/галерей и инвалидируем текущую
+        # сессию ДО барьера executor-а. Уже queued run_async не сможет записать
+        # данные после очистки; выполняющаяся операция завершится до барьера.
+        self._quiesce_card_async()
+        self.db.invalidate_async_session()
+        if not self.db.wait_executor_idle():
+            theme.themed_info(
+                self.config, self, "Операции не завершены",
+                "Фоновые операции с базой ещё идут. Полная очистка отменена; "
+                "подождите несколько секунд и повторите попытку.",
+            )
+            return
+        try:
+            self.db.wipe_all_data()
+        except Exception as e:                   # noqa: BLE001
+            logging.error("Не удалось удалить все данные: %s", e, exc_info=e)
+            theme.themed_info(
+                self.config, self, "Ошибка удаления",
+                "Не удалось удалить все данные. Подробности — в логе программы.",
+            )
+            return
         # Также удаляем все бэкапы в выбранной папке.
         deleted = 0
         folder = self.config.get("backup_folder", "").strip()
@@ -878,6 +1104,7 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, AccountCardMixin,
             except Exception as e:
                 logging.warning("Не удалось удалить бэкапы: %s", e)
         self._current_account_id = None
+        self._current_fin = None
         self._edit_cache.clear()
         self._dirty_ids.clear()
         self.current_account_data = None

@@ -1,8 +1,47 @@
 """Общие помощники виджетов: темизированные предупреждение/подтверждение,
 заголовок поля, ограниченное чтение файла (вынесены из widgets.py, этап 5)."""
 import os
-from PySide6.QtWidgets import (QLabel, QMessageBox)
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (QLabel, QMessageBox, QComboBox)
 from hranilka.ui.theme import themed_info, themed_confirm
+
+
+class ReadOnlyAwareComboBox(QComboBox):
+    """Редактируемый QComboBox, у которого режим просмотра выглядит как обычное
+    поле (не тускнеет, как disabled), но не реагирует на ввод.
+
+    В просмотре: lineEdit только для чтения, фокус снят, а клик/колёсико/клавиши
+    игнорируются — вид совпадает с readonly-QLineEdit по яркости текста, но
+    значение случайно не меняется (в т.ч. колесом мыши). В правке — обычный
+    комбобокс. Взамен setEnabled(False), из-за которого текст приглушался."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._view_only = False
+
+    def set_view_only(self, view_only: bool) -> None:
+        self._view_only = view_only
+        if self.isEditable():
+            self.lineEdit().setReadOnly(view_only)
+        self.setFocusPolicy(Qt.NoFocus if view_only else Qt.WheelFocus)
+
+    def wheelEvent(self, event):
+        if self._view_only:
+            event.ignore()
+            return
+        super().wheelEvent(event)
+
+    def mousePressEvent(self, event):
+        if self._view_only:
+            event.ignore()
+            return
+        super().mousePressEvent(event)
+
+    def keyPressEvent(self, event):
+        if self._view_only:
+            event.ignore()
+            return
+        super().keyPressEvent(event)
 
 
 def _warn(config, parent, title, text):

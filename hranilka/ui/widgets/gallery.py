@@ -17,6 +17,7 @@ from hranilka.core import util
 
 from hranilka.ui.widgets.common import (FileTooLargeError, _confirm,
                                         _read_file, _warn)
+from hranilka.data.database.gallery_ops import GALLERY_TOTAL_BYTES_LIMIT
 
 def _supported_image_exts():
     """Расширения изображений, которые умеет читать Qt (вкл. webp, tiff и т.п.,
@@ -221,7 +222,7 @@ class GalleryWidget(QWidget):
     _MAX_IMAGE_BYTES = 15 * 1024 * 1024         # 15 МБ на файл
     _MAX_IMAGE_PIXELS = 50 * 1_000_000          # 50 Мп (по метаданным, до декодирования)
     _MAX_IMAGES_PER_ACCOUNT = 50                # картинок на аккаунт
-    _MAX_TOTAL_BYTES = 500 * 1024 * 1024        # суммарно по всей базе
+    _MAX_TOTAL_BYTES = GALLERY_TOTAL_BYTES_LIMIT # суммарно по всей базе
 
     def set_size_context(self, other_bytes_provider):
         """Внедрить провайдер суммарного объёма галереи ОСТАЛЬНЫХ аккаунтов в БД
@@ -278,6 +279,22 @@ class GalleryWidget(QWidget):
             return self._account_provider()
         except Exception:                        # noqa: BLE001 — teardown/гонки
             return None
+
+    def _orphan_limit_context(self):
+        """Снять лимитный контекст исходной карточки до первого await.
+
+        После переключения виджет уже обслуживает другую запись, поэтому читать
+        его текущий provider/local items нельзя. Снимок не заменяет проверку БД,
+        но не позволяет осиротевшему импорту обойти видимые лимиты UI.
+        """
+        provider = self._other_bytes_provider
+        other = None
+        if provider is not None:
+            try:
+                other = provider()
+            except Exception:                   # проверка БД при save всё равно fail-closed
+                other = None
+        return other, self._local_bytes(), len(self.items)
 
     def _emit_orphan(self, account_id, desc_text, data):
         """Отдать осиротевшую загрузку обработчику. Если обработчик не внедрён или
@@ -455,13 +472,16 @@ class GalleryWidget(QWidget):
     def _queue_file_load(self, path):
         """Сразу добавить placeholder (bytes=None — UI не блокируется) и запустить
         async-конвейер загрузки. Реальная работа — в _upload_pipeline."""
+        # Снимаем лимитный контекст до добавления placeholder и первого await:
+        # после переключения карточки его нельзя брать из уже нового виджета.
+        limit_context = self._orphan_limit_context()
         self.add_item(None)                  # placeholder «[ фото ]», bytes=None
         item = self.items[-1]
         # Захватываем аккаунт и поколение ДО первого await (M7-05): если карточку
         # сменят за время загрузки, результат уйдёт этому аккаунту, а не текущему.
         aid = self._current_account_id()
         self._track_upload(
-            self._upload_pipeline(item, path, self._data_gen, aid))
+            self._upload_pipeline(item, path, self._data_gen, aid, limit_context))
 
     def _cancel_upload_tasks(self):
         """Отменить все активные задачи импорта (смена карточки/lock/restore).
@@ -518,20 +538,26 @@ class GalleryWidget(QWidget):
         except Exception:                        # noqa: BLE001 — виджет мог исчезнуть
             return ""
 
-    def _accept_orphan(self, data, size):
-        """Проверки осиротевшей загрузки, НЕ зависящие от аккаунта (M7-05): размер
-        файла и разрешение («бомба»). Пер-элементные проверки уже сделаны в
-        конвейере выше, здесь дублируем дёшево на всякий случай. Лимит ОБЩЕГО
-        объёма (500 МБ) для сирот НЕ проверяем: он мягкий и всё равно
-        перепроверяется при следующем открытии карточки; жёстко ронять уже
-        прочитанную с диска картинку из-за суммарного капа здесь неоправданно."""
+    def _accept_orphan(self, data, size, limit_context):
+        """Проверки осиротевшей загрузки с контекстом исходной карточки.
+
+        После переключения UI не должен позволять обходить лимит количества или
+        общего размера. Итоговую, конкурентно-безопасную проверку повторяет БД
+        при сохранении галереи.
+        """
         if not data or len(data) > self._MAX_IMAGE_BYTES:
             return False
         if size is None or size[0] * size[1] > self._MAX_IMAGE_PIXELS:
             return False
+        other, local, count = limit_context or (None, 0, 0)
+        if count >= self._MAX_IMAGES_PER_ACCOUNT:
+            return False
+        if other is not None and other + local + len(data) > self._MAX_TOTAL_BYTES:
+            return False
         return True
 
-    async def _upload_pipeline(self, item, path, gen, account_id=None):
+    async def _upload_pipeline(self, item, path, gen, account_id=None,
+                               limit_context=None):
         """Async-конвейер загрузки картинки с диска. Разные операции — в разных
         потоках пула (run_in_executor), UI-поток лишь рисует результат:
           1) чтение файла           → поток;
@@ -564,7 +590,7 @@ class GalleryWidget(QWidget):
             # Карточку сменили / элемент удалили — отдаём результат своему аккаунту
             # (M7-05), не теряя загрузку. Проверки, зависящие от аккаунта, делает
             # уже handler; здесь — только аккаунт-независимая валидность.
-            if self._accept_orphan(data, size):
+            if self._accept_orphan(data, size, limit_context):
                 self._emit_orphan(account_id, self._orphan_desc(item), data)
             return
         if not self._accept_image_checked(data, size, pending_placeholder=True):
@@ -636,9 +662,10 @@ class GalleryWidget(QWidget):
         поколение карточки и не попадёт в чужой аккаунт при переключении."""
         # Аккаунт снимаем ДО первого await (M7-05) — см. _queue_file_load.
         aid = self._current_account_id()
-        self._track_upload(self._paste_pipeline(self._data_gen, aid))
+        limit_context = self._orphan_limit_context()
+        self._track_upload(self._paste_pipeline(self._data_gen, aid, limit_context))
 
-    async def _paste_pipeline(self, gen, account_id=None):
+    async def _paste_pipeline(self, gen, account_id=None, limit_context=None):
         loop = asyncio.get_running_loop()
         clipboard = QApplication.clipboard()
         mime_data = clipboard.mimeData()
@@ -669,7 +696,7 @@ class GalleryWidget(QWidget):
             if gen != self._data_gen:
                 # Карточку сменили — не добавляем в чужую, а отдаём своему аккаунту
                 # (M7-05). desc пустой: у вставки нет placeholder-элемента.
-                if self._accept_orphan(data, size):
+                if self._accept_orphan(data, size, limit_context):
                     self._emit_orphan(account_id, "", data)
                 return
             if self._accept_image_checked(data, size):
@@ -946,8 +973,11 @@ class GalleryWidget(QWidget):
             image_id = it["image_id"]
             if data is None and image_id is None:
                 continue                         # нечего сохранять
+            # blob_size переносим для учёта ленивых BLOB в лимите объёма после
+            # round-trip через кеш правок (stash → to_storage → set_data, M7-03).
             result.append({"desc": it["desc"].text(),
-                           "data": data, "image_id": image_id})
+                           "data": data, "image_id": image_id,
+                           "blob_size": it.get("blob_size")})
         return result
 
     def assign_saved_ids(self, saved_ids):

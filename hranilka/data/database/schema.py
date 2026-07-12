@@ -16,7 +16,14 @@ from hranilka.core.util import best_effort_wipe
 #     актуальна — миграция/дедуп пропускаются).
 # v7: канонизация связей — хранить только пары (min,max) и закрепить инвариант
 #     CHECK(account_id < linked_account_id) пересборкой таблицы linked_accounts.
-SCHEMA_VERSION = 8
+# v8: обкатка конвейера нумерованных миграций (LEGACY_BASE) — реестр пуст.
+# v9: финансовые сущности (карты/кошельки) — таблицы fin_items/fin_links/
+#     fin_gallery + первая боевая нумерованная миграция m009 (аддитивная).
+# v10: удаление типа «Банковский счёт» (bank_account) — миграция m010 чистит
+#      его записи из fin_items (FK CASCADE подчищает fin_links/fin_gallery).
+# v11: удаление типа «Электронный кошелёк» (ewallet) — миграция m011 чистит
+#      его записи из fin_items (FK CASCADE подчищает fin_links/fin_gallery).
+SCHEMA_VERSION = 11
 
 # Обязательные таблицы актуальной схемы. На «быстром пути» create_tables() даже
 # при совпадении версии проверяет их наличие (M6-06): частично повреждённую базу
@@ -24,6 +31,7 @@ SCHEMA_VERSION = 8
 _REQUIRED_TABLES = frozenset({
     "folders", "services", "accounts", "personal_data", "secret_questions",
     "recovery_phrases", "recovery_codes", "gallery", "linked_accounts", "app_meta",
+    "fin_items", "fin_links", "fin_gallery",
 })
 
 
@@ -161,6 +169,11 @@ class DbSchemaMixin(DbBase):
             )
         """)
 
+        # Финансовые таблицы v9 (карты/кошельки). Единый источник SQL с миграцией
+        # m009 — оба пути (новая база здесь, база v8 в m009) создают одинаковую
+        # схему. Идемпотентно (IF NOT EXISTS): индексы создаются тут же.
+        self._create_fin_tables(self.cursor)
+
         # Канонизация существующей таблицы связей (v6→v7): нормализация пар к
         # (min,max), дедуп и добавление CHECK. Выполняется ДО создания индексов
         # ниже, чтобы uq_linked_pair лёг уже на пересобранную таблицу.
@@ -279,6 +292,7 @@ class DbSchemaMixin(DbBase):
     # пути»: удалённый вручную UNIQUE-индекс раньше проходил незамеченным (M65-04).
     _INTEGRITY_INDEXES = frozenset({
         "uq_personal_account", "uq_phrases_account", "uq_linked_pair",
+        "uq_fin_link",
     })
 
     def _fast_path_fingerprint_ok(self):
@@ -457,6 +471,98 @@ class DbSchemaMixin(DbBase):
                 CHECK (account_id < linked_account_id)
             )
         """
+
+    # ----- Финансовые таблицы v9 (карты/кошельки) -----
+    # DDL — дословно из концепта fin-entities-concept.md §2. Единый источник для
+    # create_tables() (новые базы) и миграции m009 (базы v8): расхождение двух
+    # путей создания исключено по построению.
+
+    @staticmethod
+    def _fin_items_create_sql(table_name="fin_items", if_not_exists=False):
+        """CREATE TABLE для fin_items — финансовые записи (карты/кошельки).
+
+        service_id допускает NULL («свободный» элемент, как у accounts). data —
+        JSON-полезная нагрузка типа ({"v":1,...}). card_last4/expires_on —
+        экстракт-колонки для горячих путей (поиск/предупреждения), заполняются
+        CRUD-слоем при каждом save из data (единственный писатель)."""
+        ine = "IF NOT EXISTS " if if_not_exists else ""
+        return f"""
+            CREATE TABLE {ine}{table_name} (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                service_id INTEGER,
+                item_type TEXT NOT NULL,
+                name TEXT NOT NULL,
+                data TEXT NOT NULL DEFAULT '{{}}',
+                card_last4 TEXT,
+                expires_on DATE,
+                is_favorite INTEGER DEFAULT 0,
+                sort_order INTEGER DEFAULT 0,
+                deleted_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (service_id) REFERENCES services(id) ON DELETE CASCADE
+            )
+        """
+
+    @staticmethod
+    def _fin_links_create_sql(table_name="fin_links", if_not_exists=False):
+        """CREATE TABLE для fin_links — связь элемент↔аккаунт.
+
+        Связь разнотипна (роли фиксированы колонками), поэтому канонизация не
+        нужна — достаточно UNIQUE(item_id, account_id) (индекс uq_fin_link).
+        Обе стороны каскадно чистятся при удалении элемента/аккаунта."""
+        ine = "IF NOT EXISTS " if if_not_exists else ""
+        return f"""
+            CREATE TABLE {ine}{table_name} (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                item_id INTEGER NOT NULL,
+                account_id INTEGER NOT NULL,
+                FOREIGN KEY (item_id) REFERENCES fin_items(id) ON DELETE CASCADE,
+                FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
+            )
+        """
+
+    @staticmethod
+    def _fin_gallery_create_sql(table_name="fin_gallery", if_not_exists=False):
+        """CREATE TABLE для fin_gallery — фото карты/скан договора (зеркало gallery,
+        FK на item_id). Ленивая загрузка BLOB — контракт H-6/M7-03."""
+        ine = "IF NOT EXISTS " if if_not_exists else ""
+        return f"""
+            CREATE TABLE {ine}{table_name} (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                item_id INTEGER NOT NULL,
+                description TEXT,
+                image_data BLOB,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (item_id) REFERENCES fin_items(id) ON DELETE CASCADE
+            )
+        """
+
+    @staticmethod
+    def _fin_index_sql():
+        """Идемпотентные индексы финансовых таблиц (единый источник для
+        create_tables и m009). uq_fin_link — часть отпечатка целостности."""
+        return (
+            "CREATE INDEX IF NOT EXISTS idx_fin_items_service ON fin_items(service_id)",
+            "CREATE INDEX IF NOT EXISTS idx_fin_items_deleted ON fin_items(deleted_at)",
+            "CREATE INDEX IF NOT EXISTS idx_fin_items_type ON fin_items(item_type)",
+            "CREATE INDEX IF NOT EXISTS idx_fin_items_last4 ON fin_items(card_last4)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_fin_link ON fin_links(item_id, account_id)",
+            "CREATE INDEX IF NOT EXISTS idx_fin_links_account ON fin_links(account_id)",
+        )
+
+    @staticmethod
+    def _create_fin_tables(executor):
+        """Создаёт финансовые таблицы и индексы (идемпотентно). executor —
+        объект с .execute (self.cursor в create_tables либо conn в m009), чтобы
+        оба пути создания использовали один и тот же DDL."""
+        executor.execute(
+            DbSchemaMixin._fin_items_create_sql(if_not_exists=True))
+        executor.execute(
+            DbSchemaMixin._fin_links_create_sql(if_not_exists=True))
+        executor.execute(
+            DbSchemaMixin._fin_gallery_create_sql(if_not_exists=True))
+        for stmt in DbSchemaMixin._fin_index_sql():
+            executor.execute(stmt)
 
     def _rebuild_linked_accounts_if_needed(self):
         """Привести таблицу связей к канонической форме (v6→v7), если ещё нет.

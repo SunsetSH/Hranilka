@@ -1,15 +1,28 @@
-"""Корзина удалённых аккаунтов (вынесена из dialogs.py, этап 4)."""
+"""Корзина удалённых записей: аккаунты и финансовые записи (вынесена из
+dialogs.py, этап 4; обобщена до листовых типов, Фаза 1 фин-сущностей)."""
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QHBoxLayout, QLabel, QListWidget,
                                QListWidgetItem, QPushButton)
 
+from hranilka.core.fin_types import FIN_TYPES
+from hranilka.core.nodetypes import ACCOUNT
 from hranilka.ui.theme import ThemedDialog, themed_confirm
+
+# Ретро-префиксы типов записей в списке корзины: аккаунт + все финансовые типы
+# из реестра (node_type → tree_prefix). Новый тип получает префикс автоматически.
+_TYPE_PREFIX = {ACCOUNT: "(i) "}
+_TYPE_PREFIX.update({spec.node_type: spec.tree_prefix
+                     for spec in FIN_TYPES.values()})
 
 
 class RecycleBinDialog(ThemedDialog):
-    """Корзина: список удалённых аккаунтов с восстановлением и безвозвратным
-    удалением. self.changed = True, если что-то восстановили/удалили (тогда
-    главное окно перестроит дерево и обновит кнопку корзины)."""
+    """Корзина: список удалённых записей (аккаунты + карты/кошельки) с
+    восстановлением и безвозвратным удалением. self.changed = True, если что-то
+    восстановили/удалили (тогда главное окно перестроит дерево и обновит кнопку
+    корзины)."""
+
+    # Ретро-префиксы типов записей в списке корзины (из реестра, см. модуль выше).
+    _PREFIX = _TYPE_PREFIX
 
     def __init__(self, config, db, parent=None):
         super().__init__(config, parent)
@@ -20,7 +33,7 @@ class RecycleBinDialog(ThemedDialog):
         self.setMinimumSize(460, 360)
 
         lay = self.body
-        lay.addWidget(QLabel("Удалённые аккаунты:"))
+        lay.addWidget(QLabel("Удалённые записи:"))
         self._list = QListWidget()
         lay.addWidget(self._list, 1)
 
@@ -52,12 +65,14 @@ class RecycleBinDialog(ThemedDialog):
 
     def _refresh(self):
         self._list.clear()
-        rows = self._db.get_deleted_accounts()
+        rows = self._db.get_deleted_records()
         for r in rows:
+            prefix = self._PREFIX.get(r["type"], "")
             stamp = str(r["deleted_at"] or "")[:19]
-            label = r["name"] if not stamp else f"{r['name']}   (удалён: {stamp})"
+            base = prefix + r["name"]
+            label = base if not stamp else f"{base}   (удалён: {stamp})"
             item = QListWidgetItem(label)
-            item.setData(Qt.UserRole, r["id"])
+            item.setData(Qt.UserRole, (r["type"], r["id"]))
             self._list.addItem(item)
         has_items = bool(rows)
         self._empty_label.setVisible(not has_items)
@@ -67,26 +82,38 @@ class RecycleBinDialog(ThemedDialog):
         if has_items:
             self._list.setCurrentRow(0)
 
-    def _current_id(self):
+    def _current_key(self):
+        """(type, id) выбранной записи или None."""
         item = self._list.currentItem()
         return item.data(Qt.UserRole) if item else None
 
     def _restore(self):
-        aid = self._current_id()
-        if aid is None:
+        key = self._current_key()
+        if key is None:
             return
-        self._db.restore_account(aid)
+        node_type, rid = key
+        if node_type == ACCOUNT:
+            self._db.restore_account(rid)
+        else:
+            self._db.restore_fin_item(rid)
         self.changed = True
         self._refresh()
 
     def _delete_forever(self):
-        aid = self._current_id()
-        if aid is None:
+        key = self._current_key()
+        if key is None:
             return
         if not themed_confirm(self.config, self, "Удаление",
-                              "Удалить аккаунт безвозвратно?\nЭто действие необратимо."):
+                              "Удалить запись безвозвратно?\nЭто действие необратимо."):
             return
-        self._db.delete_account(aid)
+        node_type, rid = key
+        if node_type == ACCOUNT:
+            self._db.delete_account(rid)
+        else:
+            # delete_fin_item_forever — по id, не по node_type: запись может
+            # быть типа, уже убранного из реестра (m010/m011-подобная чистка),
+            # и delete_items() ошибочно принял бы её за аккаунт (см. баг M7-фин).
+            self._db.delete_fin_item_forever(rid)
         self.changed = True
         self._refresh()
 
@@ -94,7 +121,7 @@ class RecycleBinDialog(ThemedDialog):
         if self._db.get_deleted_count() == 0:
             return
         if not themed_confirm(self.config, self, "Очистка корзины",
-                              "Безвозвратно удалить ВСЕ аккаунты из корзины?\n"
+                              "Безвозвратно удалить ВСЕ записи из корзины?\n"
                               "Это действие необратимо."):
             return
         self._db.empty_bin()

@@ -32,8 +32,8 @@ def _count(db, table, where="1", params=()):
 # ─── delete_items ─────────────────────────────────────────────────────────────
 
 def test_delete_items_mixed_atomic(db):
-    """Смешанный набор (папка + свободный аккаунт) удаляется атомарно; возвращены
-    id всех затронутых аккаунтов (потомки папки + сам аккаунт)."""
+    """Смешанный набор удаляется атомарно; возвращены типизированные ключи
+    всех затронутых листьев (потомки папки + сам аккаунт)."""
     fid = db.add_folder("F")
     sid = db.add_service("S", fid)
     a1 = db.add_account(sid, "A1")
@@ -42,7 +42,8 @@ def test_delete_items_mixed_atomic(db):
 
     affected = db.delete_items([("folder", fid), ("account", free)])
 
-    assert set(affected) == {a1, a2, free}
+    assert set(affected) == {("account", a1), ("account", a2),
+                             ("account", free)}
     assert _count(db, "folders") == 0
     assert _count(db, "services") == 0
     assert _count(db, "accounts") == 0
@@ -55,7 +56,7 @@ def test_delete_items_to_bin_soft(db):
 
     affected = db.delete_items([("account", a1)], to_bin=True)
 
-    assert affected == [a1]
+    assert affected == [("account", a1)]
     assert _count(db, "accounts") == 1                       # строка на месте
     assert _count(db, "accounts", "deleted_at IS NOT NULL") == 1   # в корзине
 
@@ -75,6 +76,19 @@ def test_delete_items_keep_content(db):
     db.cursor.execute("SELECT folder_id FROM services WHERE id = ?", (sid,))
     assert db.cursor.fetchone()["folder_id"] is None         # стал вне папки
     assert _count(db, "accounts", "id = ?", (a1,)) == 1
+
+
+def test_delete_items_container_returns_fin_leaf_keys(db):
+    """Каскадно удаляемые fin-листья возвращаются для очистки UI-черновиков."""
+    sid = db.add_service("S")
+    aid = db.add_account(sid, "A")
+    card = db.add_fin_item(sid, "bank_card", "Карта")
+    wallet = db.add_fin_item(sid, "crypto_wallet", "Кошелёк")
+
+    affected = db.delete_items([("service", sid)])
+
+    assert set(affected) == {("account", aid), ("card", card),
+                             ("wallet", wallet)}
 
 
 def test_delete_items_rollback_on_midway_error(db, monkeypatch):

@@ -25,6 +25,7 @@ from concurrent.futures import ThreadPoolExecutor
 from hranilka.data.database.accounts import DbAccountCardMixin
 from hranilka.data.database.bulk import DbBulkOpsMixin
 from hranilka.data.database.concurrency import DbConcurrencyMixin
+from hranilka.data.database.fin_items import DbFinItemsMixin
 from hranilka.data.database.gallery_ops import DbGalleryOpsMixin
 from hranilka.data.database.persistence import DbPersistenceMixin
 from hranilka.data.database.schema import (SCHEMA_VERSION, _REQUIRED_TABLES,
@@ -40,7 +41,7 @@ __all__ = ["Database", "SCHEMA_VERSION", "FutureSchemaError",
 
 class Database(DbConcurrencyMixin, DbPersistenceMixin, DbSchemaMixin,
                DbTreeOpsMixin, DbAccountCardMixin, DbGalleryOpsMixin,
-               DbBulkOpsMixin):
+               DbFinItemsMixin, DbBulkOpsMixin):
     def __init__(self, db_path: str = "hranilka.db") -> None:
         self.db_path = db_path
         # conn/cursor — None вне открытой сессии (до connect()/после lock()); все
@@ -97,12 +98,26 @@ class Database(DbConcurrencyMixin, DbPersistenceMixin, DbSchemaMixin,
         после очистки FK оставались ВЫКЛЮЧЕННЫМИ до перезапуска — все
         последующие ON DELETE CASCADE/SET NULL переставали работать."""
         with self.conn:
-            for table in ("gallery", "recovery_codes", "recovery_phrases",
+            # Финансовые записи не являются дочерними accounts: свободные
+            # карты/кошельки пережили бы очистку, если не удалить их явно.
+            # Удаляем дочерние таблицы раньше владельцев и не отключаем FK.
+            for table in ("fin_gallery", "fin_links", "fin_items", "gallery",
+                           "recovery_codes", "recovery_phrases",
                            "secret_questions", "personal_data", "linked_accounts",
                            "accounts", "services", "folders"):
                 self.conn.execute(f"DELETE FROM {table}")
         self._invalidate_gallery_bytes()   # галерея очищена (M-9)
         self._mark_dirty()
+
+    def invalidate_async_session(self):
+        """Отменить поставленные в очередь операции текущей сессии БД.
+
+        Нужен перед разрушительными действиями над содержимым (полная очистка):
+        queued ``run_async`` с прежним токеном завершится StaleSessionError, а
+        уже выполняющаяся операция закончится до захвата общего RLock.
+        Соединение при этом не закрывается.
+        """
+        self._bump_session()
             
 
     def vacuum(self):

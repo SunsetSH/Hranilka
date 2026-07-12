@@ -77,6 +77,23 @@ def test_html_gallery_cards():
     assert f"max-width:{export.HTML_GALLERY_IMG_MAX_PX}px" in html
 
 
+def test_html_nested_group_separator(db):
+    """Вложенные элементы папки/сервиса обёрнуты в блок с отступом (class='group')
+    — визуальная отбивка, чтобы следующий сервис не «прилипал» к содержимому."""
+    fid = db.add_folder("Папка")
+    sid = db.add_service("Сервис", folder_id=fid)
+    db.add_account(sid, "Акк1")
+    tree = db.export_subtree()
+    html = export._html_document(tree, Options(theme=_theme(), title="Т"))
+    # Есть и класс, и его CSS-описание с отступом/левой линией.
+    assert "<div class='group'>" in html
+    assert ".group{" in html and "border-left" in html
+    # Аккаунт лежит ВНУТРИ блока (после открытия group, до его закрытия).
+    open_i = html.index("<div class='group'>")
+    acc_i = html.index("class='account'")
+    assert open_i < acc_i
+
+
 def test_html_gallery_excluded():
     gallery = [{"data": b"\x89PNG_fake", "desc": "x"}]
     html = export._html_document(_tree_with_gallery(gallery),

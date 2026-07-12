@@ -131,7 +131,7 @@ async def test_cancel_all_tasks_suppresses_orphan(qapp, monkeypatch):
 
     gate = asyncio.Event()                    # никогда не выставляем — задача висит
 
-    async def _gated_pipeline(item, path, gen, account_id=None):
+    async def _gated_pipeline(item, path, gen, account_id=None, limit_context=None):
         await gate.wait()                     # ждём вечно, пока не отменят
         gw._emit_orphan(account_id, "", _png_bytes())  # сюда дойти не должны
 

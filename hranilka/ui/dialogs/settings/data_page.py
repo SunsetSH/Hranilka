@@ -1,7 +1,7 @@
 """Вкладка «Данные»: восстановление из бэкапа, сжатие БД, удаление
 всех данных.
 Часть SettingsDialog (dialog.py) — методы вынесены дословно (backlog-разрез по страницам)."""
-from PySide6.QtWidgets import (QVBoxLayout, QGroupBox, QPushButton, QLabel, QCheckBox, QWidget)
+from PySide6.QtWidgets import (QVBoxLayout, QGroupBox, QPushButton, QLabel, QWidget)
 from hranilka.ui.theme import themed_info
 
 
@@ -37,19 +37,6 @@ class SettingsDataPageMixin:
         del_btn.clicked.connect(self._delete_all)
         dl.addWidget(del_btn)
         lay.addWidget(danger_group)
-
-        bin_group = QGroupBox("Корзина")
-        bl = QVBoxLayout(bin_group)
-        self.recycle_bin_check = QCheckBox("Удалять в корзину")
-        self.recycle_bin_check.setChecked(self.config.get("recycle_bin_enabled", False))
-        bl.addWidget(self.recycle_bin_check)
-        bin_note = QLabel(
-            "Если включено, удалённые аккаунты перемещаются в корзину, откуда их можно восстановить. Кнопка корзины появляется рядом с «Настройки».\n"
-            "Если выключено, аккаунты удаляются сразу и безвозвратно."
-        )
-        bin_note.setWordWrap(True)
-        bl.addWidget(bin_note)
-        lay.addWidget(bin_group)
 
         exp_group = QGroupBox("Экспорт")
         el = QVBoxLayout(exp_group)

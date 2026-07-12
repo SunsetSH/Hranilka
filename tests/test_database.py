@@ -294,6 +294,42 @@ def test_gallery_total_bytes_cache_and_invalidation(db):
     assert db.gallery_total_bytes() == 0
 
 
+def test_gallery_total_includes_fin_gallery_and_enforces_common_limit(db, monkeypatch):
+    """Карты/кошельки участвуют в том же лимите, что и аккаунтная галерея."""
+    from hranilka.data.database import gallery_ops
+
+    monkeypatch.setattr(gallery_ops, "GALLERY_TOTAL_BYTES_LIMIT", 10)
+    sid = db.add_service("S")
+    aid = db.add_account(sid, "A")
+    db.save_account(aid, _card([{"desc": "акк", "data": b"x" * 8}]))
+    item = db.add_fin_item(sid, "bank_card", "Карта")
+    storage = db.load_fin_item(item)
+    storage["gallery"] = [{"desc": "фин", "data": b"y" * 3}]
+
+    assert db.gallery_total_bytes() == 8
+    with pytest.raises(ValueError, match="лимит"):
+        db.save_fin_item(item, storage)
+    assert db.gallery_total_bytes() == 8
+
+
+def test_wipe_all_data_removes_free_fin_items_and_gallery(db):
+    """Полная очистка удаляет в том числе финансовые записи вне сервисов."""
+    card = db.add_fin_item(None, "bank_card", "Свободная карта")
+    wallet = db.add_fin_item(None, "crypto_wallet", "Свободный кошелёк")
+    storage = db.load_fin_item(card)
+    storage["gallery"] = [{"desc": "чек", "data": b"blob"}]
+    db.save_fin_item(card, storage)
+
+    db.wipe_all_data()
+
+    for table in ("folders", "services", "accounts", "fin_items", "fin_links",
+                  "gallery", "fin_gallery"):
+        db.cursor.execute(f"SELECT COUNT(*) AS n FROM {table}")
+        assert db.cursor.fetchone()["n"] == 0, table
+    assert db.load_fin_item(card) is None
+    assert db.load_fin_item(wallet) is None
+
+
 def test_links_migration_normalizes_old_rows(tmp_db_path):
     """Старая (v6) база с обратными дублями и самоссылкой нормализуется при
     открытии: остаётся одна каноничная строка, версия схемы поднимается до 7."""

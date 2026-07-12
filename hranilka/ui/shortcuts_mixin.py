@@ -63,29 +63,36 @@ class ShortcutsMixin:
             fn()
 
     # Обёртки контекстно-зависимых действий: безопасно «ничего не делают»,
-    # если действие сейчас неприменимо.
+    # если действие сейчас неприменимо. Роутинг — через общие диспетчеры
+    # (edit_current/save_current/cancel_current, FinCardMixin): открытая
+    # карточка может быть как аккаунтом, так и финансовой записью, а прежние
+    # обёртки звали только аккаунтные toggle_edit_mode/save_account/cancel_edit
+    # — на фин-карточке «сохранить» становилось no-op'ом (id аккаунта не
+    # задан), а «отмена» закрывала карточку заглушкой, теряя правки.
     def _sc_edit_account(self):
-        if self._current_account_id and not self.is_editing:
-            self.toggle_edit_mode()
+        has_target = self._current_account_id is not None or self._current_fin is not None
+        if has_target and not self.is_editing:
+            self.edit_current()
 
     def _sc_save_account(self):
         if self.is_editing:
-            self.save_account()
+            self.save_current()
 
     def _sc_cancel_edit(self):
         if self.is_editing:
-            self.cancel_edit()
+            self.cancel_current()
         elif self.search_box.hasFocus() and self.search_box.text():
             # Вне режима правки WindowShortcut «съедал» Esc, и стандартная
             # очистка поля поиска не срабатывала — делаем её явно (L-14).
             self.search_box.clear()
 
     def _sc_gen_password(self):
-        if self.is_editing:
+        # Генерация пароля — поле аккаунтной карточки; на фин-записи его нет.
+        if self.is_editing and self._current_fin is None:
             self.generate_password()
 
     def _sc_gen_personal(self):
-        if self.is_editing:
+        if self.is_editing and self._current_fin is None:
             self.generate_personal_data()
 
     def _sc_delete_selected(self):

@@ -11,6 +11,10 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QBrush
 
 from hranilka.core import domain
+from hranilka.core.nodetypes import (FOLDER, SERVICE, ACCOUNT,
+                                     LEAF_TYPES, FIN_LEAF_TYPES)
+from hranilka.core.fin_domain import EXPIRY_WARN_DAYS
+from hranilka.core.fin_types import FIN_TYPES
 from hranilka.ui import theme
 from hranilka.core import util
 from hranilka.data.database import StaleSessionError
@@ -68,26 +72,34 @@ class TreeMixin:
     """Построение/перестроение дерева, сортировка, поиск, контекстное меню и
     операции над папками/сервисами/аккаунтами."""
 
-    # Префиксы-«иконки» для элементов дерева
-    PREFIX = {"folder": "[+] ", "service": "[o] ", "account": "(i) "}
+    # Префиксы-«иконки» для элементов дерева. Контейнеры/аккаунт — здесь; фин-часть
+    # берётся из реестра дескрипторов (единый источник tree_prefix, без дублирования).
+    PREFIX = {FOLDER: "[+] ", SERVICE: "[o] ", ACCOUNT: "(i) ",
+              **{spec.node_type: spec.tree_prefix for spec in FIN_TYPES.values()}}
 
     def _node_display(self, node):
         """Текст элемента дерева с маркерами избранного, просрочки и несохранённых правок."""
         text = self.PREFIX[node["type"]] + node["name"]
-        if node["type"] == "account":
+        if node["type"] in LEAF_TYPES:
+            # Избранное и метка несохранённых правок — общие для всех листьев.
             if node.get("is_favorite"):
                 text = "* " + text
-            days = node.get("pwd_days_left")
-            if days is not None and days <= 0:
-                text += "  [!]"   # пора менять пароль
-            if node["id"] in self._dirty_ids:
+            if node["type"] == ACCOUNT:
+                days = node.get("pwd_days_left")
+                if days is not None and days <= 0:
+                    text += "  [!]"   # пора менять пароль
+            elif node["type"] in FIN_LEAF_TYPES:
+                days = node.get("days_until_expiry")
+                if days is not None and days <= EXPIRY_WARN_DAYS:
+                    text += "  [!]"   # карта истекает/истекла
+            if (node["type"], node["id"]) in self._dirty_ids:
                 text = "● НЕ СОХРАНЕНО ▸ " + text   # есть несохранённые правки
         return text
 
     def _apply_item_style(self, item, node):
-        """Текст + визуальное выделение для аккаунтов с несохранёнными правками."""
+        """Текст + визуальное выделение для листьев с несохранёнными правками."""
         item.setText(0, self._node_display(node))
-        dirty = node["type"] == "account" and node["id"] in self._dirty_ids
+        dirty = (node["type"], node["id"]) in self._dirty_ids
         font = item.font(0)
         font.setBold(dirty)
         item.setFont(0, font)
@@ -143,7 +155,9 @@ class TreeMixin:
 
         def visit(item):
             node = self._node(item)
-            self_match = (not text) or (text in node["name"].lower())
+            last4 = node.get("card_last4") or ""     # поиск карты по «•1234»
+            self_match = ((not text) or (text in node["name"].lower())
+                          or (text in last4))
             child_visible = False
             for i in range(item.childCount()):
                 child_visible = visit(item.child(i)) or child_visible
@@ -164,24 +178,41 @@ class TreeMixin:
         сервисы / корневые аккаунты), т.к. они в разных таблицах со своим
         sort_order. Единый воркер БД сохраняет порядок вызовов (a)."""
         if parent_item is None:
-            folder_ids, service_ids, account_ids = [], [], []
+            folder_ids, service_ids, account_ids, fin_ids = [], [], [], []
             for i in range(self.tree.topLevelItemCount()):
                 node = self._node(self.tree.topLevelItem(i))
-                {"folder": folder_ids, "service": service_ids,
-                 "account": account_ids}[node["type"]].append(node["id"])
+                if node["type"] == FOLDER:
+                    folder_ids.append(node["id"])
+                elif node["type"] == SERVICE:
+                    service_ids.append(node["id"])
+                elif node["type"] == ACCOUNT:
+                    account_ids.append(node["id"])
+                elif node["type"] in FIN_LEAF_TYPES:
+                    fin_ids.append(node["id"])
             util.fire(self._save_order_async(
                 [(self.db.set_folders_order, folder_ids),
                  (self.db.set_services_order, service_ids),
-                 (self.db.set_accounts_order, account_ids)]))
+                 (self.db.set_accounts_order, account_ids),
+                 (self.db.set_fin_items_order, fin_ids)]))
             return
 
         parent_node = self._node(parent_item)
-        child_ids = [self._node(parent_item.child(i))["id"]
-                     for i in range(parent_item.childCount())]
-        if parent_node["type"] == "folder":
-            ops = [(self.db.set_services_order, child_ids)]
-        elif parent_node["type"] == "service":
-            ops = [(self.db.set_accounts_order, child_ids)]
+        if parent_node["type"] == FOLDER:
+            service_ids = [self._node(parent_item.child(i))["id"]
+                           for i in range(parent_item.childCount())]
+            ops = [(self.db.set_services_order, service_ids)]
+        elif parent_node["type"] == SERVICE:
+            # Аккаунты и fin-записи — братья одного сервиса, но в разных таблицах;
+            # порядок каждой группы снимаем в порядке их появления в дереве.
+            account_ids, fin_ids = [], []
+            for i in range(parent_item.childCount()):
+                cn = self._node(parent_item.child(i))
+                if cn["type"] == ACCOUNT:
+                    account_ids.append(cn["id"])
+                elif cn["type"] in FIN_LEAF_TYPES:
+                    fin_ids.append(cn["id"])
+            ops = [(self.db.set_accounts_order, account_ids),
+                   (self.db.set_fin_items_order, fin_ids)]
         else:
             return
         util.fire(self._save_order_async(ops))
@@ -210,7 +241,9 @@ class TreeMixin:
         self.tree.setUpdatesEnabled(False)
         try:
             self.tree.clear()
-            for node in self.db.get_tree_structure(self.sort_mode, self.sort_desc):
+            include_fin = self.config.get("show_fin_instruments", False)
+            for node in self.db.get_tree_structure(
+                    self.sort_mode, self.sort_desc, include_fin=include_fin):
                 self._add_tree_node(self.tree, node)
         finally:
             self.tree.setUpdatesEnabled(True)
@@ -222,7 +255,7 @@ class TreeMixin:
         item.setData(0, Qt.UserRole, data)
         item.setToolTip(0, node["name"])
         self._apply_item_style(item, node)
-        if node["type"] in ("folder", "service"):
+        if node["type"] in (FOLDER, SERVICE):
             item.setExpanded(True)
         for child in node.get("children", []):
             self._add_tree_node(item, child)
@@ -251,7 +284,7 @@ class TreeMixin:
 
         for it in self._iter_items():
             node = self._node(it)
-            if node["type"] in ("folder", "service"):
+            if node["type"] in (FOLDER, SERVICE):
                 it.setExpanded((node["type"], node["id"]) in expanded)
             if sel_key and (node["type"], node["id"]) == sel_key:
                 self.tree.setCurrentItem(it)
@@ -260,19 +293,11 @@ class TreeMixin:
 
     # ----- Точечное обновление узла (без перестройки всего дерева) -----
 
-    def _find_account_item(self, account_id):
-        """Элемент дерева аккаунта по id (или None)."""
-        for it in self._iter_items():
-            node = self._node(it)
-            if node and node["type"] == "account" and node["id"] == account_id:
-                return it
-        return None
-
     def _refresh_account_item(self, account_id):
         """Точечно перерисовать узел аккаунта (текст/жирность/маркеры) по его
         текущему node-словарю. True — элемент найден и обновлён; False —
         вызывающий должен сделать fallback на _reload_tree()."""
-        item = self._find_account_item(account_id)
+        item = self._find_leaf_item(ACCOUNT, account_id)
         if item is None:
             return False
         self._apply_item_style(item, self._node(item))
@@ -285,7 +310,7 @@ class TreeMixin:
         Полная перестройка (_reload_tree) выполняется только когда сохранение
         могло изменить ПОРЯДОК элементов — сортировка по имени/сроку пароля с
         изменившимся ключом — либо элемент не найден (безопасный fallback)."""
-        item = self._find_account_item(account_id)
+        item = self._find_leaf_item(ACCOUNT, account_id)
         if item is None:
             self._reload_tree()
             return
@@ -342,7 +367,7 @@ class TreeMixin:
         if len(selected) == 1:
             node = nodes[0]
             t = node["type"]
-            if t == "account":
+            if t == ACCOUNT:
                 self._add_move_to_service_menu(menu, selected)
                 fav = node.get("is_favorite")
                 menu.addAction("Убрать из избранного" if fav else "В избранное",
@@ -350,7 +375,16 @@ class TreeMixin:
                 menu.addSeparator()
                 menu.addAction("Экспорт…", lambda: self.open_export(node))
                 menu.addAction("Удалить", lambda: self.delete_items(selected))
-            elif t == "service":
+            elif t in FIN_LEAF_TYPES:
+                self._add_move_fin_to_service_menu(menu, selected)
+                fav = node.get("is_favorite")
+                menu.addAction("Убрать из избранного" if fav else "В избранное",
+                               lambda: self._set_fin_favorite(selected, not fav))
+                menu.addSeparator()
+                menu.addAction("Экспорт…", lambda: self.open_export(node))
+                menu.addAction("Удалить", lambda: self.delete_items(selected))
+            elif t == SERVICE:
+                self._add_create_record_menu(menu)
                 menu.addAction("Переименовать", lambda: self.rename_item(item))
                 self._add_move_to_folder_menu(menu, selected)
                 self._add_delete_menu(menu, selected, with_keep=True)
@@ -358,7 +392,8 @@ class TreeMixin:
                 menu.addAction("Экспорт…", lambda: self.open_export(node))
                 menu.addAction("Раскрыть всё", lambda: self.set_expanded(item, True))
                 menu.addAction("Свернуть всё", lambda: self.set_expanded(item, False))
-            elif t == "folder":
+            elif t == FOLDER:
+                self._add_create_record_menu(menu)
                 menu.addAction("Переименовать", lambda: self.rename_item(item))
                 self._add_delete_menu(menu, selected, with_keep=True)
                 menu.addSeparator()
@@ -367,10 +402,10 @@ class TreeMixin:
                 menu.addAction("Свернуть всё", lambda: self.set_expanded(item, False))
         else:
             # Множественный выбор
-            if types == {"service"}:
+            if types == {SERVICE}:
                 self._add_move_to_folder_menu(menu, selected)
                 self._add_delete_menu(menu, selected, with_keep=True)
-            elif types == {"account"}:
+            elif types == {ACCOUNT}:
                 self._add_move_to_service_menu(menu, selected)
                 menu.addAction("В избранное", lambda: self._set_favorite(selected, True))
                 menu.addAction("Убрать из избранного", lambda: self._set_favorite(selected, False))
@@ -413,7 +448,7 @@ class TreeMixin:
         for it in selected:
             parent = it.parent()
             pnode = self._node(parent) if parent else None
-            current.add(pnode["id"] if pnode and pnode["type"] == "service" else None)
+            current.add(pnode["id"] if pnode and pnode["type"] == SERVICE else None)
         services = [s for s in self.db.get_services() if current != {s["id"]}]
         if services:
             sub.addSeparator()
@@ -424,6 +459,30 @@ class TreeMixin:
         sub.addAction("Сделать свободным (без сервиса)",
                       lambda: self._move_accounts(selected, None))
 
+    def _add_create_record_menu(self, menu):
+        """Подменю создания записи в выбранном контейнере: аккаунт + типы
+        FIN_TYPES (пункты строятся из реестра). Фин-типы предлагаются только при
+        включённой опции «Показывать фин. инструменты». Возвращает подменю."""
+        sub = menu.addMenu("Создать запись")
+        sub.addAction("(i) Аккаунт", self.add_account)
+        if not self.config.get("show_fin_instruments", False):
+            return sub
+        for type_id, spec in FIN_TYPES.items():
+            sub.addAction(spec.tree_prefix + spec.title,
+                          lambda checked=False, tid=type_id: self.add_fin_record(tid))
+        return sub
+
+    def _add_move_fin_to_service_menu(self, menu, selected):
+        """Перемещение фин-записей между сервисами (по образцу аккаунтного меню,
+        но без создания нового сервиса — фин-записи туда переносят реже)."""
+        sub = menu.addMenu("Переместить в сервис")
+        for s in self.db.get_services():
+            sub.addAction(s["name"],
+                          lambda checked=False, sid=s["id"]: self._move_fin_items(selected, sid))
+        sub.addSeparator()
+        sub.addAction("Сделать свободной (без сервиса)",
+                      lambda: self._move_fin_items(selected, None))
+
     # ----- Операции меню -----
 
     def rename_item(self, item):
@@ -432,9 +491,9 @@ class TreeMixin:
             self.config, self, "Переименование", "Новое название:", node["name"]
         )
         if ok and new_name:
-            if node["type"] == "folder":
+            if node["type"] == FOLDER:
                 method = self.db.rename_folder
-            elif node["type"] == "service":
+            elif node["type"] == SERVICE:
                 method = self.db.rename_service
             else:
                 return
@@ -478,22 +537,31 @@ class TreeMixin:
             self._show_card_error("Не удалось удалить", e)
             self._reload_tree()                  # операция атомарна — ресинк UI (страховка)
             return
-        self._forget_account_cache(affected)
+        self._forget_leaf_cache(nodes, affected)
         self._any_db_changes = True
 
         self.current_tree_item = None
         self._current_account_id = None
+        self._current_fin = None
         self.is_editing = False
         self._reload_tree()
         self._show_placeholder()
         self._update_bin_button()
         self.statusBar().showMessage("Удалено", 2000)
 
-    def _forget_account_cache(self, account_ids):
-        """Удаляет несохранённые правки/пометки указанных аккаунтов из памяти."""
-        for aid in account_ids:
-            self._edit_cache.pop(aid, None)
-            self._dirty_ids.discard(aid)
+    def _forget_leaf_cache(self, nodes, affected):
+        """Убирает несохранённые правки удалённых листьев из памяти. Выбранные
+        листья (аккаунты/карты) забываются по точному ключу (type, id); остальные
+        affected — типизированные потомки удалённых контейнеров. Точность важна:
+        id аккаунта и карты могут совпадать."""
+        keys = set(affected)
+        for n in nodes:
+            if n["type"] in LEAF_TYPES:
+                key = (n["type"], n["id"])
+                keys.add(key)
+        for key in keys:
+            self._edit_cache.pop(key, None)
+            self._dirty_ids.discard(key)
 
     async def _db_write_then_reload(self, ops, status=None):
         """Выполнить список DB-операций (метод, args-кортеж) в фоновом потоке БД,
@@ -535,13 +603,40 @@ class TreeMixin:
 
     def _set_favorite(self, selected, value):
         ids = [node["id"] for node in (self._node(i) for i in selected)
-               if node["type"] == "account"]
+               if node["type"] == ACCOUNT]
         util.fire(self._run_then_reload(
             self.db.set_favorites, (ids, value), "Не удалось выполнить операцию"))
 
+    def _fin_ids(self, selected):
+        """id выбранных фин-записей (карты/кошельки)."""
+        return [n["id"] for n in (self._node(i) for i in selected)
+                if n["type"] in FIN_LEAF_TYPES]
+
+    def _set_fin_favorite(self, selected, value):
+        ids = self._fin_ids(selected)
+        # Пакетный метод — ОДНА транзакция БД (M7-04), как у аккаунтов
+        # (_set_favorite/set_favorites): раньше это был цикл с транзакцией на
+        # запись, и сбой середины списка оставлял половину выбора без отката.
+        util.fire(self._run_then_reload(
+            self.db.set_fin_favorites, (ids, value), "Не удалось выполнить операцию"))
+
+    def _move_fin_items(self, selected, service_id):
+        ids = self._fin_ids(selected)
+        util.fire(self._run_then_reload(
+            self.db.move_fin_items, (ids, service_id),
+            "Не удалось переместить", status="Перемещено"))
+
+    def _find_leaf_item(self, node_type, node_id):
+        """Элемент дерева листа (аккаунт/карта/кошелёк) по (типу, id) или None."""
+        for it in self._iter_items():
+            node = self._node(it)
+            if node and node["type"] == node_type and node["id"] == node_id:
+                return it
+        return None
+
     def _move_services(self, selected, folder_id):
         ids = [node["id"] for node in (self._node(i) for i in selected)
-               if node["type"] == "service"]
+               if node["type"] == SERVICE]
         util.fire(self._run_then_reload(
             self.db.move_services, (ids, folder_id),
             "Не удалось переместить", status="Перемещено"))
@@ -551,14 +646,14 @@ class TreeMixin:
         if ok and name:
             # Создание папки и перенос — ОДНА транзакция БД (M7-04).
             svc_ids = [self._node(i)["id"] for i in selected
-                       if self._node(i)["type"] == "service"]
+                       if self._node(i)["type"] == SERVICE]
             util.fire(self._run_then_reload(
                 self.db.move_services_to_new_folder, (name, svc_ids),
                 "Не удалось переместить в папку", status="Перемещено"))
 
     def _move_accounts(self, selected, service_id):
         ids = [node["id"] for node in (self._node(i) for i in selected)
-               if node["type"] == "account"]
+               if node["type"] == ACCOUNT]
         util.fire(self._run_then_reload(
             self.db.move_accounts, (ids, service_id),
             "Не удалось переместить", status="Перемещено"))
@@ -567,7 +662,7 @@ class TreeMixin:
         name, ok = theme.themed_input(self.config, self, "Новый сервис", "Название:")
         if ok and name:
             acc_ids = [self._node(i)["id"] for i in selected
-                       if self._node(i)["type"] == "account"]
+                       if self._node(i)["type"] == ACCOUNT]
             # Создание сервиса и перенос — ОДНА транзакция БД (M7-04).
             util.fire(self._run_then_reload(
                 self.db.move_accounts_to_new_service, (name, acc_ids),
@@ -581,19 +676,19 @@ class TreeMixin:
             # Запись + выбор нового узла — в одной coroutine: выбор зависит от
             # возвращённого id, поэтому write и select идут последовательно (H-8).
             util.fire(self._add_node_then_select(
-                self.db.add_folder, (name,), "folder"))
+                self.db.add_folder, (name,), FOLDER))
 
     def add_service(self):
         # Сервис можно добавить в выбранную папку либо как самостоятельный
         # (вне папки) — оба варианта допускаются ТЗ.
         current = self.tree.currentItem()
         node = self._node(current)
-        folder_id = node["id"] if node and node["type"] == "folder" else None
+        folder_id = node["id"] if node and node["type"] == FOLDER else None
 
         name, ok = theme.themed_input(self.config, self, "Новый сервис", "Название:")
         if ok and name:
             util.fire(self._add_node_then_select(
-                self.db.add_service, (name, folder_id), "service"))
+                self.db.add_service, (name, folder_id), SERVICE))
 
     async def _add_node_then_select(self, method, args, node_type):
         """Создать узел (метод возвращает новый id) в фоне, затем перестроить
@@ -614,13 +709,13 @@ class TreeMixin:
     def add_account(self):
         current = self.tree.currentItem()
         node = self._node(current)
-        if node and node["type"] == "service":
+        if node and node["type"] == SERVICE:
             service_id = node["id"]
-        elif node and node["type"] == "account":
+        elif node and node["type"] == ACCOUNT:
             # Аккаунт под сервисом → тот же сервис; свободный аккаунт → корень.
             parent = current.parent()
             pnode = self._node(parent) if parent else None
-            service_id = pnode["id"] if pnode and pnode["type"] == "service" else None
+            service_id = pnode["id"] if pnode and pnode["type"] == SERVICE else None
         else:
             # Папка или ничего не выбрано → свободный аккаунт (в корне).
             service_id = None
@@ -653,4 +748,46 @@ class TreeMixin:
         # в БД (add_account_with_card, одна транзакция), поэтому включение
         # правки — чисто UI-переключение после завершения async-загрузки.
         self._edit_on_load_id = account_id
-        self._select_node("account", account_id)
+        self._select_node(ACCOUNT, account_id)
+
+    def add_fin_record(self, type_id):
+        """Создание финансовой записи (карта/кошелёк) выбранного типа. Флоу как у
+        аккаунта: имя → пустая запись в БД → выбор узла → карточка в правке."""
+        spec = FIN_TYPES.get(type_id)
+        if spec is None:
+            return
+        current = self.tree.currentItem()
+        node = self._node(current)
+        if node and node["type"] == SERVICE:
+            service_id = node["id"]
+        elif node and node["type"] in LEAF_TYPES:
+            # Лист под сервисом → тот же сервис; свободный → корень.
+            parent = current.parent()
+            pnode = self._node(parent) if parent else None
+            service_id = pnode["id"] if pnode and pnode["type"] == SERVICE else None
+        else:
+            # Папка или ничего не выбрано → свободная запись (в корне).
+            service_id = None
+
+        name, ok = theme.themed_input(
+            self.config, self, spec.create_title, "Название:")
+        if ok and name:
+            util.fire(self._add_fin_record_async(service_id, type_id, name))
+
+    async def _add_fin_record_async(self, service_id, type_id, name):
+        session = self.db.current_session()
+        try:
+            item_id = await self.db.run_async(
+                self.db.add_fin_item, service_id, type_id, name, _session=session)
+        except StaleSessionError:
+            return
+        except Exception as e:                       # noqa: BLE001
+            self._show_card_error("Не удалось создать запись", e)
+            self._reload_tree()
+            return
+        self._any_db_changes = True
+        self._reload_tree()
+        spec = FIN_TYPES[type_id]
+        # Новая запись сразу в режим правки после загрузки (одноразовый флаг).
+        self._fin_edit_on_load = (spec.node_type, item_id)
+        self._select_node(spec.node_type, item_id)

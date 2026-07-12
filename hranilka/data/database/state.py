@@ -29,6 +29,9 @@ class DbBase:
     def _bump_session(self) -> None:
         raise NotImplementedError
 
+    def invalidate_async_session(self) -> None:
+        raise NotImplementedError
+
     def _commit(self) -> None:
         raise NotImplementedError
 
@@ -45,6 +48,31 @@ class DbBase:
                            items: list) -> list:
         raise NotImplementedError
 
+    def _save_gallery_rows_generic(self, table: str, fk_col: str,  # gallery_ops
+                                   fk_id: int, items: list) -> list:
+        raise NotImplementedError
+
+    def _load_gallery_image(self, table: str, image_id: int):     # gallery_ops
+        raise NotImplementedError
+
+    def _next_sort_order(self, table: str, parent_col: str,   # tree_ops
+                         parent_id: Optional[int]) -> int:
+        raise NotImplementedError
+
+    def _move_fin_item_to_bin_rows(self, item_id: int) -> None:   # fin_items
+        raise NotImplementedError
+
+    def _delete_fin_item_rows(self, item_id: int) -> None:        # fin_items
+        raise NotImplementedError
+
+    def _set_item_links_rows(self, item_id: int,                  # fin_items
+                             account_ids: list) -> None:
+        raise NotImplementedError
+
+    def _set_account_fin_links_rows(self, account_id: int,        # fin_items
+                                    item_ids: list) -> None:
+        raise NotImplementedError
+
     def _add_account_rows(self, service_id: Optional[int],    # tree_ops
                           account_name: str, login: Optional[str] = None,
                           password: Optional[str] = None) -> int:
@@ -58,5 +86,9 @@ class DbBase:
         raise NotImplementedError
 
     def get_tree_structure(self, sort_mode: str = "manual",   # tree_ops
-                           descending: bool = False) -> list:
+                           descending: bool = False,
+                           include_fin: bool = True) -> list:
+        raise NotImplementedError
+
+    def count_fin_items(self) -> int:                         # fin_items
         raise NotImplementedError

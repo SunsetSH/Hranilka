@@ -9,10 +9,14 @@ from hranilka.data.database.schema import SCHEMA_VERSION
 from hranilka.data.errors import FutureSchemaError
 
 
-def test_registry_empty_at_legacy_base():
-    """Пока SCHEMA_VERSION == LEGACY_BASE нумерованных шагов нет."""
-    assert SCHEMA_VERSION == migrations.LEGACY_BASE
-    assert migrations.MIGRATIONS == {}
+def test_registry_covers_legacy_base_plus_one():
+    """Реестр покрывает ровно версии LEGACY_BASE+1..SCHEMA_VERSION.
+    Зарегистрированы шаги m009 (fin-таблицы), m010 (чистка bank_account)
+    и m011 (чистка ewallet)."""
+    assert migrations.LEGACY_BASE == 8
+    assert SCHEMA_VERSION == 11
+    assert set(migrations.MIGRATIONS) == set(
+        range(migrations.LEGACY_BASE + 1, SCHEMA_VERSION + 1))
 
 
 def test_run_noop_on_current_version(db):
@@ -84,10 +88,13 @@ def test_numbered_step_runs_in_order(db, monkeypatch):
     """Нумерованные шаги выполняются по порядку и версия обновляется."""
     calls = []
     monkeypatch.setattr(runner, "SCHEMA_VERSION", SCHEMA_VERSION + 2)
-    monkeypatch.setattr(runner, "MIGRATIONS", {
-        SCHEMA_VERSION + 1: lambda conn: calls.append(SCHEMA_VERSION + 1),
-        SCHEMA_VERSION + 2: lambda conn: calls.append(SCHEMA_VERSION + 2),
-    })
+    # Реестр обязан покрывать весь диапазон LEGACY_BASE+1..SCHEMA_VERSION+2:
+    # реальные шаги (ключ 9) + два фейковых. Шаги ≤ текущей версии БД не
+    # выполняются (db на SCHEMA_VERSION), поэтому в calls только +1 и +2.
+    fake = {v: (lambda conn: None) for v in migrations.MIGRATIONS}
+    fake[SCHEMA_VERSION + 1] = lambda conn: calls.append(SCHEMA_VERSION + 1)
+    fake[SCHEMA_VERSION + 2] = lambda conn: calls.append(SCHEMA_VERSION + 2)
+    monkeypatch.setattr(runner, "MIGRATIONS", fake)
     runner.run(db)
     assert calls == [SCHEMA_VERSION + 1, SCHEMA_VERSION + 2]
     assert db.get_schema_version() == SCHEMA_VERSION + 2
@@ -97,10 +104,10 @@ def test_numbered_step_not_rerun_from_reached_version(db, monkeypatch):
     """Шаги ниже текущей версии БД не выполняются повторно."""
     calls = []
     monkeypatch.setattr(runner, "SCHEMA_VERSION", SCHEMA_VERSION + 2)
-    monkeypatch.setattr(runner, "MIGRATIONS", {
-        SCHEMA_VERSION + 1: lambda conn: calls.append(SCHEMA_VERSION + 1),
-        SCHEMA_VERSION + 2: lambda conn: calls.append(SCHEMA_VERSION + 2),
-    })
+    fake = {v: (lambda conn: None) for v in migrations.MIGRATIONS}
+    fake[SCHEMA_VERSION + 1] = lambda conn: calls.append(SCHEMA_VERSION + 1)
+    fake[SCHEMA_VERSION + 2] = lambda conn: calls.append(SCHEMA_VERSION + 2)
+    monkeypatch.setattr(runner, "MIGRATIONS", fake)
     db.set_schema_version(SCHEMA_VERSION + 1)   # первый шаг уже применён
     runner.run(db)
     assert calls == [SCHEMA_VERSION + 2]

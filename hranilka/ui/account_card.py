@@ -9,9 +9,11 @@ import logging
 from PySide6.QtCore import QDateTime
 from PySide6.QtWidgets import QDialog
 
+from hranilka.core.nodetypes import ACCOUNT
 from hranilka.data.database import StaleSessionError
 from hranilka.data.models import AccountData
 from hranilka.ui.generator_dialog import GeneratorSettingsDialog
+from hranilka.ui.widgets import fin_item_display
 from hranilka.generators import password_gen
 from hranilka.generators import pd_generator
 from hranilka.core import util
@@ -22,9 +24,21 @@ from hranilka.ui import theme
 class AccountCardMixin:
     """Правая панель: просмотр/редактирование карточки, связи, генерация, статус."""
 
+    def _fin_enabled(self):
+        """Показывать ли фин-инструменты (карты/кошельки) в интерфейсе."""
+        return self.config.get("show_fin_instruments", False)
+
+    def _current_fin_link_ids(self):
+        """id привязанных фин-записей карточки для сохранения/стеша. При
+        выключенной опции возвращает None: скрытый пустой виджет НЕ должен
+        стереть реальные связи fin_links (None не трогает их в БД)."""
+        return self.tabs.f_fin_linked.get_data() if self._fin_enabled() else None
+
     def _show_placeholder(self):
-        self.placeholder_label.show()
-        self.tabs.hide()
+        # Правая панель — QStackedWidget (заглушка / аккаунт / фин-запись);
+        # переключение страниц вместо show/hide отдельных виджетов.
+        self.right_stack.setCurrentWidget(self.placeholder_label)
+        self.fin_banner.hide()
         self.edit_btn.hide()
         self.save_btn.hide()
         self.cancel_btn.hide()
@@ -66,15 +80,15 @@ class AccountCardMixin:
             # Вернулись на карточку в режиме правки: кладём в живой виджет как
             # ручную правку (при следующем switch попадёт в _stash_current_edits).
             self.tabs.f_gallery_widget.add_item(data, desc)
-            self._dirty_ids.add(account_id)
+            self._dirty_ids.add((ACCOUNT, account_id))
             self._refresh_dirty_markers(account_id)
             return
         # Ушли на другую карточку/заглушку (или карточка не в правке) — картинку
         # кладём в черновик правок, чтобы она не потерялась вне режима правки.
-        if account_id in self._edit_cache:
-            self._edit_cache[account_id]["storage"]["gallery"].append(
+        if (ACCOUNT, account_id) in self._edit_cache:
+            self._edit_cache[(ACCOUNT, account_id)]["storage"]["gallery"].append(
                 {"desc": desc, "data": data, "image_id": None, "blob_size": None})
-            self._dirty_ids.add(account_id)
+            self._dirty_ids.add((ACCOUNT, account_id))
             self._refresh_dirty_markers(account_id)
             return
         # Черновика ещё нет (edge: пользователь не редактировал этот аккаунт —
@@ -103,11 +117,11 @@ class AccountCardMixin:
         # в режиме правки — тогда кладём в живой виджет, не перетирая состояние.
         if account_id == self._current_account_id and self.is_editing:
             self.tabs.f_gallery_widget.add_item(data, desc)
-            self._dirty_ids.add(account_id)
+            self._dirty_ids.add((ACCOUNT, account_id))
             self._refresh_dirty_markers(account_id)
             return
-        if account_id in self._edit_cache:
-            self._edit_cache[account_id]["storage"]["gallery"].append(
+        if (ACCOUNT, account_id) in self._edit_cache:
+            self._edit_cache[(ACCOUNT, account_id)]["storage"]["gallery"].append(
                 {"desc": desc, "data": data, "image_id": None, "blob_size": None})
         else:
             # Формат черновика идентичен _stash_current_edits: storage из
@@ -128,9 +142,26 @@ class AccountCardMixin:
                               "загрузки: %s", e, exc_info=e)
                 link_rows = []
             link_ids = [r["id"] for r in link_rows]
-            self._edit_cache[account_id] = {
-                "storage": acc.to_storage(), "links": link_ids}
-        self._dirty_ids.add(account_id)
+            # Привязанные фин-записи — тоже в черновик: иначе сохранение из
+            # такого черновика перезаписало бы связи fin_links пустым списком.
+            # При выключенной опции — None (сохранение не тронет fin_links).
+            fin_link_ids = None
+            if self._fin_enabled():
+                try:
+                    fin_rows = await self.db.run_async(
+                        self.db.get_account_fin_links, account_id,
+                        _session=session)
+                except StaleSessionError:
+                    return
+                except Exception as e:           # noqa: BLE001
+                    logging.error("Не удалось подгрузить фин-связи для "
+                                  "осиротевшей загрузки: %s", e, exc_info=e)
+                    fin_rows = []
+                fin_link_ids = [r["id"] for r in fin_rows]
+            self._edit_cache[(ACCOUNT, account_id)] = {
+                "storage": acc.to_storage(), "links": link_ids,
+                "fin_links": fin_link_ids}
+        self._dirty_ids.add((ACCOUNT, account_id))
         self._refresh_dirty_markers(account_id)
 
     def _quiesce_card_async(self):
@@ -143,6 +174,9 @@ class AccountCardMixin:
         self._card_busy = False
         try:
             self.tabs.f_gallery_widget.cancel_all_tasks()
+            # Галереи фин-карточек (по одной на тип реестра) — тоже гасим.
+            for fin_tabs in self.fin_tabs_by_type.values():
+                fin_tabs.f_gallery_widget.cancel_all_tasks()
         except Exception as e:                       # noqa: BLE001 — teardown-хардненинг
             logging.warning("Не удалось отменить задачи галереи: %s", e)
 
@@ -160,7 +194,7 @@ class AccountCardMixin:
 
     def on_item_selected(self, current, previous):
         node = self._node(current)
-        new_id = node["id"] if (node and node["type"] == "account") else None
+        new_id = node["id"] if (node and node["type"] == ACCOUNT) else None
 
         # Одноразовый флаг «открыть в правке» действует только для своего
         # аккаунта: ушли на другой узел — гасим, чтобы правка не включилась
@@ -187,8 +221,8 @@ class AccountCardMixin:
             self._update_status_info()
             return
 
-        self.placeholder_label.hide()
-        self.tabs.show()
+        self.right_stack.setCurrentWidget(self.tabs)
+        self.fin_banner.hide()
         self.current_tree_item = current
         self._current_account_id = new_id
         # Чтение карточки/связей/объёма галереи — в фоновом потоке БД (UI не виснет).
@@ -207,17 +241,25 @@ class AccountCardMixin:
         сессий vault (H65-02)."""
         session = self.db.current_session()
         try:
-            if new_id in self._edit_cache:
+            if (ACCOUNT, new_id) in self._edit_cache:
                 # Возврат к аккаунту с несохранёнными правками — восстанавливаем из кеша.
-                cached = self._edit_cache[new_id]
+                cached = self._edit_cache[(ACCOUNT, new_id)]
                 links = await self.db.run_async(
                     self._resolve_link_names, cached["links"], _session=session)
+                # fin_links в черновике может быть None (стеш при выключенной
+                # опции); при выключенной опции фин-связи не читаем вовсе.
+                fin_links = []
+                if self._fin_enabled():
+                    fin_links = await self.db.run_async(
+                        self._resolve_fin_link_rows,
+                        cached.get("fin_links") or [], _session=session)
                 other_bytes = await self.db.run_async(
                     self.db.gallery_total_bytes, new_id, _session=session)
                 if gen != self._card_gen:
                     return
                 self.current_account_data = AccountData.from_storage(cached["storage"])
-                self.load_data_to_ui(links=links, other_bytes=other_bytes)
+                self.load_data_to_ui(links=links, other_bytes=other_bytes,
+                                     fin_links=fin_links)
                 self.is_editing = True
                 self.tabs.set_all_editable(True)
                 self.edit_btn.hide(); self.save_btn.show(); self.cancel_btn.show()
@@ -236,13 +278,19 @@ class AccountCardMixin:
                     return
                 links = await self.db.run_async(
                     self.db.get_links, new_id, _session=session)
+                # Фин-связи не читаем при выключенной опции (секция скрыта).
+                fin_links = []
+                if self._fin_enabled():
+                    fin_links = await self.db.run_async(
+                        self.db.get_account_fin_links, new_id, _session=session)
                 other_bytes = await self.db.run_async(
                     self.db.gallery_total_bytes, new_id, _session=session)
                 if gen != self._card_gen:
                     return
                 self.current_account_data = AccountData.from_storage(storage)
                 self.is_editing = False
-                self.load_data_to_ui(links=links, other_bytes=other_bytes)
+                self.load_data_to_ui(links=links, other_bytes=other_bytes,
+                                     fin_links=fin_links)
                 self.tabs.set_all_editable(False)
                 self.edit_btn.show(); self.save_btn.hide(); self.cancel_btn.hide()
                 if self._edit_on_load_id == new_id:
@@ -280,6 +328,13 @@ class AccountCardMixin:
         """Имена связанных аккаунтов по их id (для отображения). Вызывается в
         фоновом потоке БД через run_async — get_account_path потокобезопасен."""
         return [{"id": i, "name": self.db.get_account_path(i)} for i in ids]
+
+    def _resolve_fin_link_rows(self, ids):
+        """Строки привязанных фин-записей по их id (восстановление из кеша
+        правок). Вызывается в фоновом потоке БД; записи из корзины/удалённые
+        отфильтровываются (list_fin_items отдаёт только живые)."""
+        by_id = {r["id"]: r for r in self.db.list_fin_items()}
+        return [by_id[i] for i in ids if i in by_id]
 
     def _collect_account_data(self):
         """Собирает AccountData из полей UI (без записи в БД)."""
@@ -329,13 +384,16 @@ class AccountCardMixin:
         return updated
 
     def _stash_current_edits(self, account_id):
-        """Сохраняет несохранённые правки аккаунта в память (не в БД)."""
+        """Сохраняет несохранённые правки аккаунта в память (не в БД).
+        fin_links=None при выключенной опции — сохранение из такого черновика
+        не тронет связи fin_links (см. _current_fin_link_ids)."""
         d = self._collect_account_data()
-        self._edit_cache[account_id] = {
+        self._edit_cache[(ACCOUNT, account_id)] = {
             "storage": d.to_storage(),
             "links": self.tabs.f_linked.get_data(),
+            "fin_links": self._current_fin_link_ids(),
         }
-        self._dirty_ids.add(account_id)
+        self._dirty_ids.add((ACCOUNT, account_id))
 
     def _refresh_dirty_markers(self, account_id=None):
         """Обновляет подписи и выделение элементов (метка несохранённых правок).
@@ -348,7 +406,7 @@ class AccountCardMixin:
         for it in self._iter_items():
             self._apply_item_style(it, self._node(it))
 
-    def load_data_to_ui(self, links=None, other_bytes=None):
+    def load_data_to_ui(self, links=None, other_bytes=None, fin_links=None):
         d = self.current_account_data
         self.tabs.f_name.set_text(d.name)
         self.tabs.f_url.set_text(d.url)
@@ -406,6 +464,14 @@ class AccountCardMixin:
             links = self.db.get_links(node["id"]) if node else []
         self.tabs.f_linked.set_data(links)
 
+        # Привязанные карты/кошельки (§8) — тот же горячий/холодный паттерн.
+        # При выключенной опции секция скрыта — БД не читаем, список пуст.
+        if fin_links is None:
+            node = self._node(self.current_tree_item)
+            fin_links = (self.db.get_account_fin_links(node["id"])
+                         if node and self._fin_enabled() else [])
+        self.tabs.f_fin_linked.set_data(fin_links)
+
     def toggle_edit_mode(self):
         if self._card_busy:
             return                              # идёт загрузка/сохранение — не входим в правку
@@ -427,8 +493,8 @@ class AccountCardMixin:
         # Отмена отбрасывает несохранённые правки этого аккаунта
         session = self.db.current_session()
         aid = self._current_account_id
-        self._edit_cache.pop(aid, None)
-        self._dirty_ids.discard(aid)
+        self._edit_cache.pop((ACCOUNT, aid), None)
+        self._dirty_ids.discard((ACCOUNT, aid))
         self.is_editing = False
         try:
             storage = await self.db.run_async(
@@ -443,12 +509,17 @@ class AccountCardMixin:
                 self._reload_tree()
                 return
             links = await self.db.run_async(self.db.get_links, aid, _session=session)
+            fin_links = []
+            if self._fin_enabled():
+                fin_links = await self.db.run_async(
+                    self.db.get_account_fin_links, aid, _session=session)
             other_bytes = await self.db.run_async(
                 self.db.gallery_total_bytes, aid, _session=session)
             if gen != self._card_gen:
                 return
             self.current_account_data = AccountData.from_storage(storage)
-            self.load_data_to_ui(links=links, other_bytes=other_bytes)
+            self.load_data_to_ui(links=links, other_bytes=other_bytes,
+                                 fin_links=fin_links)
             self.tabs.set_all_editable(False)
             self.edit_btn.show()
             self.save_btn.hide()
@@ -498,11 +569,15 @@ class AccountCardMixin:
         d = self._collect_account_data()
         storage = d.to_storage()
         link_ids = self.tabs.f_linked.get_data()
-        # Запись карточки и связей — атомарно, в одной транзакции, в фоновом потоке.
+        # При выключенной опции показа фин-инструментов — None: скрытый пустой
+        # виджет НЕ должен стереть реальные связи fin_links (КРИТИЧНЫЙ инвариант).
+        fin_link_ids = self._current_fin_link_ids()
+        # Запись карточки и всех связей (аккаунты + карты/кошельки) — атомарно,
+        # в ОДНОЙ транзакции, в фоновом потоке.
         try:
             gallery_ids = await self.db.run_async(
                 self.db.save_account_with_links, aid, storage, link_ids,
-                _session=session)
+                fin_link_ids, _session=session)
         except StaleSessionError:
             return                               # БД сменена (restore) — запись неактуальна
         except Exception as e:                   # noqa: BLE001
@@ -510,8 +585,9 @@ class AccountCardMixin:
                 # Снимок не потерян: возвращаем его в кеш правок, чтобы пользователь
                 # мог повторить сохранение, и показываем причину. Поля возвращаем в
                 # editable — пользователь остаётся в режиме правки (H65-01).
-                self._edit_cache[aid] = {"storage": storage, "links": link_ids}
-                self._dirty_ids.add(aid)
+                self._edit_cache[(ACCOUNT, aid)] = {"storage": storage, "links": link_ids,
+                                                    "fin_links": fin_link_ids}
+                self._dirty_ids.add((ACCOUNT, aid))
                 self._refresh_dirty_markers(aid)
                 self.tabs.set_all_editable(True)
                 self._show_card_error("Не удалось сохранить аккаунт", e)
@@ -525,8 +601,8 @@ class AccountCardMixin:
             # Новые картинки получают id своих строк — повторное сохранение
             # обновит их, а не пересоздаст (лишняя перезапись BLOB).
             gallery.assign_saved_ids(gallery_ids)
-            self._edit_cache.pop(aid, None)
-            self._dirty_ids.discard(aid)
+            self._edit_cache.pop((ACCOUNT, aid), None)
+            self._dirty_ids.discard((ACCOUNT, aid))
             self.is_editing = False
             self.tabs.set_all_editable(False)
             self.edit_btn.show()
@@ -556,7 +632,7 @@ class AccountCardMixin:
                 "НАСТРОЙКИ СОХРАНЕНЫ, ПАРОЛЬ ПОДСТАВЛЕН", 2000)
 
     def generate_personal_data(self):
-        choice, ok = theme.themed_choice(
+        choice, ok = theme.themed_combo_choice(
             self.config, self, "Генерация ПД", "Выберите национальность:",
             ["Русский", "Американец"],
         )
@@ -577,7 +653,7 @@ class AccountCardMixin:
     # ----- Связанные аккаунты -----
 
     def on_link_navigate(self, account_id):
-        self._select_node("account", account_id)
+        self._select_node(ACCOUNT, account_id)
 
     def on_add_link_requested(self):
         node = self._node(self.current_tree_item)
@@ -611,11 +687,45 @@ class AccountCardMixin:
             self.tabs.f_linked.set_data(links)
             self.tabs.f_linked.set_editable(self.is_editing)
 
+    # ----- Привязанные карты/кошельки (§8) -----
+
+    def on_fin_link_navigate(self, node_type, item_id):
+        """Клик по привязанной записи — выделить её узел в дереве."""
+        self._select_node(node_type, item_id)
+
+    def on_add_fin_link_requested(self):
+        """«+ ПРИВЯЗАТЬ» на карточке аккаунта: выбор из живых фин-записей.
+        Чтение списка — в фоновом потоке БД (H-8), диалог — после загрузки."""
+        if self._node(self.current_tree_item) is None:
+            return
+        util.fire(self._add_fin_link_async())
+
+    async def _add_fin_link_async(self):
+        session = self.db.current_session()
+        try:
+            items = await self.db.run_async(
+                self.db.list_fin_items, _session=session)
+        except StaleSessionError:
+            return
+        except Exception as e:                       # noqa: BLE001
+            self._show_card_error("Не удалось загрузить список записей", e)
+            return
+        candidates = [{"id": it["id"], "name": fin_item_display(it)}
+                      for it in items]
+        chosen, ok = theme.themed_multiselect(
+            self.config, self, "Привязать карты и кошельки", candidates,
+            self.tabs.f_fin_linked.get_data())
+        if ok:
+            chosen_set = set(chosen)
+            links = [it for it in items if it["id"] in chosen_set]
+            self.tabs.f_fin_linked.set_data(links)
+            self.tabs.f_fin_linked.set_editable(self.is_editing)
+
     # ----- Статус-бар -----
 
     def _update_status_info(self):
         node = self._node(self.current_tree_item)
-        if not node or node["type"] != "account":
+        if not node or node["type"] != ACCOUNT:
             self.status_info.setText("")
             return
         path = self.db.get_account_path(node["id"])

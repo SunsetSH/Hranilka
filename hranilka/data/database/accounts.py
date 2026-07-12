@@ -164,14 +164,19 @@ class DbAccountCardMixin(DbBase):
         self._mark_dirty()
         return account_id
 
-    def save_account_with_links(self, account_id, data, target_ids):
+    def save_account_with_links(self, account_id, data, target_ids,
+                                fin_item_ids=None):
         """Атомарно сохраняет карточку и её связи В ОДНОЙ транзакции (H6-02):
         раньше save_account и set_links были двумя транзакциями — сбой второй
         оставлял карточку записанной, а связи нет. Теперь либо обе, либо ни одна.
+        fin_item_ids — привязанные карты/кошельки (концепт §8): перезаписываются
+        той же транзакцией; None — связи fin_links не трогаются (старые вызовы).
         Возвращает список id строк галереи (как save_account)."""
         with self.conn:
             gallery_ids = self._save_account_rows(account_id, data)
             self._set_links_rows(account_id, target_ids)
+            if fin_item_ids is not None:
+                self._set_account_fin_links_rows(account_id, fin_item_ids)
         self._mark_dirty()
         return gallery_ids
 

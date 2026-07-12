@@ -7,6 +7,8 @@
 """
 import pytest
 
+from hranilka.core.nodetypes import ACCOUNT
+
 # Общий session-qapp живёт в conftest.py (M-16).
 
 
@@ -132,7 +134,7 @@ def test_orphan_upload_lands_in_edit_cache(window):
     aid = db.add_account(sid, "Acc")
 
     # У аккаунта уже есть черновик правок (как после ухода в режиме правки).
-    window._edit_cache[aid] = {
+    window._edit_cache[(ACCOUNT, aid)] = {
         "storage": {"fields": {}, "personal": {}, "questions": [],
                     "recovery": {}, "codes": [], "gallery": []},
         "links": [],
@@ -142,12 +144,28 @@ def test_orphan_upload_lands_in_edit_cache(window):
     data = b"\x89PNG_orphan_bytes"
     window._on_gallery_orphan_upload(aid, "подпись", data)
 
-    gallery = window._edit_cache[aid]["storage"]["gallery"]
+    gallery = window._edit_cache[(ACCOUNT, aid)]["storage"]["gallery"]
     assert len(gallery) == 1
     assert gallery[0]["data"] == data
     assert gallery[0]["desc"] == "подпись"
     assert gallery[0]["image_id"] is None      # новая картинка
-    assert aid in window._dirty_ids            # аккаунт помечен несохранённым
+    assert (ACCOUNT, aid) in window._dirty_ids  # аккаунт помечен несохранённым
+
+
+def test_dirty_keys_are_type_id_tuples(window):
+    """Ключи _dirty_ids/_edit_cache — кортежи (node_type, id) (Фаза 0): id аккаунта
+    и фин-записи с одинаковым числом не сталкиваются. Осиротевшая загрузка —
+    доступный из теста путь, помечающий аккаунт грязным."""
+    db = window.db
+    sid = db.add_service("Сервис")
+    aid = db.add_account(sid, "Acc")
+    window._current_account_id = None
+
+    window._on_gallery_orphan_upload(aid, "x", b"data")
+
+    assert (ACCOUNT, aid) in window._dirty_ids
+    assert all(isinstance(k, tuple) and len(k) == 2 for k in window._dirty_ids)
+    assert all(isinstance(k, tuple) and len(k) == 2 for k in window._edit_cache)
 
 
 def test_orphan_upload_deleted_account_dropped(window):
@@ -159,8 +177,8 @@ def test_orphan_upload_deleted_account_dropped(window):
     window._current_account_id = None
     window._on_gallery_orphan_upload(missing_aid, "x", b"data")
 
-    assert missing_aid not in window._edit_cache
-    assert missing_aid not in window._dirty_ids
+    assert (ACCOUNT, missing_aid) not in window._edit_cache
+    assert (ACCOUNT, missing_aid) not in window._dirty_ids
 
 
 def test_orphan_upload_builds_draft_from_db(window):
@@ -170,15 +188,15 @@ def test_orphan_upload_builds_draft_from_db(window):
     sid = db.add_service("Сервис")
     aid = db.add_account(sid, "Acc")
     window._current_account_id = None          # мы НЕ на этой карточке
-    window._edit_cache.pop(aid, None)          # черновика нет
+    window._edit_cache.pop((ACCOUNT, aid), None)  # черновика нет
 
     data = b"\x89PNG_from_db"
     window._on_gallery_orphan_upload(aid, "снимок", data)
 
-    assert aid in window._edit_cache
-    gallery = window._edit_cache[aid]["storage"]["gallery"]
+    assert (ACCOUNT, aid) in window._edit_cache
+    gallery = window._edit_cache[(ACCOUNT, aid)]["storage"]["gallery"]
     assert gallery[-1]["data"] == data
     assert gallery[-1]["desc"] == "снимок"
     assert gallery[-1]["image_id"] is None
-    assert isinstance(window._edit_cache[aid]["links"], list)
-    assert aid in window._dirty_ids
+    assert isinstance(window._edit_cache[(ACCOUNT, aid)]["links"], list)
+    assert (ACCOUNT, aid) in window._dirty_ids
