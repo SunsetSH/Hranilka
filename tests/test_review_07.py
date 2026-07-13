@@ -14,6 +14,17 @@ from hranilka.ui.dialogs.unlock import UnlockDialog
 # Общий session-qapp живёт в conftest.py (offscreen).
 
 
+def _wait_result(qapp, dlg, timeout_s=5.0):
+    """Докрутить event-loop до доставки результата фоновой разблокировки
+    (H-09: cs.unlock выполняется в потоке, результат приходит queued-сигналом)."""
+    import time
+    deadline = time.time() + timeout_s
+    while dlg.result_data is None and dlg._busy and time.time() < deadline:
+        qapp.processEvents()
+        time.sleep(0.01)
+    qapp.processEvents()
+
+
 def _future(value=None, exc=None, delay=0.0):
     """Future, резолвящийся значением или исключением (опц. с задержкой)."""
     import threading
@@ -48,6 +59,7 @@ def test_unlock_dialog_reads_container_lazily_on_attempt(qapp, pure_config, monk
     dlg.set_container_future(_future(value=b"CONTAINER-BYTES", delay=0.05))
     dlg._field.setText("secret")
     dlg._attempt()
+    _wait_result(qapp, dlg)
 
     assert seen["container"] == b"CONTAINER-BYTES"   # дождались future
     assert dlg.result_data == ("db", "dek", "header")
@@ -87,6 +99,7 @@ def test_unlock_dialog_ready_container_without_future(qapp, pure_config, monkeyp
     dlg = UnlockDialog(pure_config, b"READY")
     dlg._field.setText("secret")
     dlg._attempt()
+    _wait_result(qapp, dlg)
 
     assert seen["container"] == b"READY"
     assert dlg.result_data == ("db", "dek", "header")

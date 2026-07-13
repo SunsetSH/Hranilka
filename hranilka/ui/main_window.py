@@ -772,6 +772,9 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, FinCardMixin,
         # Привилегированные операции (шифрование/бэкап/восстановление) — только
         # монопольно, без конкуренции с фоновым воркером записи (H3-01).
         dialog.set_vault_runner(self.vault.run_exclusive)
+        # KDF-тяжёлые операции (Argon2id) — через фоновый поток с модальным
+        # progress, чтобы окно не подвисало (H-09).
+        dialog.set_vault_runner_heavy(self.vault.run_exclusive_busy)
         dialog.appearance_changed.connect(self.apply_appearance)  # лёгкий предпросмотр
         dialog.settings_applied.connect(self.apply_config)        # полное применение
         dialog.settings_applied.connect(self._rebind_shortcuts)   # пере-привязка хоткеев
@@ -813,45 +816,193 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, FinCardMixin,
             self._reload_tree()
             self._update_bin_button()
 
-    def _archive_db_file(self):
-        """Отложить (переименовать) текущий файл БД, не удаляя его."""
+    def _archive_db_file(self, suffix: str = "locked"):
+        """Отложить (переименовать) текущий файл БД, не удаляя его.
+
+        suffix: "locked" — недоступный зашифрованный файл (утерян секрет),
+        "corrupt" — повреждённый файл SQLite (H-07).
+
+        Возвращает путь к отложенному файлу или None, если файла не было.
+        OSError переименования пробрасывается: вызыватель ОБЯЗАН отменить
+        замену файла — иначе «сохранённый для диагностики» оригинал был бы
+        молча перезаписан."""
         import os
         from datetime import datetime
         if not os.path.exists(self.db.db_path):
-            return
+            return None
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-        archived = f"{self.db.db_path}.locked-{ts}"
-        try:
-            os.replace(self.db.db_path, archived)
-            logging.info("Зашифрованный файл отложен: %s", archived)
-        except OSError as e:
-            logging.warning("Не удалось отложить файл БД: %s", e)
+        archived = f"{self.db.db_path}.{suffix}-{ts}"
+        os.replace(self.db.db_path, archived)
+        logging.info("Файл БД отложен: %s", archived)
+        return archived
 
     def _create_tables_or_exit(self):
         """create_tables() с понятным отказом, если база создана более новой
         версией программы (схема новее поддерживаемой). «Миграция вниз»
-        повредила бы данные, поэтому корректнее завершить работу."""
-        try:
-            self.db.create_tables()
-        except FutureSchemaError as e:
-            logging.error("Несовместимая версия схемы БД: %s", e)
-            theme.themed_info(
-                self.config, self, "Несовместимая версия базы", str(e),
-            )
+        повредила бы данные, поэтому корректнее завершить работу.
+
+        Повреждение страниц/заголовка SQLite всплывает здесь при первом реальном
+        чтении схемы (H-07): fail-closed — соединение закрывается без записи,
+        пользователю предлагается восстановление из проверенного бэкапа."""
+        import sqlite3
+        while True:
+            try:
+                self.db.create_tables()
+                return
+            except FutureSchemaError as e:
+                logging.error("Несовместимая версия схемы БД: %s", e)
+                theme.themed_info(
+                    self.config, self, "Несовместимая версия базы", str(e),
+                )
+            except PreMigrationBackupError as e:
+                # Не удалось создать резервную копию перед необратимой правкой
+                # схемы (H7-03): база НЕ тронута. Открытие прерываем с понятным
+                # сообщением, чтобы пользователь освободил место и повторил.
+                logging.error("Отказ открытия: %s", e)
+                theme.themed_info(
+                    self.config, self, "Не удалось подготовить базу", str(e),
+                )
+            except sqlite3.DatabaseError as e:
+                self.db.close(persist=False)
+                if self._handle_db_open_error(e) and self._open_database():
+                    continue
             self.vault.shutdown()
             self._instance_lock.release()
             sys.exit(1)
-        except PreMigrationBackupError as e:
-            # Не удалось создать резервную копию перед необратимой правкой схемы
-            # (H7-03): база НЕ тронута. Открытие прерываем с понятным сообщением,
-            # чтобы пользователь освободил место/проверил доступ и повторил.
-            logging.error("Отказ открытия: %s", e)
-            theme.themed_info(
-                self.config, self, "Не удалось подготовить базу", str(e),
-            )
-            self.vault.shutdown()
-            self._instance_lock.release()
-            sys.exit(1)
+
+    def _handle_db_open_error(self, err, parent=None) -> bool:
+        """Классифицировать ошибку открытия БД: не всякий sqlite3.DatabaseError —
+        порча. Временная блокировка внешним процессом (SQLITE_BUSY/LOCKED) не
+        должна вести в recovery с заменой здоровой базы бэкапом.
+
+        Возвращает True, если открытие стоит повторить (пользователь просит
+        повтор / бэкап восстановлен), False — выход без изменений файла."""
+        import sqlite3
+        code = getattr(err, "sqlite_errorcode", None)
+        primary = code & 0xFF if code is not None else None
+        if primary in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+            logging.warning("Файл БД временно заблокирован: %s", err)
+            return theme.themed_confirm(
+                self.config, parent, "База занята",
+                "Файл базы временно заблокирован другой программой\n"
+                "(SQLite-инструмент, антивирус, резервное копирование).\n\n"
+                "Файл не повреждён и не изменён. Повторить попытку открытия?")
+        is_corruption = (primary in (sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB)
+                         # Нет кода (нестандартная сборка): DatabaseError вне
+                         # OperationalError трактуем как порчу структуры.
+                         or (code is None
+                             and not isinstance(err, sqlite3.OperationalError)))
+        if is_corruption:
+            return self._offer_corrupt_recovery(err, parent)
+        # I/O, права доступа и прочее: файл может быть цел — recovery с заменой
+        # не предлагаем, ничего не пишем.
+        logging.error("Не удалось открыть файл БД: %s", err)
+        theme.themed_info(
+            self.config, parent, "Ошибка открытия базы",
+            f"Не удалось открыть файл базы:\n{err}\n\n"
+            "Файл не изменён. Проверьте диск/права доступа и запустите снова.")
+        return False
+
+    def _fail_closed_archive_stranded(self, archived: str, parent=None):
+        """Аварийный fail-closed: восстановление сорвалось, И вернуть отложенный
+        файл на место не удалось. Продолжать цикл открытия нельзя — connect()
+        молча создал бы пустую базу, и пользователь решил бы, что данные
+        пропали. Показываем путь к данным; вызыватель обязан завершить запуск."""
+        logging.critical("Данные остались в отложенном файле: %s", archived)
+        theme.themed_info(
+            self.config, parent, "Восстановление прервано",
+            "Не удалось восстановить бэкап И вернуть исходный файл на место.\n\n"
+            f"Ваши данные сохранены в файле:\n{archived}\n\n"
+            "Программа закроется, чтобы не создать пустую базу поверх.\n"
+            "Переименуйте этот файл обратно в hranilka.db вручную\n"
+            "и запустите программу снова.")
+
+    def _offer_corrupt_recovery(self, err, parent=None) -> bool:
+        """Fail-closed обработка повреждённого файла БД (H-07).
+
+        В подозрительный файл ничего не пишется; он откладывается
+        (*.corrupt-<ts>) только после явного согласия пользователя на
+        восстановление. Возвращает True, если бэкап восстановлен и открытие
+        можно повторить, False — пользователь выбрал выход."""
+        from hranilka.ui.dialogs.unlock import pick_backup
+        from hranilka.ui.theme import ThemedDialog, themed_confirm
+        logging.error("Файл БД повреждён: %s", err)
+
+        d = ThemedDialog(self.config, parent)
+        d.setWindowTitle("База повреждена")
+        d.setMinimumWidth(480)
+        lay = d.body
+        lay.addWidget(QLabel(
+            "Файл базы данных повреждён и не может быть открыт:\n"
+            f"{err}\n\n"
+            "В повреждённый файл ничего не записано. При восстановлении из\n"
+            "бэкапа он будет сохранён рядом (переименован) для диагностики.\n\n"
+            "Выберите, как продолжить:"))
+        restore_btn = QPushButton("Восстановить из бэкапа…")
+        exit_btn = QPushButton("Выход")
+        lay.addWidget(restore_btn)
+        rr = QHBoxLayout(); rr.addStretch(); rr.addWidget(exit_btn)
+        lay.addLayout(rr)
+
+        restored = {"ok": False}
+
+        def do_restore():
+            import os
+            path = pick_backup(self.config, d)
+            if not path:
+                return
+            # Кандидат проверяется ДО любых изменений текущего файла: невалидный
+            # бэкап не должен стоить нам переименованного оригинала.
+            if not bk.validate_backup(path):
+                theme.themed_info(
+                    self.config, d, "Ошибка",
+                    "Выбранный файл повреждён или не является базой Хранилки.\n"
+                    "Текущие файлы не тронуты.")
+                return
+            if not themed_confirm(
+                    self.config, d, "Восстановление из бэкапа",
+                    "Повреждённый файл будет отложен (переименован),\n"
+                    "на его место встанет выбранный бэкап. Продолжить?"):
+                return
+            # Архивирование обязано удаться: обещали сохранить оригинал для
+            # диагностики — при сбое восстановление отменяется, файлы не тронуты.
+            try:
+                archived = self._archive_db_file("corrupt")
+            except OSError as e:
+                logging.error("Не удалось отложить повреждённый файл: %s", e)
+                theme.themed_info(
+                    self.config, d, "Ошибка",
+                    f"Не удалось отложить повреждённый файл:\n{e}\n"
+                    "Восстановление отменено, файлы не тронуты.")
+                return
+            try:
+                # restore_backup повторно проверяет кандидата и имеет свой
+                # rollback на время замены (H3-02).
+                bk.restore_backup(path, self.db.db_path)
+            except Exception as e:                     # noqa: BLE001
+                logging.error("Восстановление бэкапа не удалось: %s", e)
+                # Вернуть отложенный оригинал: иначе рабочего файла нет и
+                # следующий запуск молча создал бы пустую базу.
+                if archived is not None:
+                    try:
+                        os.replace(archived, self.db.db_path)
+                    except OSError as e2:
+                        logging.error("Не удалось вернуть отложенный файл: %s", e2)
+                        # Файл остался под архивным именем — аварийный выход:
+                        # restored["ok"]=False, вызыватели завершают запуск.
+                        self._fail_closed_archive_stranded(archived, d)
+                        d.reject()
+                        return
+                theme.themed_info(self.config, d, "Ошибка",
+                                  f"Не удалось восстановить бэкап:\n{e}")
+                return
+            restored["ok"] = True
+            d.accept()
+
+        restore_btn.clicked.connect(do_restore)
+        exit_btn.clicked.connect(d.reject)
+        d.exec()
+        return restored["ok"]
 
     @staticmethod
     def _read_container_async(path):
@@ -882,11 +1033,21 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, FinCardMixin,
         _open_and_validate_after_restore с откатом при restore). Так один и тот же
         опенер годится и для сценариев, где ошибку схемы нужно откатить, а не
         завершать программу (H65-05)."""
+        import sqlite3
         from hranilka.crypto import store as cs
         from hranilka.ui.dialogs import UnlockDialog
         while True:
             if not cs.is_encrypted_file(self.db.db_path):
-                self.db.connect()
+                try:
+                    self.db.connect()
+                except sqlite3.DatabaseError as e:
+                    # Fail-closed (H-07): ничего не писать. Классификация
+                    # отличает порчу (recovery) от временной блокировки
+                    # внешним процессом (повтор) и I/O-ошибок (выход).
+                    self.db.close(persist=False)
+                    if self._handle_db_open_error(e, parent):
+                        continue
+                    return False
                 self.config.set("encryption_enabled", False)
                 self.config.save()
                 return True
@@ -909,18 +1070,49 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, FinCardMixin,
                 return True
 
             if dlg.recovery_action == "reset":
-                self._archive_db_file()
+                try:
+                    self._archive_db_file()
+                except OSError as e:
+                    # Файл не отложен — новую базу поверх не создаём (обещали
+                    # сохранить зашифрованный оригинал). Снова окно разблокировки.
+                    theme.themed_info(self.config, parent, "Ошибка",
+                                      f"Не удалось отложить файл БД:\n{e}")
                 # Файла нет → connect() создаст новую пустую базу.
                 continue
 
             if dlg.recovery_action == "restore" and dlg.restore_path:
-                self._archive_db_file()
+                # Кандидат проверяется ДО архивирования: невалидный бэкап не
+                # должен стоить нам переименованного оригинала.
+                if not bk.validate_backup(dlg.restore_path):
+                    theme.themed_info(
+                        self.config, parent, "Ошибка",
+                        "Выбранный файл повреждён или не является базой "
+                        "Хранилки.\nТекущие файлы не тронуты.")
+                    continue
+                try:
+                    archived = self._archive_db_file()
+                except OSError as e:
+                    theme.themed_info(self.config, parent, "Ошибка",
+                                      f"Не удалось отложить файл БД:\n{e}\n"
+                                      "Восстановление отменено.")
+                    continue
                 # Через restore_backup (а не прямой copy2): кандидат проверяется
-                # до и после замены, есть откат при сбое (H3-02). Текущий файл
-                # уже отложен (_archive_db_file), поэтому терять нечего.
+                # повторно, замена атомарна, есть откат на время подмены (H3-02).
                 try:
                     bk.restore_backup(dlg.restore_path, self.db.db_path)
                 except Exception as e:
+                    # Вернуть отложенный оригинал: иначе рабочего файла нет и
+                    # следующая итерация молча создала бы пустую базу.
+                    if archived is not None:
+                        import os
+                        try:
+                            os.replace(archived, self.db.db_path)
+                        except OSError as e2:
+                            logging.error("Не удалось вернуть отложенный файл: %s",
+                                          e2)
+                            # Аварийный fail-closed: цикл продолжать нельзя.
+                            self._fail_closed_archive_stranded(archived, parent)
+                            return False
                     theme.themed_info(self.config, parent, "Ошибка",
                                       f"Не удалось восстановить бэкап:\n{e}")
                 # Повторяем цикл: восстановленный файл может быть как обычным,
@@ -995,31 +1187,36 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, FinCardMixin,
         rollback = None
         if os.path.exists(db_path):
             rollback = db_path + ".pre-restore"
-            try:
-                bk._copy_durable(Path(db_path), Path(rollback))
-            except OSError as e:
+            # Durable-копия большой базы (fsync) — в фоне с progress: окно не
+            # получает Not Responding. Гейт сохранён (run_exclusive_busy).
+            ok, err = self.vault.run_exclusive_busy(
+                lambda: bk._copy_durable(Path(db_path), Path(rollback)),
+                "Создание страховочной копии текущей базы…")
+            if not ok:
                 # H65-03: рабочий файл есть, но страховочную копию создать не удалось.
                 # Продолжать restore нельзя — при неоткрытии кандидата рабочая БД
                 # пропала бы безвозвратно. Отменяем restore и возвращаем прежнюю БД.
-                logging.error("Не удалось создать страховочную копию перед restore: %s", e)
+                logging.error("Не удалось создать страховочную копию перед restore: %s", err)
                 self._discard_file(rollback)
                 if self._open_and_validate_after_restore():
                     self._after_db_reopened(None)
                     return False, ("Не удалось создать страховочную копию; "
-                                   f"восстановление отменено:\n{e}")
+                                   f"восстановление отменено:\n{err}")
                 self.close()
-                return False, f"Не удалось создать страховочную копию: {e}"
-        try:
-            bk.restore_backup(path, db_path)
-        except Exception as e:
+                return False, f"Не удалось создать страховочную копию: {err}"
+        # Копирование кандидата, fsync и quick_check — тоже в фоне (гейт тот же).
+        ok, err = self.vault.run_exclusive_busy(
+            lambda: bk.restore_backup(path, db_path),
+            "Восстановление из бэкапа: копирование и проверка…")
+        if not ok:
             # restore_backup при сбое откатывает файл к прежнему состоянию —
             # переоткрываем БД как была и сообщаем об ошибке.
             self._discard_file(rollback)
             if not self._open_and_validate_after_restore():
                 self.close()
-                return False, str(e)
+                return False, err
             self._after_db_reopened(None)
-            return False, str(e)
+            return False, err
         if not self._open_and_validate_after_restore():
             # Восстановленный файл не открылся/не аутентифицирован/не прошёл
             # проверку схемы. Возвращаем прежнюю БД из страховочной копии.

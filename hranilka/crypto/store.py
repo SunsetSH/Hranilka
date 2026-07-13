@@ -216,7 +216,9 @@ def unlock(container: bytes, secret: str, is_recovery: bool = False):
     try:
         db_bytes = AESGCM(dek).decrypt(data_nonce, data_ct, None)
     except InvalidTag:
-        raise WrongPassword()
+        # DEK уже успешно развёрнут — секрет верен; провал GCM-тега здесь
+        # означает повреждение/подмену секции данных, а не неверный пароль.
+        raise CorruptVault("повреждена секция данных (GCM-тег не сошёлся)")
     return db_bytes, dek, header
 
 

@@ -1,20 +1,84 @@
 """Окно разблокировки мастер-паролем / recovery-кодом (вынесено из
 dialogs.py, этап 4)."""
-from PySide6.QtCore import Qt, QTimer
+import threading
+
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog, QFileDialog,
                                QHBoxLayout, QLabel, QLineEdit, QListWidget,
-                               QListWidgetItem, QPushButton)
+                               QListWidgetItem, QProgressBar, QPushButton)
 
 from hranilka.crypto import store as cs
 from hranilka.services import backup as bk
 from hranilka.ui.theme import ThemedDialog, themed_confirm
 
 
+def browse_backup_file(parent):
+    """Выбрать файл бэкапа через проводник. Возвращает путь или None."""
+    path, _ = QFileDialog.getOpenFileName(
+        parent, "Выберите файл бэкапа", "",
+        "База Хранилки (*.db);;Все файлы (*)")
+    return path or None
+
+
+def pick_backup(config, parent):
+    """Предложить бэкапы из настроенной папки; если папка не задана или
+    пуста — открыть проводник. Возвращает путь к файлу или None."""
+    folder = config.get("backup_folder", "").strip()
+    backups = bk.list_backups(folder) if folder else []
+    if not backups:
+        return browse_backup_file(parent)
+
+    d = ThemedDialog(config, parent)
+    d.setWindowTitle("Выбор бэкапа")
+    d.setMinimumSize(440, 320)
+    lay = d.body
+    lay.addWidget(QLabel(f"Бэкапы из папки:\n{folder}"))
+    lst = QListWidget()
+    for p in backups:
+        item = QListWidgetItem(p.name)
+        item.setData(Qt.UserRole, str(p))
+        lst.addItem(item)
+    lst.setCurrentRow(0)
+    lst.itemDoubleClicked.connect(lambda *_: d.accept())
+    lay.addWidget(lst, 1)
+
+    chosen = {"path": None}
+    row = QHBoxLayout()
+    browse_btn = QPushButton("Другой файл…")
+    row.addWidget(browse_btn)
+    row.addStretch()
+    ok = QPushButton("Выбрать"); ok.setDefault(True); ok.clicked.connect(d.accept)
+    cancel = QPushButton("Отмена"); cancel.clicked.connect(d.reject)
+    row.addWidget(ok); row.addWidget(cancel)
+    lay.addLayout(row)
+
+    def do_browse():
+        p = browse_backup_file(d)
+        if p:
+            chosen["path"] = p
+            d.accept()
+    browse_btn.clicked.connect(do_browse)
+
+    if d.exec() != QDialog.Accepted:
+        return None
+    if chosen["path"]:
+        return chosen["path"]
+    item = lst.currentItem()
+    return item.data(Qt.UserRole) if item else None
+
+
 class UnlockDialog(ThemedDialog):
     """Окно ввода мастер-пароля при запуске / после автоблокировки.
 
     При успехе self.result_data = (db_bytes, dek, header). При отмене (выход)
-    результат остаётся None — вызывающий код должен завершить программу."""
+    результат остаётся None — вызывающий код должен завершить программу.
+
+    Разблокировка (Argon2id + расшифровка всего контейнера) — тяжёлый CPU,
+    выполняется в фоновом потоке (H-09): результат приходит queued-сигналом
+    _unlock_done, ввод на время заблокирован, поколение _gen отсекает
+    устаревший результат после закрытия диалога."""
+
+    _unlock_done = Signal(int, object, object)   # gen, result_data, exception
 
     def __init__(self, config, container: bytes = b"", parent=None):
         super().__init__(config, parent)
@@ -31,6 +95,9 @@ class UnlockDialog(ThemedDialog):
         self.result_data = None
         self.recovery_action = None   # None | "reset" | "restore"
         self.restore_path = None
+        self._busy = False            # фоновая разблокировка в работе
+        self._gen = 0                 # поколение попытки (см. reject)
+        self._unlock_done.connect(self._on_unlock_done)
 
         lay = self.body
         lay.addWidget(QLabel("Введите мастер-пароль для доступа к базе:"))
@@ -38,10 +105,10 @@ class UnlockDialog(ThemedDialog):
         self._field = QLineEdit()
         self._field.setEchoMode(QLineEdit.Password)
         field_row.addWidget(self._field, 1)
-        paste_btn = QPushButton("Вставить")
-        paste_btn.setToolTip("Вставить из буфера обмена")
-        paste_btn.clicked.connect(self._paste)
-        field_row.addWidget(paste_btn)
+        self._paste_btn = QPushButton("Вставить")
+        self._paste_btn.setToolTip("Вставить из буфера обмена")
+        self._paste_btn.clicked.connect(self._paste)
+        field_row.addWidget(self._paste_btn)
         lay.addLayout(field_row)
 
         self._rec_check = QCheckBox("Использовать recovery-код вместо пароля")
@@ -52,10 +119,16 @@ class UnlockDialog(ThemedDialog):
         self._err.setWordWrap(True)
         lay.addWidget(self._err)
 
-        forgot_btn = QPushButton("Забыли пароль и recovery-код?")
-        forgot_btn.clicked.connect(self._forgot)
+        # Indeterminate-прогресс на время KDF/расшифровки (H-09).
+        self._progress = QProgressBar()
+        self._progress.setRange(0, 0)
+        self._progress.setVisible(False)
+        lay.addWidget(self._progress)
+
+        self._forgot_btn = QPushButton("Забыли пароль и recovery-код?")
+        self._forgot_btn.clicked.connect(self._forgot)
         forgot_row = QHBoxLayout()
-        forgot_row.addWidget(forgot_btn)
+        forgot_row.addWidget(self._forgot_btn)
         forgot_row.addStretch()
         lay.addLayout(forgot_row)
 
@@ -159,58 +232,8 @@ class UnlockDialog(ThemedDialog):
         cancel_btn.clicked.connect(d.reject)
         d.exec()
 
-    @staticmethod
-    def _browse_backup_file(parent):
-        path, _ = QFileDialog.getOpenFileName(
-            parent, "Выберите файл бэкапа", "",
-            "База Хранилки (*.db);;Все файлы (*)")
-        return path or None
-
     def _pick_backup(self, parent):
-        """Предложить бэкапы из настроенной папки; если папка не задана или
-        пуста — открыть проводник. Возвращает путь к файлу или None."""
-        folder = self.config.get("backup_folder", "").strip()
-        backups = bk.list_backups(folder) if folder else []
-        if not backups:
-            return self._browse_backup_file(parent)
-
-        d = ThemedDialog(self.config, parent)
-        d.setWindowTitle("Выбор бэкапа")
-        d.setMinimumSize(440, 320)
-        lay = d.body
-        lay.addWidget(QLabel(f"Бэкапы из папки:\n{folder}"))
-        lst = QListWidget()
-        for p in backups:
-            item = QListWidgetItem(p.name)
-            item.setData(Qt.UserRole, str(p))
-            lst.addItem(item)
-        lst.setCurrentRow(0)
-        lst.itemDoubleClicked.connect(lambda *_: d.accept())
-        lay.addWidget(lst, 1)
-
-        chosen = {"path": None}
-        row = QHBoxLayout()
-        browse_btn = QPushButton("Другой файл…")
-        row.addWidget(browse_btn)
-        row.addStretch()
-        ok = QPushButton("Выбрать"); ok.setDefault(True); ok.clicked.connect(d.accept)
-        cancel = QPushButton("Отмена"); cancel.clicked.connect(d.reject)
-        row.addWidget(ok); row.addWidget(cancel)
-        lay.addLayout(row)
-
-        def do_browse():
-            p = self._browse_backup_file(d)
-            if p:
-                chosen["path"] = p
-                d.accept()
-        browse_btn.clicked.connect(do_browse)
-
-        if d.exec() != QDialog.Accepted:
-            return None
-        if chosen["path"]:
-            return chosen["path"]
-        item = lst.currentItem()
-        return item.data(Qt.UserRole) if item else None
+        return pick_backup(self.config, parent)
 
     def _on_mode_toggle(self, use_recovery: bool):
         if use_recovery:
@@ -223,6 +246,8 @@ class UnlockDialog(ThemedDialog):
         self._err.setText("")
 
     def _attempt(self):
+        if self._busy:
+            return
         secret = self._field.text().strip()
         if not secret:
             return
@@ -231,13 +256,46 @@ class UnlockDialog(ThemedDialog):
         if not self._ensure_container():
             return
         is_rec = self._rec_check.isChecked()
-        try:
-            self.result_data = cs.unlock(self._container, secret, is_recovery=is_rec)
+        # Argon2id + расшифровка контейнера — тяжёлый CPU: в фоновый поток (H-09).
+        # Кнопка «Выход» остаётся доступной; поздний результат отсекается по _gen.
+        self._set_busy(True)
+        gen, container, done = self._gen, self._container, self._unlock_done
+
+        def work():
+            try:
+                done.emit(gen, cs.unlock(container, secret, is_recovery=is_rec), None)
+            except Exception as e:       # noqa: BLE001 — классифицируется в GUI-потоке
+                done.emit(gen, None, e)
+
+        threading.Thread(target=work, daemon=True, name="unlock-kdf").start()
+
+    def _set_busy(self, busy: bool):
+        self._busy = busy
+        for w in (self._field, self._ok, self._rec_check,
+                  self._paste_btn, self._forgot_btn):
+            w.setEnabled(not busy)
+        self._progress.setVisible(busy)
+        self._err.setText("Расшифровка…" if busy else "")
+
+    def _on_unlock_done(self, gen: int, result, error):
+        if gen != self._gen:
+            return                       # устаревший результат: диалог закрыт/перезапущен
+        self._set_busy(False)
+        if error is None:
+            self.result_data = result
             self.accept()
-        except cs.WrongPassword:
+        elif isinstance(error, cs.WrongPassword):
             self._err.setText("Неверный пароль или recovery-код.")
             self._field.selectAll()
             self._field.setFocus()
-        except cs.CorruptVault as e:
-            self._err.setText(f"Файл базы повреждён: {e}")
+        elif isinstance(error, cs.CorruptVault):
+            self._err.setText(f"Файл базы повреждён: {error}")
+        else:
+            self._err.setText(f"Ошибка разблокировки: {error}")
+
+    def reject(self):
+        # «Выход» во время фоновой разблокировки: результат, который придёт
+        # позже, игнорируется по несовпадению поколения.
+        self._gen += 1
+        super().reject()
 

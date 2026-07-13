@@ -143,7 +143,10 @@ class SettingsSecurityMixin:
         if not pw:
             return
         preset = self._current_preset()
-        ok, res = self._run_vault_op(lambda: self._db.enable_encryption(pw, preset))
+        ok, res = self._vault_op_heavy(
+            lambda: self._db.enable_encryption(pw, preset),
+            "Включение шифрования: вычисление ключа (Argon2id)\n"
+            "и шифрование базы…")
         if not ok:
             themed_info(self.config, self, "Ошибка", f"Не удалось включить шифрование:\n{res}")
             return
@@ -163,13 +166,14 @@ class SettingsSecurityMixin:
         if auth is None:
             return
         secret, is_rec = auth
-        if not self._db.verify_secret(secret, is_rec):
-            themed_info(self.config, self, "Ошибка", "Неверный пароль или recovery-код.")
+        if not self._verify_secret_heavy(secret, is_rec):
             return
         if not themed_confirm(self.config, self, "Отключение шифрования",
                               "База будет сохранена в открытом (незашифрованном) виде. Продолжить?"):
             return
-        ok, res = self._run_vault_op(self._db.disable_encryption)
+        ok, res = self._vault_op_heavy(
+            self._db.disable_encryption,
+            "Отключение шифрования: сохранение базы в открытом виде…")
         if not ok:
             themed_info(self.config, self, "Ошибка", f"Не удалось отключить шифрование:\n{res}")
             return
@@ -186,13 +190,14 @@ class SettingsSecurityMixin:
         if auth is None:
             return
         secret, is_rec = auth
-        if not self._db.verify_secret(secret, is_rec):
-            themed_info(self.config, self, "Ошибка", "Неверный пароль или recovery-код.")
+        if not self._verify_secret_heavy(secret, is_rec):
             return
         new = self._ask_new_password("Новый мастер-пароль")
         if not new:
             return
-        ok, res = self._run_vault_op(lambda: self._db.change_master_password(new))
+        ok, res = self._vault_op_heavy(
+            lambda: self._db.change_master_password(new),
+            "Смена мастер-пароля: вычисление ключа (Argon2id)…")
         if not ok:
             themed_info(self.config, self, "Ошибка", f"Не удалось сменить пароль:\n{res}")
             return
@@ -206,17 +211,33 @@ class SettingsSecurityMixin:
         if auth is None:
             return
         secret, is_rec = auth
-        if not self._db.verify_secret(secret, is_rec):
-            themed_info(self.config, self, "Ошибка", "Неверный пароль или recovery-код.")
+        if not self._verify_secret_heavy(secret, is_rec):
             return
         if not themed_confirm(self.config, self, "Обновление recovery-кода",
                               "Старый recovery-код перестанет действовать. Продолжить?"):
             return
-        ok, res = self._run_vault_op(self._db.regenerate_recovery_code)
+        ok, res = self._vault_op_heavy(
+            self._db.regenerate_recovery_code,
+            "Обновление recovery-кода: вычисление ключа (Argon2id)…")
         if not ok:
             themed_info(self.config, self, "Ошибка", f"Не удалось обновить код:\n{res}")
             return
         self._show_recovery(res)
+
+    def _verify_secret_heavy(self, secret: str, is_rec: bool) -> bool:
+        """Проверка мастер-пароля/recovery-кода — это Argon2id (тяжёлый CPU),
+        поэтому через heavy-runner (H-09). Ошибку/несовпадение показывает сам;
+        возвращает True только при подтверждённом секрете."""
+        ok, valid = self._vault_op_heavy(
+            lambda: self._db.verify_secret(secret, is_rec),
+            "Проверка пароля: вычисление ключа (Argon2id)…")
+        if not ok:
+            themed_info(self.config, self, "Ошибка", f"Проверка не удалась:\n{valid}")
+            return False
+        if not valid:
+            themed_info(self.config, self, "Ошибка", "Неверный пароль или recovery-код.")
+            return False
+        return True
 
     def _ask_credential(self, title: str, prompt: str, with_recovery: bool):
         """Общий однопольный ввод секрета (L-11): каркас диалога один, а режим

@@ -264,7 +264,19 @@ class FinCardMixin:
                 self.db.save_fin_item_with_links, item_id, storage, link_ids,
                 _session=session)
         except StaleSessionError:
-            return                               # БД сменена (restore) — запись неактуальна
+            # БД сменена во время записи (restore, вкл/выкл шифрования) — запись
+            # не выполнена. Если карточка всё ещё открыта (gen совпал), её НЕЛЬЗЯ
+            # оставлять busy/read-only: возвращаем черновик в кеш и разблокируем.
+            if gen == self._card_gen:
+                self._edit_cache[fin] = {"storage": storage, "links": link_ids}
+                self._dirty_ids.add(fin)
+                self._refresh_fin_marker(node_type, item_id)
+                self.fin_tabs.set_all_editable(True)
+                self._set_card_busy(False)
+                self.statusBar().showMessage(
+                    "База была переоткрыта — сохранение не выполнено, "
+                    "правки в черновике. Повторите сохранение.", 6000)
+            return
         except Exception as e:                       # noqa: BLE001
             if gen == self._card_gen:
                 # Снимок не теряем: возвращаем в кеш правок для повтора.

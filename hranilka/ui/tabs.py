@@ -5,7 +5,7 @@ from hranilka.ui.flowlayout import WrappingTabWidget
 from hranilka.ui.widgets import (CopyableField, CopyableDateField, CopyableTextEdit,
                      SecretQuestionsWidget, CodeListWidget, GalleryWidget,
                      IntervalField, LinkedAccountsWidget, LinkedFinItemsWidget,
-                     heading_label)
+                     MaskedTextEdit, heading_label)
 
 
 class AccountTabs(WrappingTabWidget):
@@ -133,7 +133,8 @@ class AccountTabs(WrappingTabWidget):
         l = QVBoxLayout(w)
         l.setSpacing(10)
         l.setContentsMargins(0, 8, 0, 0)
-        self.f_recovery = CopyableTextEdit()
+        # Секрет: в просмотре текст скрыт, раскрывается кнопкой (M-02).
+        self.f_recovery = MaskedTextEdit()
         self.f_device_id = CopyableField()
         l.addWidget(heading_label("Фраза восстановления:"))
         l.addWidget(self.f_recovery)

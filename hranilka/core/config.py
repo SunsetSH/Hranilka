@@ -162,13 +162,21 @@ class Config:
     
     def save(self) -> None:
         # Атомарная запись: пишем во временный файл и подменяем им основной,
-        # чтобы обрыв на середине не повредил config.json.
+        # чтобы обрыв на середине не повредил config.json. При сбое временный
+        # файл не остаётся на диске.
         tmp = str(CONFIG_FILE) + ".tmp"
-        with open(tmp, 'w', encoding='utf-8') as f:
-            json.dump(self.config, f, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, CONFIG_FILE)
+        try:
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(self.config, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, CONFIG_FILE)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
     
     def get(self, key: str, default: Any = None) -> Any:
         return self.config.get(key, default)

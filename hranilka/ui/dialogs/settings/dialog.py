@@ -45,6 +45,7 @@ class SettingsDialog(SettingsAppearanceMixin, SettingsSecurityMixin,
         self._db_path = str(BASE_DIR / "hranilka.db")
         self._db = None
         self._run_vault_op = self._default_vault_op
+        self._run_vault_op_heavy = None   # KDF-тяжёлый runner; None → _run_vault_op
         self._restore_handler = self._default_restore_handler
         self._delete_all_confirmed = False
         self._restore_done = False
@@ -83,6 +84,20 @@ class SettingsDialog(SettingsAppearanceMixin, SettingsSecurityMixin,
         модального диалога. Через гейт они выполняются, когда фоновый воркер
         заведомо не пишет (H3-01). runner(fn) -> (ok, result_or_error)."""
         self._run_vault_op = runner
+
+    def set_vault_runner_heavy(self, runner):
+        """Внедрить runner для KDF-тяжёлых операций (вкл/выкл шифрования, смена
+        пароля, recovery-код): тот же гейт, но fn выполняется в фоновом потоке
+        с модальным progress — GUI не подвисает (H-09).
+        runner(fn, message) -> (ok, result_or_error)."""
+        self._run_vault_op_heavy = runner
+
+    def _vault_op_heavy(self, fn, message: str):
+        """KDF-тяжёлая привилегированная операция: через heavy-runner, если
+        внедрён; иначе — обычный синхронный гейт (диалог вне главного окна)."""
+        if self._run_vault_op_heavy is not None:
+            return self._run_vault_op_heavy(fn, message)
+        return self._run_vault_op(fn)
 
     @staticmethod
     def _default_vault_op(fn):
@@ -307,11 +322,17 @@ class SettingsDialog(SettingsAppearanceMixin, SettingsSecurityMixin,
         if not folder:
             themed_info(self.config, self, "Ошибка", "Укажите папку для бэкапов.")
             return
-        # Бэкап читает файл с диска. Через гейт: в шифр. режиме отложенный снимок
-        # сбрасывается и воркер квисцируется ДО чтения файла, поэтому копия
-        # содержит свежие данные и не конкурирует с фоновой записью (H3-01).
-        ok, res = self._run_vault_op(
-            lambda: bk.create_backup(self._db_path, folder, self.backup_keep_spin.value()))
+        # Бэкап читает файл с диска. Через гейт: очередь run_async и воркер
+        # квисцируются, свежий снимок сброшен ДО чтения файла — копия актуальна
+        # и не конкурирует с фоновой записью (H3-01). Heavy-runner: копирование
+        # и fsync большой базы идут в фоне с progress, GUI не подвисает.
+        # Значения Qt-виджетов снимаем ДО запуска: лямбда выполняется в фоновом
+        # потоке, а обращаться к виджетам можно только из GUI-потока.
+        db_path = self._db_path
+        keep_count = self.backup_keep_spin.value()
+        ok, res = self._vault_op_heavy(
+            lambda: bk.create_backup(db_path, folder, keep_count),
+            "Создание бэкапа: копирование базы…")
         if not ok:
             themed_info(self.config, self, "Ошибка", f"Не удалось создать бэкап:\n{res}")
             return

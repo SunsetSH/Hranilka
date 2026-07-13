@@ -200,3 +200,152 @@ def test_orphan_upload_builds_draft_from_db(window):
     assert gallery[-1]["image_id"] is None
     assert isinstance(window._edit_cache[(ACCOUNT, aid)]["links"], list)
     assert (ACCOUNT, aid) in window._dirty_ids
+
+
+# ─── H-07: fail-closed при повреждённом файле БД ──────────────────────────────
+
+def test_corrupt_db_fail_closed_offers_recovery(qapp, tmp_path, monkeypatch):
+    """Мусор вместо hranilka.db: не сырой DatabaseError, а recovery-предложение;
+    при отказе — корректный выход, в подозрительный файл ничего не записано."""
+    from hranilka.core import config
+    monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "config.json")
+    from hranilka.ui import main_window as main
+    monkeypatch.setattr(main, "BASE_DIR", tmp_path)
+    garbage = b"not-a-sqlite-database" * 100
+    (tmp_path / "hranilka.db").write_bytes(garbage)
+
+    offered = {"n": 0}
+
+    def fake_offer(self, err, parent=None):
+        offered["n"] += 1
+        return False                        # пользователь выбрал «Выход»
+
+    monkeypatch.setattr(main.MainWindow, "_offer_corrupt_recovery", fake_offer)
+    with pytest.raises(SystemExit):
+        main.MainWindow()
+    assert offered["n"] == 1
+    assert (tmp_path / "hranilka.db").read_bytes() == garbage
+
+
+def test_corrupt_db_recovery_restores_and_opens(qapp, tmp_path, monkeypatch):
+    """Восстановление из валидного бэкапа после обнаружения порчи: окно
+    открывается, повреждённый файл отложен рядом (*.corrupt-*)."""
+    from hranilka.core import config
+    monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "config.json")
+    from hranilka.ui import main_window as main
+    monkeypatch.setattr(main, "BASE_DIR", tmp_path)
+
+    from hranilka.data.database import Database
+    backup_path = tmp_path / "backup.db"
+    bdb = Database(str(backup_path))
+    bdb.connect()
+    bdb.create_tables()
+    bdb.close()
+
+    (tmp_path / "hranilka.db").write_bytes(b"garbage-not-sqlite" * 64)
+
+    def fake_offer(self, err, parent=None):
+        # Как do_restore в _offer_corrupt_recovery, но без модальных диалогов.
+        from hranilka.services import backup as bk
+        self._archive_db_file("corrupt")
+        bk.restore_backup(str(backup_path), self.db.db_path)
+        return True
+
+    monkeypatch.setattr(main.MainWindow, "_offer_corrupt_recovery", fake_offer)
+    win = main.MainWindow()
+    try:
+        assert win.db.conn is not None
+        assert list(tmp_path.glob("hranilka.db.corrupt-*"))
+    finally:
+        win.vault.shutdown()
+        win._instance_lock.release()
+
+
+def test_busy_db_not_treated_as_corrupt(qapp, tmp_path, monkeypatch):
+    """SQLITE_BUSY (внешний BEGIN EXCLUSIVE на здоровой БД) — не порча:
+    recovery с заменой бэкапом НЕ предлагается, файл не тронут."""
+    import sqlite3
+    from hranilka.core import config
+    monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "config.json")
+    from hranilka.ui import main_window as main
+    monkeypatch.setattr(main, "BASE_DIR", tmp_path)
+
+    # Здоровая БД Хранилки.
+    from hranilka.data.database import Database
+    db_path = tmp_path / "hranilka.db"
+    d = Database(str(db_path))
+    d.connect()
+    d.create_tables()
+    d.close()
+
+    # Внешний процесс держит эксклюзивную блокировку.
+    holder = sqlite3.connect(str(db_path))
+    holder.execute("BEGIN EXCLUSIVE")
+
+    calls = {"corrupt": 0, "confirm": 0}
+    monkeypatch.setattr(
+        main.MainWindow, "_offer_corrupt_recovery",
+        lambda self, e, parent=None: calls.__setitem__("corrupt", calls["corrupt"] + 1) or False)
+
+    def fake_confirm(cfg, parent, title, text):
+        calls["confirm"] += 1
+        assert "заблокирован" in text
+        return False                         # пользователь не повторяет — выход
+    monkeypatch.setattr(main.theme, "themed_confirm", fake_confirm)
+
+    original = db_path.read_bytes()
+    try:
+        with pytest.raises(SystemExit):
+            main.MainWindow()
+    finally:
+        holder.rollback()
+        holder.close()
+    assert calls["corrupt"] == 0, "BUSY не должен вести в recovery"
+    assert calls["confirm"] == 1, "BUSY предлагает повтор"
+    assert db_path.read_bytes() == original
+
+
+def test_archive_db_file_returns_path_and_raises(window, monkeypatch, tmp_path):
+    """_archive_db_file возвращает путь; OSError переименования пробрасывается
+    (вызыватель обязан отменить восстановление)."""
+    import os
+    # В реальном recovery-потоке соединение закрыто ДО архивирования
+    # (на Windows нельзя переименовать открытый файл).
+    window.db.close(persist=False)
+    archived = window._archive_db_file("corrupt")
+    assert archived and ".corrupt-" in archived
+    assert list(tmp_path.glob("hranilka.db.corrupt-*"))
+    # Вернуть файл и соединение, чтобы teardown фикстуры прошёл штатно.
+    os.replace(archived, window.db.db_path)
+
+    def boom(src, dst):
+        raise OSError("нет прав")
+    monkeypatch.setattr(os, "replace", boom)
+    with pytest.raises(OSError):
+        window._archive_db_file("corrupt")
+    monkeypatch.undo()
+    window.db.connect()
+
+
+def test_save_unblocks_card_on_stale_session(window, monkeypatch):
+    """StaleSessionError во время Save (смена сессии БД: restore, вкл/выкл
+    шифрования) не оставляет карточку заблокированной: busy снят, поля
+    editable, черновик — в кеше правок."""
+    from hranilka.data.database import StaleSessionError
+
+    db = window.db
+    aid = db.add_account(None, "Акк")
+    window._reload_tree()
+    window._select_node("account", aid)
+    window.toggle_edit_mode()
+    window.tabs.f_login.set_text("user@example.com")
+
+    def boom(*a, **k):
+        raise StaleSessionError()
+    monkeypatch.setattr(db, "save_account_with_links", boom)
+
+    window.save_account()
+    assert window._card_busy is False
+    assert not window.tabs.f_login.input.isReadOnly()
+    assert ("account", aid) in window._edit_cache
+    assert ("account", aid) in window._dirty_ids

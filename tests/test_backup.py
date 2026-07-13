@@ -113,3 +113,22 @@ def test_is_valid_db_accepts_encrypted_container(tmp_path):
     truncated = tmp_path / "trunc.hdb"
     truncated.write_bytes(container[:20])
     assert backup._is_valid_db(truncated) is False
+
+
+def test_validate_backup_public(tmp_path):
+    """Публичная проверка кандидата: валидная БД Хранилки — True, мусор и
+    отсутствующий файл — False (нужна вызывателям ДО перемещения текущего файла)."""
+    from hranilka.data.database import Database
+    from hranilka.services import backup as bk
+
+    good = tmp_path / "good.db"
+    d = Database(str(good))
+    d.connect()
+    d.create_tables()
+    d.close()
+    assert bk.validate_backup(str(good)) is True
+
+    bad = tmp_path / "bad.db"
+    bad.write_bytes(b"not-a-sqlite-database")
+    assert bk.validate_backup(str(bad)) is False
+    assert bk.validate_backup(str(tmp_path / "missing.db")) is False

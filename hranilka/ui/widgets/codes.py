@@ -23,6 +23,7 @@ class CodeListWidget(QWidget):
         self.layout.setSpacing(5)
         self.rows = []
         self._editable = False
+        self._revealed = False
 
         btn_layout = QHBoxLayout()
         btn_layout.setSpacing(5)
@@ -32,6 +33,11 @@ class CodeListWidget(QWidget):
         self.import_btn = QPushButton("ИМПОРТ")
         self.import_btn.clicked.connect(self.import_codes)
         btn_layout.addWidget(self.import_btn)
+        self.reveal_btn = QPushButton("ПОКАЗАТЬ КОДЫ")
+        self.reveal_btn.setCheckable(True)
+        self.reveal_btn.setToolTip("Показать / скрыть все коды")
+        self.reveal_btn.toggled.connect(self._on_reveal_toggled)
+        btn_layout.addWidget(self.reveal_btn)
         self.layout.addLayout(btn_layout)
 
         self.import_hint = QLabel(
@@ -47,6 +53,21 @@ class CodeListWidget(QWidget):
 
     def _update_empty(self):
         self.empty_label.setVisible(not self.rows)
+        # Кнопка показа осмысленна только в просмотре и при наличии строк.
+        self.reveal_btn.setVisible(bool(self.rows) and not self._editable)
+
+    def _codes_hidden(self) -> bool:
+        return not (self._editable or self._revealed)
+
+    def _apply_echo(self):
+        mode = QLineEdit.Password if self._codes_hidden() else QLineEdit.Normal
+        for code_edit, _btn, _w in self.rows:
+            code_edit.setEchoMode(mode)
+
+    def _on_reveal_toggled(self, checked: bool):
+        self._revealed = checked
+        self.reveal_btn.setText("СКРЫТЬ КОДЫ" if checked else "ПОКАЗАТЬ КОДЫ")
+        self._apply_echo()
 
     def add_code(self, code_text=""):
         row_widget = QWidget(self)
@@ -57,6 +78,8 @@ class CodeListWidget(QWidget):
         code_edit = QLineEdit(code_text)
         code_edit.setReadOnly(not self._editable)
         code_edit.setPlaceholderText("Код / резервный ключ...")
+        if self._codes_hidden():
+            code_edit.setEchoMode(QLineEdit.Password)
         h_layout.addWidget(code_edit)
         
         copy_btn = QPushButton("[КОП]", row_widget)  # родитель сразу — см. add_item
@@ -140,6 +163,18 @@ class CodeListWidget(QWidget):
         for code in data: self.add_code(code)
         self._update_empty()
 
+    def _prune_empty_rows(self):
+        """Пустые коды не сохраняются в БД (см. get_data) — после выхода из
+        правки убираем их и из интерфейса, не дожидаясь перезагрузки карточки."""
+        drop = [row for row in self.rows if not row[0].text().strip()]
+        if not drop:
+            return
+        self.rows = [row for row in self.rows if row[0].text().strip()]
+        for _edit, _btn, widget in drop:
+            self.layout.removeWidget(widget)
+            widget.deleteLater()
+        self._update_empty()
+
     def set_editable(self, editable):
         self._editable = editable
         self.add_btn.setVisible(editable)
@@ -148,3 +183,10 @@ class CodeListWidget(QWidget):
         for code_edit, del_btn, _w in self.rows:
             code_edit.setReadOnly(not editable)
             del_btn.setVisible(editable)
+        if not editable:
+            self._prune_empty_rows()
+        # Выход из правки снова маскирует коды; вход — показывает для ввода.
+        self._revealed = False
+        self.reveal_btn.setChecked(False)
+        self._apply_echo()
+        self._update_empty()

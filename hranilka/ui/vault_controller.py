@@ -11,12 +11,35 @@
 ни с синхронными привилегированными операциями (гейт run_exclusive + флаг
 _vault_locked, под которым отложенный flush воркеру не сабмитится)."""
 import logging
+import threading
 
-from PySide6.QtCore import (Qt, QObject, QThread, QEventLoop, QTimer,
-                            Signal, Slot)
+from PySide6.QtCore import (Qt, QMetaObject, QObject, QThread, QEventLoop,
+                            QTimer, Signal, Slot)
+from PySide6.QtWidgets import QLabel, QProgressBar, QWidget
 
 from hranilka.ui import theme
 from hranilka.data.database import VaultConflictError
+
+
+class _BusyDialog(theme.ThemedDialog):
+    """Модальный «Выполняется…» для run_exclusive_busy: indeterminate progress,
+    пользователь закрыть НЕ может (Esc/заголовок игнорируются) — диалог
+    закрывает только завершение фоновой операции."""
+
+    def __init__(self, config, parent, message: str):
+        super().__init__(config, parent)
+        self.setWindowTitle("Подождите")
+        self.setModal(True)
+        self.setMinimumWidth(380)
+        lbl = QLabel(message)
+        lbl.setWordWrap(True)
+        bar = QProgressBar()
+        bar.setRange(0, 0)               # indeterminate: KDF не даёт прогресса
+        self.body.addWidget(lbl)
+        self.body.addWidget(bar)
+
+    def reject(self):
+        pass
 
 
 class _VaultWriter(QObject):
@@ -213,11 +236,9 @@ class VaultController(QObject):
 
         Возвращает (ok: bool, result_or_error): при успехе — то, что вернул fn()
         (например, recovery-код); при ошибке — текст для показа пользователю."""
-        if self.db.encrypted:
-            self.flush()
-            if not self.wait_idle():
-                return False, ("Фоновое сохранение базы не завершилось вовремя.\n"
-                               "Повторите операцию через несколько секунд.")
+        if not self._quiesce():
+            return False, ("Фоновые операции с базой не завершились вовремя.\n"
+                           "Повторите операцию через несколько секунд.")
         self._vault_locked = True
         try:
             result = fn()
@@ -225,10 +246,83 @@ class VaultController(QObject):
             return False, str(e)
         finally:
             self._vault_locked = False
+            self._note_window_activity()
         # Накопленные за время операции правки записать после снятия монополии.
         if self._write_pending or self.db._dirty:
             self.schedule_flush()
         return True, result
+
+    def _quiesce(self) -> bool:
+        """Дочистить фоновую активность перед привилегированной операцией.
+        Возвращает False при таймауте — вызыватель обязан отказаться от операции.
+
+        Порядок тот же, что при restore (H7-01), и он ПРИНЦИПИАЛЕН:
+          1) барьер run_async — in-flight мутаторы (сохранение карточки)
+             дорабатывают в старой сессии и помечают БД грязной;
+          2) flush — записывает СВЕЖИЙ снимок, включающий эти мутации;
+          3) wait_idle — дожидаемся завершения самой фоновой записи.
+        Обратный порядок (flush до барьера) дал бы на диске старый снимок:
+        ручной бэкап скопировал бы файл без только что сохранённой карточки."""
+        if not self.db.wait_executor_idle():
+            return False
+        if self.db.encrypted:
+            self.flush()
+            if not self.wait_idle():
+                return False
+        return True
+
+    def _note_window_activity(self):
+        """Сбросить счётчик простоя окна после привилегированной операции:
+        шифрование большой базы может длиться дольше idle-интервала, и без
+        сброса первый же тик заблокировал бы vault поверх диалога с одноразовым
+        recovery-кодом."""
+        note = getattr(self._window, "note_activity", None)
+        if callable(note):
+            note()
+
+    def run_exclusive_busy(self, fn, message: str = "Выполняется операция…"):
+        """run_exclusive для KDF-тяжёлых операций (H-09): fn выполняется в
+        фоновом потоке, а GUI-поток крутит модальный progress-диалог — окно
+        отзывчиво (не «Not Responding»), ввод заблокирован, повторные клики
+        исключены. Гейт и сигнатура (ok, result_or_error) — как у run_exclusive.
+
+        Потокобезопасность fn: соединение открыто с check_same_thread=False, а
+        публичные методы Database сериализованы RLock'ом, поэтому вызов
+        enable_encryption/change_master_password и т.п. из фонового потока
+        корректен (см. database.py, авто-обёртка в лок)."""
+        if not self._quiesce():
+            return False, ("Фоновые операции с базой не завершились вовремя.\n"
+                           "Повторите операцию через несколько секунд.")
+        self._vault_locked = True
+        # Родитель — только настоящий QWidget (в тестах окно может быть фейком).
+        parent = self._window if isinstance(self._window, QWidget) else None
+        dlg = _BusyDialog(self.config, parent, message)
+        out = {}
+
+        def work():
+            try:
+                out["res"] = (True, fn())
+            except Exception as e:                   # noqa: BLE001 — отдаём наверх
+                out["res"] = (False, str(e))
+            # Закрыть диалог из GUI-потока; если exec ещё не начался, queued-событие
+            # будет обработано первым же оборотом его event-loop.
+            QMetaObject.invokeMethod(dlg, "accept", Qt.ConnectionType.QueuedConnection)
+
+        thread = threading.Thread(target=work, daemon=True, name="vault-exclusive")
+        try:
+            thread.start()
+            dlg.exec()                               # ждём accept от work()
+            thread.join()                            # к этому моменту work() завершён
+        finally:
+            self._vault_locked = False
+            dlg.deleteLater()
+            # Долгая операция (KDF на большой базе) не должна засчитываться как
+            # простой: без сброса первый тик idle-таймера заблокировал бы vault
+            # поверх диалога с одноразовым recovery-кодом.
+            self._note_window_activity()
+        if self._write_pending or self.db._dirty:
+            self.schedule_flush()
+        return out["res"]
 
     def shutdown(self):
         """Корректно остановить поток фоновой записи (идемпотентно).

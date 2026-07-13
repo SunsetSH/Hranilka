@@ -167,25 +167,81 @@ class CopyableTextEdit(QWidget):
         self.text_edit.setReadOnly(True)
         layout.addWidget(self.text_edit)
         
-        btn_layout = QHBoxLayout()
-        btn_layout.addStretch()
+        self.btn_layout = QHBoxLayout()
+        self.btn_layout.addStretch()
         self.copy_btn = QPushButton("[КОП]")
         self.copy_btn.setFixedWidth(60)
         self.copy_btn.clicked.connect(self.do_copy)
-        btn_layout.addWidget(self.copy_btn)
-        layout.addLayout(btn_layout)
-        
+        self.btn_layout.addWidget(self.copy_btn)
+        layout.addLayout(self.btn_layout)
+
     def do_copy(self):
-        text = self.text_edit.toPlainText()
+        text = self.get_text()
         if text:
             QApplication.clipboard().setText(text)
             self.copy_signal.emit()
-            
+
     def set_text(self, text): self.text_edit.setPlainText(text)
     def get_text(self): return self.text_edit.toPlainText()
     def set_editable(self, editable):
         self.text_edit.setReadOnly(not editable)
         self.copy_btn.setVisible(not editable)
+
+
+class MaskedTextEdit(CopyableTextEdit):
+    """CopyableTextEdit для секретов (recovery-фраза): в режиме просмотра текст
+    скрыт («•»), раскрывается кнопкой. У QTextEdit нет echo mode, поэтому
+    маскируем подменой отображаемого текста — настоящее значение живёт в
+    _secret и в виджет попадает только при показе/редактировании."""
+
+    _MASK_SHOW = CopyableField._MASK_SHOW
+    _MASK_HIDE = CopyableField._MASK_HIDE
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._secret = ""
+        self._editable = False
+        self._revealed = False
+        self.reveal_btn = QPushButton(self._MASK_SHOW)
+        self.reveal_btn.setFixedWidth(45)
+        self.reveal_btn.setCheckable(True)
+        self.reveal_btn.setToolTip("Показать / скрыть")
+        self.reveal_btn.clicked.connect(self._toggle_reveal)
+        # Перед [КОП] (после stretch).
+        self.btn_layout.insertWidget(1, self.reveal_btn)
+
+    def _toggle_reveal(self):
+        self._revealed = self.reveal_btn.isChecked()
+        self.reveal_btn.setText(self._MASK_HIDE if self._revealed
+                                else self._MASK_SHOW)
+        self._refresh()
+
+    def _refresh(self):
+        if self._editable or self._revealed:
+            shown = self._secret
+        else:
+            shown = "".join(c if c == "\n" else "•" for c in self._secret)
+        self.text_edit.setPlainText(shown)
+
+    def set_text(self, text):
+        self._secret = text or ""
+        self._refresh()
+
+    def get_text(self):
+        # В режиме правки истина — в виджете; в просмотре там может быть маска.
+        return self.text_edit.toPlainText() if self._editable else self._secret
+
+    def set_editable(self, editable):
+        if self._editable and not editable:
+            # Выход из правки: зафиксировать введённое и снова замаскировать.
+            self._secret = self.text_edit.toPlainText()
+        self._editable = editable
+        super().set_editable(editable)
+        self._revealed = False
+        self.reveal_btn.setChecked(False)
+        self.reveal_btn.setText(self._MASK_SHOW)
+        self.reveal_btn.setVisible(not editable)   # в правке текст и так виден
+        self._refresh()
 
 class IntervalField(QWidget):
     """Поле «Сменять пароль каждые N дней». Значение 0 = срок не задан (None)."""

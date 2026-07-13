@@ -130,9 +130,19 @@ class WindowChromeMixin:
                 return True
         return False
 
+    def note_activity(self):
+        """Сбросить счётчик простоя (idle-lock). Вызывает VaultController после
+        привилегированных операций: их длительность (KDF на большой базе) не
+        должна засчитываться как бездействие пользователя."""
+        self._last_activity = QDateTime.currentDateTime()
+
     def _check_idle(self):
         mins = self.config.get("idle_lock_mins", 0)
         if mins <= 0 or self._unlocking:
+            return
+        # Идёт привилегированная операция над файлом (run_exclusive_busy крутит
+        # модальный event-loop, таймеры живы): блокировать БД сейчас нельзя.
+        if getattr(self.vault, "_vault_locked", False):
             return
         # В обычном режиме прячем только открытую карточку; в зашифрованном —
         # блокируем всю базу (снимаем ключ), даже если карточка не открыта.
@@ -244,12 +254,10 @@ class WindowChromeMixin:
     # ─── Скриншот-защита ─────────────────────────────────────────────────────
 
     def _apply_screenshot_protect(self, enabled: bool):
-        try:
-            hwnd = int(self.winId())
-            WDA_NONE = 0x00000000
-            WDA_EXCLUDEFROMCAPTURE = 0x00000011
-            ctypes.windll.user32.SetWindowDisplayAffinity(
-                hwnd, WDA_EXCLUDEFROMCAPTURE if enabled else WDA_NONE
-            )
-        except Exception as e:
-            logging.warning("SetWindowDisplayAffinity: %s", e)
+        """Скриншот-защита главного окна. Результат WinAPI проверяется (M-01):
+        при включении, которое НЕ применилось, пользователь видит честный
+        статус, а не молчаливое ложное чувство защиты."""
+        ok = theme.apply_screenshot_protect(self, enabled)
+        if enabled and not ok:
+            self.statusBar().showMessage(
+                "ВНИМАНИЕ: защита от скриншотов НЕ применилась (см. лог).", 8000)

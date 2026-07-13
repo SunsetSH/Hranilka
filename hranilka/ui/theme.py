@@ -1,12 +1,37 @@
 """Темизация: единый стиль для окон и набор модальных диалогов, которые
 учитывают настройки (шрифт, размер, цвета, фон) — в отличие от стандартных
 QMessageBox/QInputDialog."""
+import logging
 
 from PySide6.QtWidgets import (QDialog, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                                QLineEdit, QPushButton, QComboBox, QListWidget,
                                QListWidgetItem, QLayout)
 from PySide6.QtGui import QColor
 from PySide6.QtCore import Qt, QTimer
+
+
+def apply_screenshot_protect(widget, enabled: bool = True) -> bool:
+    """Применить/снять скриншот-защиту окна (Windows SetWindowDisplayAffinity).
+
+    Единая точка для главного окна и диалогов (M-01). Возвращает True при
+    успехе; провал WinAPI (BOOL=0) не маскируется — GetLastError уходит в лог,
+    вызыватель может показать фактический статус. Вне Windows — False."""
+    WDA_NONE = 0x00000000
+    WDA_EXCLUDEFROMCAPTURE = 0x00000011
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32          # AttributeError вне Windows
+        ok = bool(user32.SetWindowDisplayAffinity(
+            int(widget.winId()),
+            WDA_EXCLUDEFROMCAPTURE if enabled else WDA_NONE))
+        if not ok:
+            logging.warning(
+                "SetWindowDisplayAffinity(enabled=%s) не применилась: "
+                "WinAPI error %s", enabled, ctypes.windll.kernel32.GetLastError())
+        return ok
+    except Exception as e:                      # noqa: BLE001 — не-Windows/нет API
+        logging.warning("Скриншот-защита недоступна: %s", e)
+        return False
 
 
 def mix(c1, c2, t):
@@ -208,12 +233,9 @@ class ThemedDialog(QDialog):
     def showEvent(self, e):
         super().showEvent(e)
         # Применяем ту же скриншот-защиту, что у главного окна, к диалогу.
+        # Провал не глотается: apply_screenshot_protect пишет причину в лог.
         if self.config.get("screenshot_protect", False):
-            try:
-                import ctypes
-                ctypes.windll.user32.SetWindowDisplayAffinity(int(self.winId()), 0x00000011)
-            except Exception:
-                pass
+            apply_screenshot_protect(self, True)
         # Windows иногда подменяет запрошенную геометрию окна УЖЕ ПОСЛЕ того,
         # как Qt разложил формы под старый размер (см. предупреждение
         # QWindowsWindow::setGeometry на мониторах с нестандартным DPI/масштабом —

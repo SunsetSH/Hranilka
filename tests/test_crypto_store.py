@@ -110,12 +110,17 @@ def _flip_byte(data: bytes, index: int) -> bytes:
 
 
 def test_tamper_data_section_detected():
-    """Инверсия байта в шифртексте данных → провал тега GCM (WrongPassword)."""
+    """Инверсия байта в шифртексте данных при верном пароле → CorruptVault:
+    DEK развёрнут успешно, значит секрет верен, а данные повреждены/подменены."""
     container, _ = _make()
     # Данные лежат в самом конце файла — правим последний байт (data_ct/тег).
     tampered = _flip_byte(container, len(container) - 1)
-    with pytest.raises(cs.WrongPassword):
+    with pytest.raises(cs.CorruptVault):
         cs.unlock(tampered, _PW)
+    # Неверный пароль на том же контейнере — по-прежнему WrongPassword:
+    # порча данных не должна раскрываться раньше проверки секрета.
+    with pytest.raises(cs.WrongPassword):
+        cs.unlock(tampered, "wrong-" + _PW)
 
 
 def test_tamper_wrap_pw_detected():

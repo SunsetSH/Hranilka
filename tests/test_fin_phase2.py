@@ -27,6 +27,8 @@ def window(qapp, tmp_path, monkeypatch):
     monkeypatch.setattr(main, "BASE_DIR", tmp_path)
     win = main.MainWindow()
     win.config.set("welcome_shown", True)
+    win.config.set("show_fin_instruments", True)
+    win.apply_config()
     yield win
     win.vault.shutdown()
     win._instance_lock.release()

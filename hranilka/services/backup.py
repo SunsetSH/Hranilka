@@ -131,6 +131,14 @@ def _is_valid_db(path: Path) -> bool:
         return False
 
 
+def validate_backup(backup_path: str) -> bool:
+    """Публичная проверка кандидата на восстановление (та же, что внутри
+    restore_backup). Нужна вызывателям, которые перед restore перемещают
+    текущий файл: кандидата следует проверить ДО любых изменений."""
+    p = Path(backup_path)
+    return p.exists() and _is_valid_db(p)
+
+
 def restore_backup(backup_path: str, db_path: str) -> None:
     """Заменяет текущую базу выбранным бэкапом — проверяемо и с откатом.
 
