@@ -74,6 +74,10 @@ class Config:
             # дерево, связи, экспорт, кнопки создания. Записи в БД и корзина
             # видны всегда. bool — _coerce_bool подхватит автоматически.
             "show_fin_instruments": False,
+            # Показывать VPS-серверы в интерфейсе: дерево, связи, экспорт,
+            # кнопки создания. Записи в БД и корзина видны всегда (по образцу
+            # show_fin_instruments). UI-тумблер — этап 5.
+            "show_servers": False,
             "screenshot_protect": False,
             "idle_lock_mins": 0,
             "backup_folder": "",

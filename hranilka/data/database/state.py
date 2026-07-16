@@ -73,6 +73,10 @@ class DbBase:
                                     item_ids: list) -> None:
         raise NotImplementedError
 
+    def _set_account_server_links_rows(self, account_id: int,     # servers
+                                       server_ids: list) -> None:
+        raise NotImplementedError
+
     def _add_account_rows(self, service_id: Optional[int],    # tree_ops
                           account_name: str, login: Optional[str] = None,
                           password: Optional[str] = None) -> int:
@@ -87,8 +91,18 @@ class DbBase:
 
     def get_tree_structure(self, sort_mode: str = "manual",   # tree_ops
                            descending: bool = False,
-                           include_fin: bool = True) -> list:
+                           include_fin: bool = True,
+                           include_servers: bool = False) -> list:
         raise NotImplementedError
 
     def count_fin_items(self) -> int:                         # fin_items
+        raise NotImplementedError
+
+    def _move_server_to_bin_rows(self, server_id: int) -> None:   # servers
+        raise NotImplementedError
+
+    def _delete_server_rows(self, server_id: int) -> None:        # servers
+        raise NotImplementedError
+
+    def get_deleted_servers(self) -> list[dict[str, Any]]:        # servers
         raise NotImplementedError

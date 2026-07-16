@@ -24,7 +24,7 @@ def test_builds_under_themes(qapp, pure_config):
         pure_config.set("tree_bg_color", colors["tree_bg"])
         pure_config.set("main_bg_color", colors["main_bg"])
         d = WelcomeDialog(pure_config)
-        assert d._stack.count() == 7
+        assert d._stack.count() == 8
         assert d._stack.currentIndex() == 0
         d.deleteLater()
 
@@ -105,13 +105,44 @@ def test_recycle_bin_choice_is_active_and_deferred(dlg, pure_config):
     assert pure_config.get("recycle_bin_enabled") is True
 
 
+def test_servers_choice_is_applied_only_on_finish(dlg, pure_config):
+    assert not dlg.servers_check.isChecked()
+    dlg.servers_check.setChecked(True)
+    assert pure_config.get("show_servers") is False
+
+    for _ in range(dlg._stack.count() - 1):
+        dlg._go(+1)
+    dlg._on_next()
+    assert pure_config.get("show_servers") is True
+
+
+def test_servers_callback_can_reject_choice(dlg, pure_config):
+    calls = []
+    dlg._on_servers_changed = lambda show: calls.append(show) and False
+    dlg.servers_check.setChecked(True)
+    for _ in range(dlg._stack.count() - 1):
+        dlg._go(+1)
+    dlg._on_next()
+    assert calls == [True]
+    assert not dlg.servers_check.isChecked()
+    assert dlg.result() == 0
+
+
+def test_servers_slide_is_after_fin_instruments_slide(dlg):
+    fin_index = next(i for i in range(dlg._stack.count())
+                     if dlg._stack.widget(i).isAncestorOf(dlg.fin_instruments_check))
+    servers_index = next(i for i in range(dlg._stack.count())
+                         if dlg._stack.widget(i).isAncestorOf(dlg.servers_check))
+    assert servers_index == fin_index + 1
+
+
 def test_should_show(pure_config):
     assert should_show(pure_config) is True
     pure_config.set("welcome_shown", True)
     assert should_show(pure_config) is False
 
 
-def test_first_run_wiring(qapp, tmp_path, monkeypatch):
+def test_first_run_wiring(qapp, tmp_path, monkeypatch, dispose_window):
     monkeypatch.setattr(config_mod, "CONFIG_FILE", tmp_path / "config.json")
     from hranilka.ui import main_window as main
     monkeypatch.setattr(main, "BASE_DIR", tmp_path)
@@ -120,7 +151,7 @@ def test_first_run_wiring(qapp, tmp_path, monkeypatch):
 
     class _FakeWelcome:
         def __init__(self, config, parent=None, on_fin_instruments_changed=None,
-                     on_recycle_bin_changed=None):
+                     on_recycle_bin_changed=None, on_servers_changed=None):
             opened.append(self)
 
         def open(self):
@@ -136,8 +167,7 @@ def test_first_run_wiring(qapp, tmp_path, monkeypatch):
         win._maybe_show_welcome()  # повторный вызов диалог не создаёт
         assert len(opened) == 1
     finally:
-        win.vault.shutdown()
-        win._instance_lock.release()
+        dispose_window(win)
 
 
 def test_settings_button_exists(qapp, pure_config):

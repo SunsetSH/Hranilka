@@ -70,8 +70,11 @@ class ShortcutsMixin:
     # — на фин-карточке «сохранить» становилось no-op'ом (id аккаунта не
     # задан), а «отмена» закрывала карточку заглушкой, теряя правки.
     def _sc_edit_account(self):
-        has_target = self._current_account_id is not None or self._current_fin is not None
-        if has_target and not self.is_editing:
+        # M-01: цель — аккаунт, фин-запись ИЛИ сервер (раньше сервер не
+        # учитывался, шорткат «Редактировать» на открытой VPS-карточке
+        # молчал). edit_current() уже маршрутизирует все три случая через MRO
+        # (ServerCardMixin → FinCardMixin → AccountCardMixin).
+        if self._any_card_open() and not self.is_editing:
             self.edit_current()
 
     def _sc_save_account(self):
@@ -87,12 +90,15 @@ class ShortcutsMixin:
             self.search_box.clear()
 
     def _sc_gen_password(self):
-        # Генерация пароля — поле аккаунтной карточки; на фин-записи его нет.
-        if self.is_editing and self._current_fin is None:
+        # M-01: поле-цель — только аккаунтная карточка, поэтому проверяем
+        # позитивно `_current_account_id is not None`, а не отрицанием
+        # фин-записи (раньше на открытой VPS-карточке `_current_fin is None`
+        # тоже было истинно, и шорткат менял скрытые поля аккаунтной формы).
+        if self.is_editing and self._current_account_id is not None:
             self.generate_password()
 
     def _sc_gen_personal(self):
-        if self.is_editing and self._current_fin is None:
+        if self.is_editing and self._current_account_id is not None:
             self.generate_personal_data()
 
     def _sc_delete_selected(self):

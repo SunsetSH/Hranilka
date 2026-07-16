@@ -12,6 +12,7 @@
 _vault_locked, под которым отложенный flush воркеру не сабмитится)."""
 import logging
 import threading
+import time
 
 from PySide6.QtCore import (Qt, QMetaObject, QObject, QThread, QEventLoop,
                             QTimer, Signal, Slot)
@@ -65,13 +66,21 @@ class _VaultWriter(QObject):
     @Slot(bool)
     def _do(self, force):
         ok, err, conflict = True, "", False
+        # Тайминги стадий — диагностика редких таймаутов wait_idle (когда фоновая
+        # запись не укладывается в страховочный лимит, важно знать, ГДЕ она стоит:
+        # ожидание кванта потока, serialize под RLock или шифрование+запись файла).
+        t_start = time.perf_counter()
         try:
             # Снимок БД (serialize) делаем здесь, в потоке писателя: соединение
             # потокобезопасно (RLock + check_same_thread=False), поэтому UI-поток
             # больше не тратит сотни мс на копирование большой базы. Затем —
             # шифрование AES-GCM и атомарная запись (самое тяжёлое), тоже вне UI.
             db_bytes = self._db.serialize_db()
+            t_serialized = time.perf_counter()
             self._db.seal_and_write(db_bytes, force=force)
+            logging.debug("vault-write: serialize %.3fс, seal+write %.3fс",
+                          t_serialized - t_start,
+                          time.perf_counter() - t_serialized)
         except VaultConflictError:
             ok, conflict, err = False, True, "conflict"
         except Exception as e:                       # noqa: BLE001 — отдаём наверх
@@ -211,6 +220,7 @@ class VaultController(QObject):
         instance-lock — иначе возможна потеря/порча данных при живом воркере."""
         if not self._write_busy:
             return True
+        t_start = time.perf_counter()
         loop = QEventLoop()
         self._writer_idle_loop = loop
         QTimer.singleShot(timeout_ms, loop.quit)   # страховочный таймаут
@@ -218,6 +228,13 @@ class VaultController(QObject):
         self._writer_idle_loop = None
         # _on_vault_written сбрасывает _write_busy перед quit() — по нему и
         # отличаем штатное завершение от срабатывания страховочного таймаута.
+        if self._write_busy:
+            # Диагностика редких таймаутов: сколько ждали и насколько нагружен
+            # процесс потоками (подозрение на накопление фоновых потоков/таймеров).
+            logging.warning(
+                "wait_idle: фоновая запись не завершилась за %.1fс "
+                "(потоков в процессе: %d)",
+                time.perf_counter() - t_start, threading.active_count())
         return not self._write_busy
 
     def run_exclusive(self, fn):

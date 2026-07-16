@@ -5,12 +5,13 @@ from PySide6.QtWidgets import (QHBoxLayout, QLabel, QListWidget,
                                QListWidgetItem, QPushButton)
 
 from hranilka.core.fin_types import FIN_TYPES
-from hranilka.core.nodetypes import ACCOUNT
+from hranilka.core.nodetypes import ACCOUNT, SERVER
 from hranilka.ui.theme import ThemedDialog, themed_confirm
 
-# Ретро-префиксы типов записей в списке корзины: аккаунт + все финансовые типы
-# из реестра (node_type → tree_prefix). Новый тип получает префикс автоматически.
-_TYPE_PREFIX = {ACCOUNT: "(i) "}
+# Ретро-префиксы типов записей в списке корзины: аккаунт + сервер + все
+# финансовые типы из реестра (node_type → tree_prefix). Новый фин-тип получает
+# префикс автоматически; сервер — своим литералом (не в реестре FIN_TYPES).
+_TYPE_PREFIX = {ACCOUNT: "(i) ", SERVER: "[#] "}
 _TYPE_PREFIX.update({spec.node_type: spec.tree_prefix
                      for spec in FIN_TYPES.values()})
 
@@ -94,6 +95,8 @@ class RecycleBinDialog(ThemedDialog):
         node_type, rid = key
         if node_type == ACCOUNT:
             self._db.restore_account(rid)
+        elif node_type == SERVER:
+            self._db.restore_server(rid)
         else:
             self._db.restore_fin_item(rid)
         self.changed = True
@@ -109,6 +112,8 @@ class RecycleBinDialog(ThemedDialog):
         node_type, rid = key
         if node_type == ACCOUNT:
             self._db.delete_account(rid)
+        elif node_type == SERVER:
+            self._db.delete_server_forever(rid)
         else:
             # delete_fin_item_forever — по id, не по node_type: запись может
             # быть типа, уже убранного из реестра (m010/m011-подобная чистка),

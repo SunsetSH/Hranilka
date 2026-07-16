@@ -165,7 +165,7 @@ def test_accounttabs_build_no_floating_window(qapp, tmp_path, monkeypatch):
     assert not new, f"Появились лишние top-level виджеты: {new}"
 
 
-def test_mainwindow_switch_accounts_no_floating_window(qapp, tmp_path, monkeypatch):
+def test_mainwindow_switch_accounts_no_floating_window(qapp, tmp_path, monkeypatch, dispose_window):
     from hranilka.core import config
     monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "config.json")
     from hranilka.ui import main_window as main
@@ -207,14 +207,7 @@ def test_mainwindow_switch_accounts_no_floating_window(qapp, tmp_path, monkeypat
         new = _new_toplevels(before)
     finally:
         qapp.removeEventFilter(spy)
-        try:
-            win.vault.shutdown()
-        except Exception:
-            pass
-        try:
-            win._instance_lock.release()
-        except Exception:
-            pass
+        dispose_window(win)
 
     for w in new:
         print("UNEXPECTED:", type(w).__name__, w.objectName(),

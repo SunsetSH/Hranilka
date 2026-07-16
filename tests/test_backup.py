@@ -95,6 +95,83 @@ def test_rotate_keep_count_zero_is_noop(tmp_path):
     assert len(list(folder.glob(backup._GLOB))) == 1
 
 
+# ─── M-02: ротация/удаление бэкапов затирают plaintext через best_effort_wipe ─
+
+def test_rotate_wipes_evicted_backup(tmp_path, monkeypatch):
+    """Старейший ротируемый файл убирается через best_effort_wipe (не голым
+    unlink) — при выключенном шифровании это полная plaintext-копия БД."""
+    folder = tmp_path / "backups"
+    folder.mkdir()
+    names = ["hranilka_backup_20240101_000000_000001.db",
+             "hranilka_backup_20240101_000000_000002.db"]
+    for n in names:
+        (folder / n).write_bytes(b"secret-plaintext-db")
+
+    calls = []
+
+    def spy_wipe(path):
+        calls.append(path)
+        Path(path).unlink(missing_ok=True)
+
+    monkeypatch.setattr(backup, "best_effort_wipe", spy_wipe)
+    backup._rotate(folder, keep_count=1)
+
+    assert len(calls) == 1
+    assert calls[0].endswith(names[0])                  # затёрт именно старейший
+    remaining = sorted(p.name for p in folder.glob(backup._GLOB))
+    assert remaining == names[1:]
+
+
+def test_delete_all_backups_wipes_each_file(tmp_path, monkeypatch):
+    """«Удалить все бэкапы» затирает каждый файл через best_effort_wipe."""
+    folder = tmp_path / "backups"
+    folder.mkdir()
+    names = ["hranilka_backup_20240101_000000_000001.db",
+             "hranilka_backup_20240101_000000_000002.db"]
+    for n in names:
+        (folder / n).write_bytes(b"secret-plaintext-db")
+
+    calls = []
+
+    def spy_wipe(path):
+        calls.append(path)
+        Path(path).unlink(missing_ok=True)
+
+    monkeypatch.setattr(backup, "best_effort_wipe", spy_wipe)
+    count = backup.delete_all_backups(str(folder))
+
+    assert count == 2
+    assert len(calls) == 2
+    assert list(folder.glob(backup._GLOB)) == []
+
+
+def test_create_backup_wipes_partial_tmp_on_copy_failure(tmp_path, monkeypatch):
+    """Обрыв копирования в create_backup — недописанный tmp-файл (частичная
+    plaintext-копия БД) затирается через best_effort_wipe, а не голым unlink."""
+    dbp = tmp_path / "hranilka.db"
+    _make_db(dbp)
+    folder = tmp_path / "backups"
+
+    calls = []
+
+    def spy_wipe(path):
+        calls.append(path)
+        Path(path).unlink(missing_ok=True)
+
+    def boom_copy(src, dst):
+        Path(dst).write_bytes(b"partial-secret")
+        raise OSError("disk full")
+
+    monkeypatch.setattr(backup, "best_effort_wipe", spy_wipe)
+    monkeypatch.setattr(backup, "_copy_durable", boom_copy)
+
+    with pytest.raises(OSError):
+        backup.create_backup(str(dbp), str(folder))
+
+    assert len(calls) == 1
+    assert [p.name for p in folder.iterdir() if p.name.endswith(".tmp")] == []
+
+
 def test_is_valid_db_accepts_encrypted_container(tmp_path):
     """Валидный зашифрованный контейнер (из crypto_store.create_vault на настоящих
     байтах БД) проходит валидацию бэкапа — структурный разбор заголовка успешен."""

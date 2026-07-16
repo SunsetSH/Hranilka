@@ -15,12 +15,13 @@ import datetime as dt
 from typing import Iterator
 
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout,
-                               QPushButton, QApplication, QFrame)
+                               QPushButton, QApplication, QFrame, QScrollArea)
 from PySide6.QtCore import Signal
 
 from hranilka.core.fin_domain import detect_payment_system
 from hranilka.core.fin_types import ItemTypeSpec
 from hranilka.ui.flowlayout import WrappingTabWidget
+from hranilka.ui.tabs import wrap_scrollable, apply_scroll_areas_bg
 from hranilka.ui.widgets import (CopyableField, CopyableDateField,
                                  CopyableTextEdit, GalleryWidget,
                                  MaskedCardNumberField, ExpiryField,
@@ -126,15 +127,26 @@ class FinItemTabs(WrappingTabWidget):
         # массовая установка (load_payload/сам автодетект), сигналы игнорируем.
         self._payment_system_overridden = False
         self._suppress_ps_signal = False
+        self._scroll_areas: list[QScrollArea] = []
         self.build_tabs()
         self._wire_bin_autodetect()
 
+    def _add_scroll_tab(self, inner: QWidget, title: str) -> None:
+        sa = wrap_scrollable(inner, self)
+        self._scroll_areas.append(sa)
+        self.addTab(sa, title)
+
     def build_tabs(self):
         for tab_name in self.spec.tabs:
-            self.addTab(self._build_tab(tab_name), tab_name)
+            self._add_scroll_tab(self._build_tab(tab_name), tab_name)
         # Вкладка «Галерея» — последняя, общая для всех типов (концепт §5).
         # Отдельной вкладки «Связи» нет: связи показаны внизу первой вкладки.
-        self.addTab(self._build_gallery_tab(), "Галерея")
+        self._add_scroll_tab(self._build_gallery_tab(), "Галерея")
+
+    def apply_scroll_bg(self, main_bg: str) -> None:
+        """Обновить фон прокручиваемых областей вкладок под цвет из настроек
+        (как AccountTabs.apply_scroll_bg — общий хелпер, ui/tabs.py)."""
+        apply_scroll_areas_bg(self._scroll_areas, main_bg)
 
     def _build_tab(self, tab_name):
         w = QWidget(self)

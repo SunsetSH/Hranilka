@@ -30,6 +30,10 @@ def vc(qapp, tmp_db_path, pure_config):
     yield controller
     controller.shutdown()
     db.close(persist=False)
+    # Тесты этой фикстуры гоняют run_async/executor-барьер (wait_executor_idle,
+    # run_exclusive*) — воркер db-worker* реально стартует и переживает
+    # close() (см. docs/CODE_REVIEW_VPS_SERVERS_2026-07-15.md). Гасим явно.
+    db.shutdown_executor()
 
 
 def test_wait_idle_true_when_not_busy(vc):
@@ -83,6 +87,7 @@ def test_barrier_flush_persists_inflight_mutation(qapp, tmp_db_path, pure_config
     recovery = db.enable_encryption("pw", "fast")   # → шифр. режим, dirty сброшен
     assert recovery
     vc = VaultController(db, _FakeWindow(), pure_config)
+    d2 = None
     try:
         started = threading.Event()
         release = threading.Event()
@@ -101,19 +106,26 @@ def test_barrier_flush_persists_inflight_mutation(qapp, tmp_db_path, pure_config
         vc.flush()
         assert vc.wait_idle() is True
         fut.result(timeout=2)
-    finally:
-        vc.shutdown()
 
-    # На диске — контейнер с правкой (расшифровываем и проверяем сервис на месте).
-    with open(tmp_db_path, "rb") as f:
-        container = f.read()
-    db_bytes, dek, header = cs.unlock(container, "pw")
-    d2 = Database(tmp_db_path)
-    d2.open_encrypted(db_bytes, dek, header)
-    d2.create_tables()
-    assert "inflight" in [s["name"] for s in d2.get_services()]
-    d2.close(persist=False)
-    db.close(persist=False)
+        # На диске — контейнер с правкой (расшифровываем и проверяем сервис на месте).
+        with open(tmp_db_path, "rb") as f:
+            container = f.read()
+        db_bytes, dek, header = cs.unlock(container, "pw")
+        d2 = Database(tmp_db_path)
+        d2.open_encrypted(db_bytes, dek, header)
+        d2.create_tables()
+        assert "inflight" in [s["name"] for s in d2.get_services()]
+    finally:
+        # Гарантируем очистку даже при упавшем assert (в т.ч. самого
+        # диагностируемого wait_idle) — иначе поток db-worker* и писатель
+        # vault переживают тест и накапливаются к концу прогона (см.
+        # docs/РАЗБОР_НЕСТАБИЛЬНЫЙ_VAULT_ТЕСТ.md).
+        vc.shutdown()
+        db.close(persist=False)
+        db.shutdown_executor()
+        if d2 is not None:
+            d2.close(persist=False)
+            d2.shutdown_executor()
 
 
 # ─── H-09: run_exclusive_busy — фоновое выполнение с живым event-loop ─────────
@@ -306,3 +318,4 @@ def test_exclusive_backup_includes_queued_changes(qapp, tmp_path, pure_config):
     finally:
         vc.shutdown()
         db.close(persist=False)
+        db.shutdown_executor()

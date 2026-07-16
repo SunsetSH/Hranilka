@@ -26,7 +26,7 @@ class WelcomeDialog(ThemedDialog):
     """Слайдовое обучение: заголовок + короткий текст + живой мини-виджет."""
 
     def __init__(self, config, parent=None, on_fin_instruments_changed=None,
-                 on_recycle_bin_changed=None):
+                 on_recycle_bin_changed=None, on_servers_changed=None):
         super().__init__(config, parent)
         self.setWindowTitle("Обучение")
         self.setFixedSize(660, 580)
@@ -34,13 +34,15 @@ class WelcomeDialog(ThemedDialog):
         # callback дополнительно проверяет безопасное отключение записей.
         self._on_fin_instruments_changed = on_fin_instruments_changed
         self._on_recycle_bin_changed = on_recycle_bin_changed
+        self._on_servers_changed = on_servers_changed
         self._initial_fin_instruments = config.get("show_fin_instruments", False)
         self._initial_recycle_bin = config.get("recycle_bin_enabled", False)
+        self._initial_servers = config.get("show_servers", False)
 
         self._stack = QStackedWidget()
         for build in (self._slide_welcome, self._slide_tree, self._slide_card,
-                      self._slide_fin_instruments, self._slide_security,
-                      self._slide_tools, self._slide_final):
+                      self._slide_fin_instruments, self._slide_servers,
+                      self._slide_security, self._slide_tools, self._slide_final):
             self._stack.addWidget(build())
         self.body.addWidget(self._stack, 1)
 
@@ -92,6 +94,15 @@ class WelcomeDialog(ThemedDialog):
                         return
                 else:
                     self.config.set("recycle_bin_enabled", recycle_selected)
+                    self.config.save()
+            servers_selected = self.servers_check.isChecked()
+            if servers_selected != self._initial_servers:
+                if self._on_servers_changed is not None:
+                    if not self._on_servers_changed(servers_selected):
+                        self.servers_check.setChecked(self._initial_servers)
+                        return
+                else:
+                    self.config.set("show_servers", servers_selected)
                     self.config.save()
             self.accept()
         else:
@@ -312,7 +323,7 @@ class WelcomeDialog(ThemedDialog):
         tabs_lay = QHBoxLayout(tabs_box)
         tabs_lay.setContentsMargins(0, 0, 0, 0)
         tabs_lay.setSpacing(4)
-        for name in ("Данные входа", "Связь аккаунтов", "Коды и секреты", "Галерея", "Телеметрия"):
+        for name in ("Связь аккаунтов", "Персона", "Коды и секреты", "Галерея"):
             tabs_lay.addWidget(self._chip(name))
         tabs_lay.addStretch()
         lay.addLayout(self._feature_row("Можно хранить", tabs_box))
@@ -367,6 +378,45 @@ class WelcomeDialog(ThemedDialog):
         hint = QLabel(
             "Если позже передумаете: Настройки → Опции. Отключение только "
             "скрывает финансовые записи из интерфейса и не удаляет их из базы.")
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+        lay.addStretch()
+        return page
+
+    def _slide_servers(self):
+        page, lay = self._slide(
+            "Управляете VPS-серверами?",
+            "Хранилка умеет хранить данные серверов рядом с аккаунтами: "
+            "хост и SSH-порт, пользователей ОС, SSH-ключи, панели вроде "
+            "3x-ui — и привязывать сервер к аккаунту провайдера (хостера).",
+        )
+
+        preview = QFrame()
+        preview.setFrameShape(QFrame.StyledPanel)
+        preview_lay = QVBoxLayout(preview)
+        preview_lay.setSpacing(8)
+        preview_lay.addWidget(QLabel(
+            "[СЕРВЕР] 192.0.2.10:22   |   root, deploy   |   [3x-ui]"))
+        linked = QLabel("Свяжите сервер с аккаунтом хостера — переход работает "
+                        "в обе стороны, как у карт и кошельков.")
+        linked.setWordWrap(True)
+        preview_lay.addWidget(linked)
+        lay.addWidget(preview)
+
+        choice, self.servers_check, self._servers_choice_status = (
+            self._choice_panel(
+                "Показывать VPS-серверы?",
+                "Да, использовать VPS-серверы",
+                self._initial_servers,
+                "ИСПОЛЬЗОВАТЬ — раздел серверов будет доступен.",
+                "НЕ ИСПОЛЬЗОВАТЬ — этот раздел будет скрыт."))
+        self.servers_check.setToolTip(
+            "После завершения обучения настройка сразу применится к интерфейсу.")
+        lay.addWidget(choice)
+
+        hint = QLabel(
+            "Если позже передумаете: Настройки → Опции. Отключение только "
+            "скрывает серверы из интерфейса и не удаляет их из базы.")
         hint.setWordWrap(True)
         lay.addWidget(hint)
         lay.addStretch()
@@ -435,7 +485,7 @@ class WelcomeDialog(ThemedDialog):
         pd_box = QWidget()
         pd_lay = QHBoxLayout(pd_box)
         pd_lay.setContentsMargins(0, 0, 0, 0)
-        pd = QLineEdit("Менделеев Дмитрий, 27.01.1834,+ адрес! ")
+        pd = QLineEdit("Менделеев Дмитрий, 27.01.1834, адрес! ")
         pd.setReadOnly(True)
         pd.setToolTip("Тестовые личные данные для регистраций")
         pd_lay.addWidget(pd)

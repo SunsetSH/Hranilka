@@ -130,6 +130,16 @@ class WindowChromeMixin:
                 return True
         return False
 
+    def _any_card_open(self):
+        """True, если в правой панели открыта любая карточка — аккаунт, фин.
+        запись или VPS-сервер. Общий предикат для idle-lock (H-01) и
+        контекстных хоткеев (M-01): раньше проверялся только
+        `_current_account_id`, из-за чего открытая фин-/VPS-карточка не
+        считалась «картой на экране»."""
+        return (self._current_account_id is not None
+                or self._current_fin is not None
+                or self._current_server is not None)
+
     def note_activity(self):
         """Сбросить счётчик простоя (idle-lock). Вызывает VaultController после
         привилегированных операций: их длительность (KDF на большой базе) не
@@ -144,9 +154,10 @@ class WindowChromeMixin:
         # модальный event-loop, таймеры живы): блокировать БД сейчас нельзя.
         if getattr(self.vault, "_vault_locked", False):
             return
-        # В обычном режиме прячем только открытую карточку; в зашифрованном —
-        # блокируем всю базу (снимаем ключ), даже если карточка не открыта.
-        if not self.db.encrypted and self._current_account_id is None:
+        # В обычном режиме прячем только открытую карточку (аккаунт, фин.
+        # запись или сервер — H-01); в зашифрованном — блокируем всю базу
+        # (снимаем ключ), даже если карточка не открыта.
+        if not self.db.encrypted and not self._any_card_open():
             return
         elapsed_secs = self._last_activity.secsTo(QDateTime.currentDateTime())
         if elapsed_secs >= mins * 60:
@@ -174,13 +185,35 @@ class WindowChromeMixin:
         self._quiesce_card_async()
         # В обычном (plaintext) режиме «блокировка» лишь скрывает карточку с экрана:
         # ключ не теряется, поэтому несохранённые правки безопасно стэшим в кеш и
-        # восстанавливаем при возврате (H5-03). В encrypted сюда попадаем уже без
-        # правок (см. ранний выход выше), так что стэш — no-op.
-        if self.is_editing and self._current_account_id is not None:
+        # восстанавливаем при возврате (H5-03). Стэшим черновик ТЕКУЩЕГО открытого
+        # типа — аккаунт, фин-запись или сервер открыты не одновременно (одна
+        # правая панель), маршрутизация как в _save_unsaved_before_exit. В
+        # encrypted сюда попадаем уже без правок (см. ранний выход выше), так что
+        # стэш — no-op (H-01: раньше стэшился только аккаунт, фин-/VPS-черновик
+        # терялся молча).
+        stashed = False
+        if self.is_editing and self._current_fin is not None:
+            self._stash_current_fin_edits()
+            stashed = True
+        elif self.is_editing and self._current_server is not None:
+            self._stash_current_server_edits()
+            stashed = True
+        elif self.is_editing and self._current_account_id is not None:
             self._stash_current_edits(self._current_account_id)
+            stashed = True
+        if stashed:
             self._refresh_dirty_markers()
         self._show_placeholder()
+        # H-01: сбрасываем ВСЕ три current-состояния и их data-объекты —
+        # симметрично _hide_fin_everywhere/_hide_servers_everywhere. Иначе
+        # секреты открытой фин-/VPS-карточки оставались бы в памяти, и
+        # карточка считалась бы всё ещё «открытой» (_any_card_open) сразу
+        # после блокировки.
         self._current_account_id = None
+        self._current_fin = None
+        self.current_fin_data = None
+        self._current_server = None
+        self.current_server_data = None
         self.is_editing = False
         self._update_status_info()
         if self.db.encrypted:

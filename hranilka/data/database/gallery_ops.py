@@ -16,7 +16,7 @@ class DbGalleryOpsMixin(DbBase):
         self._gallery_bytes = None
 
     def _gallery_total_all(self) -> int:
-        """Полный SUM(LENGTH(image_data)) обеих галерей с мемоизацией (M-9).
+        """Полный SUM(LENGTH(image_data)) всех трёх галерей с мемоизацией (M-9).
 
         Значение считается один раз и хранится в self._gallery_bytes до первой
         мутации галереи или смены сессии (там кэш сбрасывается в None)."""
@@ -24,21 +24,24 @@ class DbGalleryOpsMixin(DbBase):
             self.cursor.execute(
                 "SELECT "
                 "COALESCE((SELECT SUM(LENGTH(image_data)) FROM gallery), 0) + "
-                "COALESCE((SELECT SUM(LENGTH(image_data)) FROM fin_gallery), 0) "
+                "COALESCE((SELECT SUM(LENGTH(image_data)) FROM fin_gallery), 0) + "
+                "COALESCE((SELECT SUM(LENGTH(image_data)) FROM server_gallery), 0) "
                 "AS s")
             self._gallery_bytes = int(self.cursor.fetchone()["s"])
         return self._gallery_bytes
 
     def gallery_total_bytes(self, exclude_account_id: int | None = None,
-                            exclude_fin_item_id: int | None = None) -> int:
-        """Суммарный объём всех картинок в обеих галереях (в байтах).
+                            exclude_fin_item_id: int | None = None,
+                            exclude_server_id: int | None = None) -> int:
+        """Суммарный объём всех картинок во всех галереях (в байтах).
 
-        exclude_account_id — исключить указанный аккаунт из суммы: его картинки
-        обычно держатся в памяти редактируемой карточки, и учитывать их повторно
-        при проверке лимита суммарного объёма не нужно (M3-05).
+        exclude_account_id/exclude_fin_item_id/exclude_server_id — исключить
+        указанного владельца из суммы: его картинки обычно держатся в памяти
+        редактируемой карточки, и учитывать их повторно при проверке лимита
+        суммарного объёма не нужно (M3-05).
 
         Полный объём кэшируется (M-9); при exclude вычитаем объём редактируемого
-        аккаунта и/или финансовой записи из кэшированной суммы."""
+        владельца из кэшированной суммы."""
         total = self._gallery_total_all()
         if exclude_account_id is not None:
             self.cursor.execute(
@@ -49,6 +52,11 @@ class DbGalleryOpsMixin(DbBase):
             self.cursor.execute(
                 "SELECT COALESCE(SUM(LENGTH(image_data)), 0) AS s "
                 "FROM fin_gallery WHERE item_id = ?", (exclude_fin_item_id,))
+            total -= int(self.cursor.fetchone()["s"])
+        if exclude_server_id is not None:
+            self.cursor.execute(
+                "SELECT COALESCE(SUM(LENGTH(image_data)), 0) AS s "
+                "FROM server_gallery WHERE server_id = ?", (exclude_server_id,))
             total -= int(self.cursor.fetchone()["s"])
         return total
 

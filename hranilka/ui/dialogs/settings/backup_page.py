@@ -60,10 +60,13 @@ class SettingsBackupPageMixin:
         return w
 
     def _do_export_all(self):
+        """M-04: диалог открывается сразу, без предварительного чтения БД —
+        снимок и формирование файла идут в фоне после подтверждения параметров
+        (см. ExportDialog._run_export), как и у export_all главного окна."""
         if not self._db:
             return
-        tree = self._db.export_subtree()
-        dlg = ExportDialog(self.config, tree, "Вся база", self,
-                           show_fin=self.config.get("show_fin_instruments", False))
+        dlg = ExportDialog(self.config, self._db, None, None, "Вся база", self,
+                           show_fin=self.config.get("show_fin_instruments", False),
+                           show_servers=self.config.get("show_servers", False))
         dlg.exec()
 

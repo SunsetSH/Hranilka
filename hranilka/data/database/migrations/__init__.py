@@ -48,3 +48,8 @@ MIGRATIONS[10] = _m010
 from hranilka.data.database.migrations.m011_drop_ewallet import migrate as _m011
 
 MIGRATIONS[11] = _m011
+
+# v11→v12: VPS-серверы — таблицы servers/server_links/server_gallery.
+from hranilka.data.database.migrations.m012_servers import migrate as _m012
+
+MIGRATIONS[12] = _m012

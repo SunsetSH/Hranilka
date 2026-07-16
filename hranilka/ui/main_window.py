@@ -21,20 +21,22 @@ from hranilka.ui.chrome import WindowChromeMixin
 from hranilka.ui.shortcuts_mixin import ShortcutsMixin
 from hranilka.ui.account_card import AccountCardMixin
 from hranilka.ui.fin_card import FinCardMixin
+from hranilka.ui.server_card import ServerCardMixin
 from hranilka.ui.tree import AccountTree, TreeMixin
 from hranilka.core import instance_lock
 from hranilka.core import util
-from hranilka.core.nodetypes import ACCOUNT, FIN_LEAF_TYPES
+from hranilka.core.nodetypes import ACCOUNT, FIN_LEAF_TYPES, SERVER
 from hranilka.core.fin_types import FIN_TYPES
 from hranilka.core.paths import BASE_DIR
 from hranilka.ui.dialogs import SettingsDialog, RecycleBinDialog, ExportDialog
 from hranilka.ui.tabs import AccountTabs
 from hranilka.ui.fin_tabs import FinItemTabs
+from hranilka.ui.server_tabs import ServerTabs
 from hranilka.ui.titlebar import TitleBar, ResizableContainer
 from hranilka.ui import theme
 
 
-class MainWindow(WindowChromeMixin, ShortcutsMixin, FinCardMixin,
+class MainWindow(WindowChromeMixin, ShortcutsMixin, ServerCardMixin, FinCardMixin,
                  AccountCardMixin, TreeMixin, QMainWindow):
     def __init__(self):
         super().__init__()
@@ -90,6 +92,13 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, FinCardMixin,
         # id только что созданной записи: карточка после загрузки открывается в
         # правке (одноразовый флаг (node_type, id), см. _load_fin_into_ui).
         self._fin_edit_on_load = None
+        # Открытый сервер правой панели: (SERVER, id) | None — независимо от
+        # _current_fin (docs/ТЗ_VPS_Серверы.md §2, ServerCardMixin).
+        self._current_server = None
+        self.current_server_data = None
+        # id только что созданного сервера: карточка после загрузки открывается
+        # в правке (одноразовый флаг, см. _load_server_into_ui).
+        self._server_edit_on_load = None
         # Ключ несохранённых правок — кортеж (node_type, id): id-пространства
         # аккаунтов и фин-записей раздельны, голый id их бы столкнул.
         self._edit_cache = {}                # (type, id) -> {"storage":..., "links":[...]}
@@ -144,7 +153,7 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, FinCardMixin,
         self.config.save()
         dlg = ui_welcome.WelcomeDialog(
             self.config, self, self._apply_welcome_fin_instruments,
-            self._apply_welcome_recycle_bin)
+            self._apply_welcome_recycle_bin, self._apply_welcome_servers)
         dlg.open()
 
     def _apply_welcome_fin_instruments(self, show: bool) -> bool:
@@ -177,11 +186,36 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, FinCardMixin,
         self.apply_config()
         return True
 
+    def _apply_welcome_servers(self, show: bool) -> bool:
+        """Применить выбор VPS-серверов из приветственного обучения.
+
+        Симметрично _apply_welcome_fin_instruments/_resolve_show_servers
+        (settings/dialog.py): те же гарантии при отключении, если записи
+        уже есть. Возвращаем False, чтобы финальный слайд остался открытым
+        при отказе.
+        """
+        old = self.config.get("show_servers", False)
+        if old == show:
+            return True
+        if old and not show and self.db.count_servers() > 0:
+            if not theme.themed_confirm(
+                    self.config, self, "Скрыть серверы",
+                    "Серверы будут скрыты из интерфейса (дерево, связи, "
+                    "создание). Записи останутся в БД, корзина продолжит их "
+                    "показывать. Несохранённые правки серверов будут "
+                    "сброшены. Продолжить?"):
+                return False
+        self.config.set("show_servers", show)
+        self.config.save()
+        self.apply_config()
+        return True
+
     # Подписи типизированного подсчёта несохранённых записей в диалоге закрытия.
     # Фин-часть строится из реестра (spec.unsaved_label) — новый тип получает
     # свою строку подсчёта автоматически, без правки MainWindow.
     _UNSAVED_LABELS = ((ACCOUNT, "Аккаунтов"),) + tuple(
-        (spec.node_type, spec.unsaved_label) for spec in FIN_TYPES.values())
+        (spec.node_type, spec.unsaved_label) for spec in FIN_TYPES.values()) + (
+        (SERVER, "Серверов"),)
 
     def _unsaved_keys(self):
         """Ключи (node_type, id) записей с несохранёнными правками, включая
@@ -191,6 +225,8 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, FinCardMixin,
             unsaved.add((ACCOUNT, self._current_account_id))
         if self.is_editing and self._current_fin is not None:
             unsaved.add(self._current_fin)
+        if self.is_editing and self._current_server is not None:
+            unsaved.add(self._current_server)
         return unsaved
 
     def _unsaved_summary(self, unsaved):
@@ -207,22 +243,35 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, FinCardMixin,
         True — всё записано (кеш очищен); False — ошибка (показана, не выходим)."""
         if self.is_editing and self._current_fin is not None:
             self._stash_current_fin_edits()
+        elif self.is_editing and self._current_server is not None:
+            self._stash_current_server_edits()
         elif self.is_editing and self._current_account_id is not None:
             self._stash_current_edits(self._current_account_id)
         show_fin = self.config.get("show_fin_instruments", False)
+        show_servers = self.config.get("show_servers", False)
         for (node_type, rec_id), cached in list(self._edit_cache.items()):
-            # Защита: при выключенной опции фин-правок в кеше быть не должно
-            # (сброшены при выключении) — пропускаем, не записываем вслепую.
+            # Защита: при выключенной опции фин-правок/серверов в кеше быть не
+            # должно (сброшены при выключении) — пропускаем, не пишем вслепую.
             if node_type in FIN_LEAF_TYPES and not show_fin:
+                continue
+            if node_type == SERVER and not show_servers:
                 continue
             try:
                 if node_type == ACCOUNT:
                     self.db.save_account_with_links(
                         rec_id, cached["storage"], cached.get("links") or [],
-                        cached.get("fin_links") if show_fin else None)
+                        cached.get("fin_links") if show_fin else None,
+                        cached.get("server_links") if show_servers else None)
                 elif node_type in FIN_LEAF_TYPES:
+                    # links=None (H-02: ошибка чтения при осиротевшей загрузке
+                    # галереи) передаётся КАК ЕСТЬ, без "or []" — save_fin_item_
+                    # with_links трактует None как «не трогать fin_links»,
+                    # иначе автосохранение при выходе стёрло бы реальные связи.
                     self.db.save_fin_item_with_links(
-                        rec_id, cached["storage"], cached.get("links") or [])
+                        rec_id, cached["storage"], cached.get("links"))
+                elif node_type == SERVER:
+                    self.db.save_server_with_links(
+                        rec_id, cached["storage"], cached.get("links"))
             except Exception as e:                   # noqa: BLE001 — показать и не выходить
                 storage = cached.get("storage") or {}
                 name = (storage.get("fields", {}).get("account_name")
@@ -392,23 +441,28 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, FinCardMixin,
         left_layout = QVBoxLayout(left_panel)
         left_layout.setContentsMargins(0, 0, 0, 0)
 
-        # Ряд 1: контейнеры и аккаунт. «+ АККАУНТ» — прямой вызов add_account
-        # (шорткат «добавить аккаунт» тоже на add_account, см. shortcuts_mixin).
-        btn_layout = QHBoxLayout()
+        # Ряд 1 + ряд 2: состав каждого ряда зависит от тумблеров show_fin_instruments/
+        # show_servers и перестраивается в _relayout_create_buttons (вызывается
+        # при старте и из apply_config). Кнопки создаются один раз здесь;
+        # relayout только перекладывает их между row1_layout/row2_layout —
+        # ссылки на кнопки (add_account_btn и т.д.) не дублируются.
+        self.row1_layout = QHBoxLayout()
         self.add_folder_btn = QPushButton(" + ПАПКА ")
         self.add_service_btn = QPushButton(" + СЕРВИС ")
         self.add_account_btn = QPushButton(" + АККАУНТ ")
         self.add_folder_btn.clicked.connect(self.add_folder)
         self.add_service_btn.clicked.connect(self.add_service)
         self.add_account_btn.clicked.connect(self.add_account)
-        btn_layout.addWidget(self.add_folder_btn)
-        btn_layout.addWidget(self.add_service_btn)
-        btn_layout.addWidget(self.add_account_btn)
-        left_layout.addLayout(btn_layout)
+        left_layout.addLayout(self.row1_layout)
 
-        # Ряд 2: кнопки создания фин-записей из реестра FIN_TYPES (короткая
-        # подпись spec.short_title). Виден только при включённой опции
-        # «Показывать фин. инструменты» — видимость задаётся в apply_config.
+        self.row2_widget = QWidget()
+        self.row2_layout = QHBoxLayout(self.row2_widget)
+        self.row2_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.addWidget(self.row2_widget)
+
+        # Кнопки создания фин-записей из реестра FIN_TYPES (короткая подпись
+        # spec.short_title) — сгруппированы в свой контейнер (findChildren в
+        # тестах опирается на то, что здесь только фин-кнопки).
         self.fin_buttons_widget = QWidget()
         fin_btn_layout = QHBoxLayout(self.fin_buttons_widget)
         fin_btn_layout.setContentsMargins(0, 0, 0, 0)
@@ -417,7 +471,17 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, FinCardMixin,
             fin_btn.clicked.connect(
                 lambda checked=False, tid=type_id: self.add_fin_record(tid))
             fin_btn_layout.addWidget(fin_btn)
-        left_layout.addWidget(self.fin_buttons_widget)
+
+        # Кнопка создания VPS-сервера (docs/ТЗ_VPS_Серверы.md §4) — свой
+        # контейнер, аналогично fin_buttons_widget.
+        self.srv_buttons_widget = QWidget()
+        srv_btn_layout = QHBoxLayout(self.srv_buttons_widget)
+        srv_btn_layout.setContentsMargins(0, 0, 0, 0)
+        self.add_server_btn = QPushButton(" + СЕРВЕР ")
+        self.add_server_btn.clicked.connect(self.add_server)
+        srv_btn_layout.addWidget(self.add_server_btn)
+
+        self._relayout_create_buttons()
 
         # Строка поиска (живой фильтр по названиям)
         self.search_box = QLineEdit()
@@ -500,12 +564,17 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, FinCardMixin,
             for spec in FIN_TYPES.values()}
         self.fin_tabs = next(iter(self.fin_tabs_by_type.values()), None)
 
+        # Карточка VPS-сервера — независимый код (docs/ТЗ_VPS_Серверы.md §2):
+        # один тип узла (SERVER), поэтому одна страница (не словарь, как у fin).
+        self.server_tabs = ServerTabs(config=self.config)
+
         # Правая панель — стек: заглушка / карточка аккаунта / карточки записей.
         self.right_stack = QStackedWidget()
         self.right_stack.addWidget(self.placeholder_label)
         self.right_stack.addWidget(self.tabs)
         for fin_tabs in self.fin_tabs_by_type.values():
             self.right_stack.addWidget(fin_tabs)
+        self.right_stack.addWidget(self.server_tabs)
         self.right_stack.setCurrentWidget(self.placeholder_label)
         right_layout.addWidget(self.right_stack)
 
@@ -516,6 +585,10 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, FinCardMixin,
         # Привязанные карты/кошельки на карточке аккаунта (§8)
         self.tabs.f_fin_linked.navigate_requested.connect(self.on_fin_link_navigate)
         self.tabs.f_fin_linked.add_requested.connect(self.on_add_fin_link_requested)
+
+        # Привязанные серверы на карточке аккаунта (docs/ТЗ_VPS_Серверы.md §4)
+        self.tabs.f_server_linked.navigate_requested.connect(self.on_server_link_navigate)
+        self.tabs.f_server_linked.add_requested.connect(self.on_add_server_link_requested)
 
         # Индикатор загрузки картинки в галерею (статус-бар)
         self.tabs.f_gallery_widget.upload_status_changed.connect(
@@ -555,8 +628,26 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, FinCardMixin,
             fin_tabs.f_gallery_widget.upload_status_changed.connect(
                 self._on_gallery_upload_status)
 
-        # КНОПКИ РЕДАКТИРОВАНИЯ — общие для аккаунта и фин-записи, роутинг по
-        # типу открытого узла (edit/save/cancel_current в FinCardMixin).
+        # Копируемые поля серверной карточки — независимо (docs/ТЗ_VPS_Серверы.md §2).
+        self.server_tabs.f_name.copy_signal.connect(self._on_field_copied)
+        for _key, widget in self.server_tabs.fields():
+            widget.copy_signal.connect(self._on_field_copied)
+        for _key, widget in self.server_tabs.list_fields():
+            widget.copy_signal.connect(self._on_field_copied)
+        # «Доп. IP» — список вне list_fields() (список строк, не словарей;
+        # УИ §2026-07-15), но копирование через тот же канал автоочистки.
+        self.server_tabs._extra_ips_widget.copy_signal.connect(
+            self._on_field_copied)
+        self.server_tabs.f_linked_accounts.navigate_requested.connect(
+            self.on_server_account_link_navigate)
+        self.server_tabs.f_linked_accounts.add_requested.connect(
+            self.on_add_server_account_link_requested)
+        self.server_tabs.f_gallery_widget.upload_status_changed.connect(
+            self._on_gallery_upload_status)
+
+        # КНОПКИ РЕДАКТИРОВАНИЯ — общие для аккаунта/фин-записи/сервера, роутинг
+        # по типу открытого узла (edit/save/cancel_current в ServerCardMixin/
+        # FinCardMixin).
         self.action_layout = QHBoxLayout()
 
         self.edit_btn = QPushButton(" РЕДАКТИРОВАТЬ ")
@@ -616,6 +707,9 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, FinCardMixin,
         # Общий стиль окна (вкл. кнопки-вкладки QPushButton[tabButton], спинбоксы, комбобоксы)
         self.setStyleSheet(theme.main_stylesheet(self.config))
         self.tabs.apply_scroll_bg(main_bg)
+        for fin_tabs in self.fin_tabs_by_type.values():
+            fin_tabs.apply_scroll_bg(main_bg)
+        self.server_tabs.apply_scroll_bg(main_bg)
         self.tree.setStyleSheet(f"""
             QTreeWidget {{ border: 2px inset #808080; background-color: {tree_bg}; color: {text_color}; font-family: '{font_name}'; font-size: {font_size}px; }}
             QTreeWidget::item {{ padding: 4px; border: 1px solid transparent; }}
@@ -728,12 +822,147 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, FinCardMixin,
         # дерево). При выключении — скрыть отовсюду, кроме корзины.
         self._apply_fin_visibility()
 
+        # Показ VPS-серверов (docs/ТЗ_VPS_Серверы.md §4): кнопка создания +
+        # секция карточки аккаунта + дерево. При выключении — скрыть отовсюду,
+        # кроме корзины (по образцу _apply_fin_visibility).
+        self._apply_server_visibility()
+
+        # Раскладка рядов кнопок создания зависит от обоих тумблеров сразу —
+        # пересчитывается один раз после того, как оба флага применены.
+        self._relayout_create_buttons()
+
+    def _relayout_create_buttons(self):
+        """Перестроить состав рядов кнопок создания по флагам show_fin_instruments/
+        show_servers (docs/ТЗ_VPS_Серверы.md §4). Кнопки не пересоздаются —
+        только перекладываются между row1_layout/row2_layout:
+        - фин + серверы:  ряд1 «+ПАПКА +СЕРВИС +АККАУНТ», ряд2 «+КАРТА +КРИПТО +СЕРВЕР»;
+        - только фин:      ряд1 «+ПАПКА +СЕРВИС +АККАУНТ», ряд2 «+КАРТА +КРИПТО»;
+        - только серверы:  ряд1 «+ПАПКА +СЕРВИС»,           ряд2 «+СЕРВЕР +АККАУНТ»;
+        - оба выключены:   ряд1 «+ПАПКА +СЕРВИС +АККАУНТ», ряд2 скрыт целиком."""
+        show_fin = self.config.get("show_fin_instruments", False)
+        show_servers = self.config.get("show_servers", False)
+
+        for layout in (self.row1_layout, self.row2_layout):
+            while layout.count():
+                item = layout.takeAt(0)
+                w = item.widget()
+                if w is not None:
+                    layout.removeWidget(w)
+
+        if not show_fin and show_servers:
+            row1 = [self.add_folder_btn, self.add_service_btn]
+            row2 = [self.srv_buttons_widget, self.add_account_btn]
+        else:
+            row1 = [self.add_folder_btn, self.add_service_btn, self.add_account_btn]
+            row2 = []
+            if show_fin:
+                row2.append(self.fin_buttons_widget)
+            if show_servers:
+                row2.append(self.srv_buttons_widget)
+
+        # Стретч = число кнопок внутри виджета ряда (1 у одиночной кнопки,
+        # N у контейнера вроде fin_buttons_widget/srv_buttons_widget). Без
+        # этого QHBoxLayout делит излишек ширины ПОРОВНУ между виджетами
+        # ряда независимо от того, сколько кнопок каждый содержит — при
+        # растяжении окна «+ СЕРВЕР» (1 кнопка в своём контейнере) становился
+        # шире «+ КАРТА»/«+ КРИПТО» (2 кнопки делят тот же излишек пополам).
+        # Пропорциональный стретч выравнивает прирост на кнопку.
+        for w in row1:
+            self.row1_layout.addWidget(w, self._btn_group_stretch(w))
+        for w in row2:
+            self.row2_layout.addWidget(w, self._btn_group_stretch(w))
+
+        self.fin_buttons_widget.setVisible(show_fin)
+        self.srv_buttons_widget.setVisible(show_servers)
+        self.row2_widget.setVisible(bool(row2))
+
+        self._equalize_create_button_widths(show_fin, show_servers)
+
+    def _equalize_create_button_widths(self, show_fin: bool, show_servers: bool) -> None:
+        """Фин+серверы: выровнять МИНИМАЛЬНУЮ ширину всех 6 кнопок создания
+        (ряд1 «+ПАПКА +СЕРВИС +АККАУНТ» + ряд2 «+КАРТА +КРИПТО +СЕРВЕР»).
+
+        Стретчи _btn_group_stretch выравнивают ширины только пока есть излишек
+        места для распределения. На МИНИМАЛЬНОЙ ширине окна излишка нет —
+        каждая кнопка садится на свой sizeHint (зависит от длины текста:
+        «+ АККАУНТ » шире «+ КАРТА »), и кнопки расходятся. Фиксируем общий
+        minimumWidth = максимум sizeHint по всем шести — тогда обе крайности
+        (растянуто через стретч / сжато до минимума) дают равные кнопки.
+
+        Пересчитывается при каждом relayout (не только смене темы/шрифта —
+        apply_appearance предшествует _relayout_create_buttons в apply_config,
+        так что sizeHint уже отражает актуальные метрики).
+
+        В остальных сценариях (только фин / только серверы / оба выкл) —
+        снять override (эти раскладки и так устраивают, трогать не просят)."""
+        all_buttons = [self.add_folder_btn, self.add_service_btn, self.add_account_btn,
+                       *self.fin_buttons_widget.findChildren(QPushButton),
+                       *self.srv_buttons_widget.findChildren(QPushButton)]
+        if not (show_fin and show_servers):
+            for btn in all_buttons:
+                btn.setMinimumWidth(0)
+            return
+        width = max(btn.sizeHint().width() for btn in all_buttons)
+        for btn in all_buttons:
+            btn.setMinimumWidth(width)
+
+    @staticmethod
+    def _btn_group_stretch(w):
+        """Стретч виджета ряда кнопок создания: 1 для одиночной QPushButton,
+        иначе число вложенных QPushButton (fin_buttons_widget/srv_buttons_widget)."""
+        if isinstance(w, QPushButton):
+            return 1
+        return max(1, len(w.findChildren(QPushButton)))
+
+    def _apply_server_visibility(self):
+        """Применить опцию «Показывать серверы»: секция «Привязанные серверы»
+        на карточке аккаунта и дерево. При изменении опции — очистить
+        открытую карточку сервера/кеш и перестроить дерево. Видимость кнопки
+        «+ СЕРВЕР» — в _relayout_create_buttons."""
+        show = self.config.get("show_servers", False)
+        self.tabs.set_server_section_visible(show)
+        prev = getattr(self, "_servers_shown", None)
+        self._servers_shown = show
+        if prev is None or prev == show:
+            return                    # первый вызов (дерево строит __init__) / без изменений
+        if not show:
+            self._hide_servers_everywhere()
+        self._reload_tree()
+
+    def _hide_servers_everywhere(self):
+        """Скрытие серверов: закрыть открытую карточку сервера и вычистить
+        несохранённые правки серверов из кеша (в UI они больше недоступны).
+        Корзина не затрагивается — серверы там видны всегда.
+
+        M-02: перед очисткой состояния — тот же централизованный способ, что
+        и при смене сессии БД (_quiesce_card_async/_lock_screen, H65-02):
+        инвалидировать поколение карточки (устаревший load/save серверной
+        карточки, ещё не завершившийся к моменту выключения тумблера, не
+        тронет UI/кеш после проверки gen), снять busy и отменить висящие
+        задачи серверной галереи (импорт/предпросмотр) — иначе завершившаяся
+        уже ПОСЛЕ выключения загрузка могла бы через orphan-handler создать
+        новый серверный черновик или изменить общий UI."""
+        self._card_gen += 1
+        self._card_busy = False
+        try:
+            self.server_tabs.f_gallery_widget.cancel_all_tasks()
+        except Exception as e:                       # noqa: BLE001 — teardown-хардненинг
+            logging.warning("Не удалось отменить задачи серверной галереи: %s", e)
+        if self._current_server is not None:
+            self._current_server = None
+            self.current_server_data = None
+            self.is_editing = False
+            self._show_placeholder()
+        for key in [k for k in self._edit_cache if k[0] == SERVER]:
+            self._edit_cache.pop(key, None)
+        self._dirty_ids = {k for k in self._dirty_ids if k[0] != SERVER}
+
     def _apply_fin_visibility(self):
-        """Применить опцию «Показывать фин. инструменты»: видимость кнопок ряда 2
-        и секции привязанных карт на карточке аккаунта. При изменении опции —
-        очистить открытую фин-карточку/кеш и перестроить дерево."""
+        """Применить опцию «Показывать фин. инструменты»: секция привязанных
+        карт на карточке аккаунта и дерево. При изменении опции — очистить
+        открытую фин-карточку/кеш и перестроить дерево. Видимость кнопок
+        ряда 2 — в _relayout_create_buttons."""
         show = self.config.get("show_fin_instruments", False)
-        self.fin_buttons_widget.setVisible(show)
         self.tabs.set_fin_section_visible(show)
         prev = getattr(self, "_fin_shown", None)
         self._fin_shown = show
@@ -746,7 +975,19 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, FinCardMixin,
     def _hide_fin_everywhere(self):
         """Скрытие фин-инструментов: закрыть открытую фин-карточку и вычистить
         несохранённые правки фин-записей из кеша (в UI они больше недоступны).
-        Корзина не затрагивается — фин-записи там видны всегда."""
+        Корзина не затрагивается — фин-записи там видны всегда.
+
+        M-02 (симметрично _hide_servers_everywhere): тот же централизованный
+        способ гашения незавершённого async — инвалидировать поколение
+        карточки, снять busy, отменить висящие задачи галереи КАЖДОЙ фин-
+        карточки (по одной на тип реестра, как в _quiesce_card_async)."""
+        self._card_gen += 1
+        self._card_busy = False
+        try:
+            for fin_tabs in self.fin_tabs_by_type.values():
+                fin_tabs.f_gallery_widget.cancel_all_tasks()
+        except Exception as e:                       # noqa: BLE001 — teardown-хардненинг
+            logging.warning("Не удалось отменить задачи фин-галереи: %s", e)
         if self._current_fin is not None:
             self._current_fin = None
             self.current_fin_data = None
@@ -757,13 +998,14 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, FinCardMixin,
         self._dirty_ids = {k for k in self._dirty_ids if k[0] not in FIN_LEAF_TYPES}
 
     def export_all(self):
-        """Экспорт всей базы — то же, что кнопка «Экспортировать всё» в настройках."""
-        tree = self.db.export_subtree()
-        if not tree:
-            self.statusBar().showMessage("Нечего экспортировать", 3000)
-            return
-        ExportDialog(self.config, tree, "Вся база", self,
-                     show_fin=self.config.get("show_fin_instruments", False)).exec()
+        """Экспорт всей базы — то же, что кнопка «Экспортировать всё» в настройках.
+
+        M-04: диалог открывается сразу, без предварительного чтения БД — снимок
+        (отфильтрованный по выбранным разделам) и формирование файла идут в фоне
+        уже ПОСЛЕ подтверждения параметров (см. ExportDialog._run_export)."""
+        ExportDialog(self.config, self.db, None, None, "Вся база", self,
+                     show_fin=self.config.get("show_fin_instruments", False),
+                     show_servers=self.config.get("show_servers", False)).exec()
 
     def open_settings(self):
         dialog = SettingsDialog(self.config, self)
@@ -788,17 +1030,17 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, FinCardMixin,
 
     def open_export(self, node):
         """Экспорт поддерева (папка/сервис/аккаунт) в выбранный формат.
-        Данные берутся из текущей БД (в шифр. режиме — из памяти)."""
+        Данные берутся из текущей БД (в шифр. режиме — из памяти).
+
+        M-04: снимок ветки читается в фоне ПОСЛЕ подтверждения параметров
+        диалога, не здесь (см. ExportDialog._run_export)."""
         if node["type"] == ACCOUNT:
             title = self.db.get_account_path(node["id"])
         else:
             title = node["name"]
-        tree = self.db.export_subtree(node["type"], node["id"])
-        if not tree:
-            self.statusBar().showMessage("Нечего экспортировать", 3000)
-            return
-        ExportDialog(self.config, tree, title, self,
-                     show_fin=self.config.get("show_fin_instruments", False)).exec()
+        ExportDialog(self.config, self.db, node["type"], node["id"], title, self,
+                     show_fin=self.config.get("show_fin_instruments", False),
+                     show_servers=self.config.get("show_servers", False)).exec()
 
     def _update_bin_button(self):
         """Синхронизирует кнопку корзины в заголовке с числом аккаунтов в
@@ -1257,6 +1499,7 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, FinCardMixin,
         """Сброс состояния и UI после переоткрытия БД (восстановление бэкапа)."""
         self._current_account_id = None
         self._current_fin = None
+        self._current_server = None
         self._edit_cache.clear()
         self._dirty_ids.clear()
         self.current_account_data = None
@@ -1302,6 +1545,7 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, FinCardMixin,
                 logging.warning("Не удалось удалить бэкапы: %s", e)
         self._current_account_id = None
         self._current_fin = None
+        self._current_server = None
         self._edit_cache.clear()
         self._dirty_ids.clear()
         self.current_account_data = None

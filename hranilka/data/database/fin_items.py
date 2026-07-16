@@ -113,12 +113,18 @@ class DbFinItemsMixin(DbBase):
         return gallery_ids
 
     def save_fin_item_with_links(self, item_id: int, storage: dict[str, Any],
-                                 account_ids: list[int]) -> list:
+                                 account_ids: Optional[list[int]] = None) -> list:
         """Атомарно сохраняет карточку и её связи в ОДНОЙ транзакции (по образцу
-        save_account_with_links): либо обе, либо ни одна."""
+        save_account_with_links): либо обе, либо ни одна.
+        account_ids=None — fin_links НЕ трогаются: черновик с неизвестными
+        связями (H-02, симметрично save_server_with_links: ошибка чтения
+        get_item_links при осиротевшей загрузке галереи не должна при
+        сохранении стереть реальные привязки). Пустой список [] — легитимное
+        «снять все связи»."""
         with self.conn:
             gallery_ids = self._save_fin_item_rows(item_id, storage)
-            self._set_item_links_rows(item_id, account_ids)
+            if account_ids is not None:
+                self._set_item_links_rows(item_id, account_ids)
         self._mark_dirty()
         return gallery_ids
 

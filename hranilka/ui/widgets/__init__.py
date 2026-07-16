@@ -12,11 +12,12 @@ from hranilka.ui.widgets.kv_list import KeyValueListWidget
 from hranilka.ui.widgets.linked import LinkedAccountsWidget
 from hranilka.ui.widgets.secret_questions import SecretQuestionsWidget
 from hranilka.ui.widgets.seed_phrase import SeedPhraseWidget
+from hranilka.ui.widgets.srv_linked import LinkedServersWidget, server_item_display
 
 __all__ = ["CodeListWidget", "CopyableField",
            "CopyableDateField", "CopyableTextEdit", "ExpiryField",
            "GalleryWidget", "IntervalField", "KeyValueListWidget",
-           "LinkedAccountsWidget", "LinkedFinItemsWidget",
+           "LinkedAccountsWidget", "LinkedFinItemsWidget", "LinkedServersWidget",
            "MaskedCardNumberField", "MaskedTextEdit", "ReadOnlyAwareComboBox",
            "SecretQuestionsWidget", "SeedPhraseWidget",
-           "fin_item_display", "heading_label"]
+           "fin_item_display", "heading_label", "server_item_display"]

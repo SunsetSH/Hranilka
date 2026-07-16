@@ -42,5 +42,19 @@ class SettingsOptionsMixin:
         fl.addWidget(fin_note)
         lay.addWidget(fin_group)
 
+        srv_group = QGroupBox("VPS-серверы")
+        sl = QVBoxLayout(srv_group)
+        self.show_servers_check = QCheckBox("Показывать серверы")
+        self.show_servers_check.setChecked(
+            self.config.get("show_servers", False))
+        sl.addWidget(self.show_servers_check)
+        srv_note = QLabel(
+            "Данные подключения к VPS-серверам: показ в дереве, связях и кнопках "
+            "создания. Если выключено — записи скрыты из интерфейса, но остаются "
+            "в базе; корзина продолжает их показывать.")
+        srv_note.setWordWrap(True)
+        sl.addWidget(srv_note)
+        lay.addWidget(srv_group)
+
         lay.addStretch()
         return w

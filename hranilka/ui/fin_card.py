@@ -81,9 +81,36 @@ class FinCardMixin:
         try:
             if (node_type, item_id) in self._edit_cache:
                 cached = self._edit_cache[(node_type, item_id)]
+                link_ids = cached.get("links")
+                if link_ids is None:
+                    # H-02: связи неизвестны (черновик пережил сбой чтения
+                    # get_item_links при осиротевшей загрузке галереи). НЕ
+                    # подменяем молча пустым списком — обычное сохранение
+                    # синхронизировало бы fin_links с [] и стёрло бы реальные
+                    # привязки. load_fin_item не отдаёт связи в одном снимке
+                    # (в отличие от get_server), поэтому второе чтение здесь
+                    # неизбежно — пытаемся перечитать; вторая неудача —
+                    # открываем карточку fail-closed, черновик не трогаем.
+                    try:
+                        link_ids = await self.db.run_async(
+                            self.db.get_item_links, item_id, _session=session)
+                    except StaleSessionError:
+                        return
+                    except Exception as e:            # noqa: BLE001
+                        if gen == self._card_gen:
+                            self._current_fin = None
+                            self.is_editing = False
+                            self._show_placeholder()
+                            self._show_card_error(
+                                "Не удалось восстановить связи черновика "
+                                "записи — открытие отменено, чтобы не "
+                                "потерять привязки", e)
+                        return
+                    if gen != self._card_gen:
+                        return
+                    cached["links"] = link_ids        # связи стали известны
                 links = await self.db.run_async(
-                    self._resolve_link_names, cached.get("links", []),
-                    _session=session)
+                    self._resolve_link_names, link_ids, _session=session)
                 other_bytes = await self.db.run_async(
                     self.db.gallery_total_bytes, exclude_fin_item_id=item_id,
                     _session=session)
@@ -436,8 +463,15 @@ class FinCardMixin:
                     self.db.get_item_links, item_id, _session=session)
             except StaleSessionError:
                 return
-            except Exception:                        # noqa: BLE001
-                link_ids = []
+            except Exception as e:                    # noqa: BLE001
+                # H-02 (симметрично server_card.py): НЕ подменяем неизвестные
+                # связи пустым списком — иначе последующее сохранение этого
+                # черновика стёрло бы реальные fin_links. None = «не трогать
+                # при сохранении» (save_fin_item_with_links/_save_unsaved_
+                # before_exit).
+                logging.error("Не удалось подгрузить связи записи для "
+                              "осиротевшей загрузки: %s", e, exc_info=e)
+                link_ids = None
             self._edit_cache[fin_key] = {
                 "storage": fin_data.to_storage(), "links": link_ids}
         self._mark_fin_orphan_dirty(fin_key)

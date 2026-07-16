@@ -137,6 +137,21 @@ def test_save_with_links_atomic(db):
     assert db.load_fin_item(iid)["name"] == "N"
 
 
+def test_save_with_links_none_does_not_touch_links(db):
+    """H-02 (симметрично серверам, data/database/servers.py): account_ids=None
+    — save_fin_item_with_links НЕ трогает fin_links (отличие от []="снять
+    все связи"). Карточка при этом сохраняется как обычно."""
+    sid = db.add_service("S")
+    a1 = db.add_account(sid, "A1")
+    iid = db.add_fin_item(sid, "bank_card", "Карта")
+    db.set_item_links(iid, [a1])
+    storage = db.load_fin_item(iid)
+    storage["name"] = "N2"
+    db.save_fin_item_with_links(iid, storage, None)
+    assert db.get_item_links(iid) == [a1]        # связь цела
+    assert db.load_fin_item(iid)["name"] == "N2"  # карточка сохранена
+
+
 def test_link_cascade_on_account_delete(db):
     sid = db.add_service("S")
     a1 = db.add_account(sid, "A1")

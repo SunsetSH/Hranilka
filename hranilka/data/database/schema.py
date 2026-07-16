@@ -23,7 +23,11 @@ from hranilka.core.util import best_effort_wipe
 #      его записи из fin_items (FK CASCADE подчищает fin_links/fin_gallery).
 # v11: удаление типа «Электронный кошелёк» (ewallet) — миграция m011 чистит
 #      его записи из fin_items (FK CASCADE подчищает fin_links/fin_gallery).
-SCHEMA_VERSION = 11
+# v12: VPS-серверы (данные подключения: хост/SSH, пользователи ОС, SSH-ключи,
+#      панели управления) — таблицы servers/server_links/server_gallery +
+#      миграция m012 (аддитивная). Сущность полностью независима от
+#      финансовых записей (fin_items) — своя таблица, свои связи, своя галерея.
+SCHEMA_VERSION = 12
 
 # Обязательные таблицы актуальной схемы. На «быстром пути» create_tables() даже
 # при совпадении версии проверяет их наличие (M6-06): частично повреждённую базу
@@ -32,6 +36,7 @@ _REQUIRED_TABLES = frozenset({
     "folders", "services", "accounts", "personal_data", "secret_questions",
     "recovery_phrases", "recovery_codes", "gallery", "linked_accounts", "app_meta",
     "fin_items", "fin_links", "fin_gallery",
+    "servers", "server_links", "server_gallery",
 })
 
 
@@ -174,6 +179,12 @@ class DbSchemaMixin(DbBase):
         # схему. Идемпотентно (IF NOT EXISTS): индексы создаются тут же.
         self._create_fin_tables(self.cursor)
 
+        # Таблицы VPS-серверов v12. Единый источник SQL с миграцией m012 (как
+        # у fin-таблиц выше) — оба пути создают одинаковую схему. Идемпотентно
+        # (IF NOT EXISTS): индексы создаются тут же. Сущность независима от
+        # fin_items (docs/ТЗ_VPS_Серверы.md §2) — своя таблица, свои FK.
+        self._create_server_tables(self.cursor)
+
         # Канонизация существующей таблицы связей (v6→v7): нормализация пар к
         # (min,max), дедуп и добавление CHECK. Выполняется ДО создания индексов
         # ниже, чтобы uq_linked_pair лёг уже на пересобранную таблицу.
@@ -292,7 +303,7 @@ class DbSchemaMixin(DbBase):
     # пути»: удалённый вручную UNIQUE-индекс раньше проходил незамеченным (M65-04).
     _INTEGRITY_INDEXES = frozenset({
         "uq_personal_account", "uq_phrases_account", "uq_linked_pair",
-        "uq_fin_link",
+        "uq_fin_link", "uq_server_link",
     })
 
     def _fast_path_fingerprint_ok(self):
@@ -562,6 +573,100 @@ class DbSchemaMixin(DbBase):
         executor.execute(
             DbSchemaMixin._fin_gallery_create_sql(if_not_exists=True))
         for stmt in DbSchemaMixin._fin_index_sql():
+            executor.execute(stmt)
+
+    # ----- Таблицы VPS-серверов v12 -----
+    # DDL — дословно из docs/ТЗ_VPS_Серверы.md §3. Единый источник для
+    # create_tables() (новые базы) и миграции m012 (базы v11): расхождение
+    # двух путей создания исключено по построению. Сущность полностью
+    # независима от fin-таблиц выше (§2 ТЗ) — своя таблица, свои связи/галерея.
+
+    @staticmethod
+    def _servers_create_sql(table_name="servers", if_not_exists=False):
+        """CREATE TABLE для servers — VPS-серверы (хост/SSH, ОС-пользователи,
+        SSH-ключи, панели управления — всё в JSON-payload).
+
+        service_id допускает NULL («свободный» сервер, как у accounts/
+        fin_items). data — JSON-полезная нагрузка ({"v":1,...}). paid_until —
+        экстракт-колонка (маркер [!], сортировка без парсинга JSON),
+        заполняется CRUD-слоем при каждом save из data (единственный
+        писатель)."""
+        ine = "IF NOT EXISTS " if if_not_exists else ""
+        return f"""
+            CREATE TABLE {ine}{table_name} (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                service_id INTEGER,
+                name TEXT NOT NULL,
+                data TEXT NOT NULL DEFAULT '{{}}',
+                paid_until TEXT,
+                is_favorite INTEGER DEFAULT 0,
+                sort_order INTEGER DEFAULT 0,
+                deleted_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (service_id) REFERENCES services(id) ON DELETE CASCADE
+            )
+        """
+
+    @staticmethod
+    def _server_links_create_sql(table_name="server_links", if_not_exists=False):
+        """CREATE TABLE для server_links — связь сервер↔аккаунт провайдера.
+
+        Связь однотипна (не нужна канонизация пар, в отличие от
+        linked_accounts) — достаточно UNIQUE(server_id, account_id) (индекс
+        uq_server_link). Обе стороны каскадно чистятся при удалении
+        сервера/аккаунта."""
+        ine = "IF NOT EXISTS " if if_not_exists else ""
+        return f"""
+            CREATE TABLE {ine}{table_name} (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                server_id INTEGER NOT NULL,
+                account_id INTEGER NOT NULL,
+                FOREIGN KEY (server_id) REFERENCES servers(id) ON DELETE CASCADE,
+                FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
+            )
+        """
+
+    @staticmethod
+    def _server_gallery_create_sql(table_name="server_gallery", if_not_exists=False):
+        """CREATE TABLE для server_gallery — скриншоты панелей/инвойсы (зеркало
+        gallery/fin_gallery, FK на server_id). Ленивая загрузка BLOB —
+        контракт H-6/M7-03."""
+        ine = "IF NOT EXISTS " if if_not_exists else ""
+        return f"""
+            CREATE TABLE {ine}{table_name} (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                server_id INTEGER NOT NULL,
+                description TEXT,
+                image_data BLOB,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (server_id) REFERENCES servers(id) ON DELETE CASCADE
+            )
+        """
+
+    @staticmethod
+    def _server_index_sql():
+        """Идемпотентные индексы таблиц серверов (единый источник для
+        create_tables и m012). uq_server_link — часть отпечатка целостности."""
+        return (
+            "CREATE INDEX IF NOT EXISTS idx_servers_service ON servers(service_id)",
+            "CREATE INDEX IF NOT EXISTS idx_servers_deleted ON servers(deleted_at)",
+            "CREATE INDEX IF NOT EXISTS idx_servers_paid_until ON servers(paid_until)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_server_link ON server_links(server_id, account_id)",
+            "CREATE INDEX IF NOT EXISTS idx_server_links_account ON server_links(account_id)",
+        )
+
+    @staticmethod
+    def _create_server_tables(executor):
+        """Создаёт таблицы серверов и индексы (идемпотентно). executor —
+        объект с .execute (self.cursor в create_tables либо conn в m012),
+        чтобы оба пути создания использовали один и тот же DDL."""
+        executor.execute(
+            DbSchemaMixin._servers_create_sql(if_not_exists=True))
+        executor.execute(
+            DbSchemaMixin._server_links_create_sql(if_not_exists=True))
+        executor.execute(
+            DbSchemaMixin._server_gallery_create_sql(if_not_exists=True))
+        for stmt in DbSchemaMixin._server_index_sql():
             executor.execute(stmt)
 
     def _rebuild_linked_accounts_if_needed(self):

@@ -4,10 +4,10 @@
 import logging
 from datetime import datetime
 from typing import Any, Optional
-from hranilka.core.domain import days_until_password_change
+from hranilka.core.domain import days_until_password_change, days_until_paid_until
 from hranilka.core.fin_domain import days_until_expiry
 from hranilka.core.fin_types import FIN_TYPES
-from hranilka.core.nodetypes import ACCOUNT, FIN_LEAF_TYPES
+from hranilka.core.nodetypes import ACCOUNT, FIN_LEAF_TYPES, SERVER
 from hranilka.data.database.state import DbBase
 
 
@@ -132,6 +132,35 @@ class DbTreeOpsMixin(DbBase):
         "card_last4", "expires_on",
     )
 
+    # ----- Серверы (VPS) — параллельная листовая ветка дерева -----
+    # Сервер НЕ переиспользует фин-инфраструктуру (docs/ТЗ_VPS_Серверы.md §2):
+    # своя таблица servers, свой узел, свой предикат is_server_node.
+
+    # Колонки servers, нужные дереву (без тяжёлого data JSON).
+    _TREE_SERVER_COLUMNS = ("id", "name", "is_favorite", "service_id", "paid_until")
+
+    @staticmethod
+    def _build_server_node(row) -> dict:
+        """Узел сервера для дерева, включая дни до «оплачен до»
+        (paid_days_left — экстракт-колонка paid_until, маркер [!])."""
+        return {
+            'type': SERVER,
+            'id': row['id'],
+            'name': row['name'],
+            'is_favorite': bool(row['is_favorite']),
+            'paid_days_left': days_until_paid_until(row['paid_until']),
+        }
+
+    def _sorted_servers(self, rows, sort_mode, descending=False):
+        """Сортирует серверы по режиму. Избранные всегда сверху. Режим pwd_due
+        к серверам не применяется (как у фин-записей) — порядок из SQL."""
+        nodes = [self._build_server_node(r) for r in rows]
+        if sort_mode == "name":
+            nodes.sort(key=lambda n: n['name'].lower(), reverse=descending)
+        # "created" — порядок задан в SQL; "manual"/"pwd_due" — по sort_order из SQL
+        nodes.sort(key=lambda n: not n['is_favorite'])
+        return nodes
+
     # Колонки accounts, нужные для построения/сортировки дерева (M-5). Тяжёлые
     # текстовые поля (password, notes, extra_info, url, ip и т.д.) в дерево не
     # входят — выбираем только используемые в _build_account_node/_sorted_accounts
@@ -162,12 +191,14 @@ class DbTreeOpsMixin(DbBase):
         return "name COLLATE NOCASE " + ("DESC" if descending else "ASC")
 
     def get_tree_structure(self, sort_mode="manual", descending=False,
-                           include_fin=True):
+                           include_fin=True, include_servers=False):
         """Структура дерева. sort_mode: manual | name | created | pwd_due.
         Верхний уровень: папки, затем сервисы вне папок, затем свободные аккаунты.
 
         include_fin=False — финансовые листья (карты/кошельки) не выбираются из
         БД и не попадают в дерево (опция «Показывать фин. инструменты» выключена).
+        include_servers=False (дефолт) — аналогично для VPS-серверов (опция
+        «Показывать серверы»).
 
         Один запрос на тип (папки/сервисы/аккаунты) вместо запроса на каждый
         контейнер — устранение N+1 (на больших базах было десятки SELECT'ов)."""
@@ -175,9 +206,11 @@ class DbTreeOpsMixin(DbBase):
         if sort_mode == "created":
             acc_order = "created_at " + ("DESC" if descending else "ASC")
             fin_order = "created_at " + ("DESC" if descending else "ASC")
+            server_order = "created_at " + ("DESC" if descending else "ASC")
         else:
             acc_order = "sort_order, account_name"
             fin_order = "sort_order, name"
+            server_order = "sort_order, name"
 
         self.cursor.execute(f"SELECT id, name FROM folders ORDER BY {order}")
         folders = self.cursor.fetchall()
@@ -208,6 +241,16 @@ class DbTreeOpsMixin(DbBase):
                 "Финансовые записи неизвестных типов пропущены в дереве: %s",
                 ", ".join(sorted(unknown_types)))
 
+        # Серверы — листья того же дерева, братья аккаунтов и фин-записей.
+        # При include_servers=False выборку пропускаем на стороне БД.
+        servers: list = []
+        if include_servers:
+            srv_cols = ", ".join(self._TREE_SERVER_COLUMNS)
+            self.cursor.execute(
+                f"SELECT {srv_cols} FROM servers WHERE deleted_at IS NULL "
+                f"ORDER BY {server_order}")
+            servers = self.cursor.fetchall()
+
         # Группируем в памяти, сохраняя порядок выборки (важно для режима
         # "created" и базового sort_order, поверх которых _sorted_accounts
         # доводит сортировку по имени/просрочке и поднимает избранные).
@@ -217,16 +260,22 @@ class DbTreeOpsMixin(DbBase):
         fin_by_service: dict[Any, list] = {}
         for it in fin_items:
             fin_by_service.setdefault(it["service_id"], []).append(it)
+        servers_by_service: dict[Any, list] = {}
+        for s in servers:
+            servers_by_service.setdefault(s["service_id"], []).append(s)
         services_by_folder: dict[Any, list] = {}
         for s in services:
             services_by_folder.setdefault(s["folder_id"], []).append(s)
 
         def leaf_nodes(service_id):
-            # Аккаунты, затем финансовые записи (братья внутри одного контейнера).
+            # Аккаунты, затем финансовые записи, затем серверы (братья внутри
+            # одного контейнера).
             return (self._sorted_accounts(
                         accounts_by_service.get(service_id, []), sort_mode, descending)
                     + self._sorted_fin_items(
-                        fin_by_service.get(service_id, []), sort_mode, descending))
+                        fin_by_service.get(service_id, []), sort_mode, descending)
+                    + self._sorted_servers(
+                        servers_by_service.get(service_id, []), sort_mode, descending))
 
         def service_node(s):
             return {'type': 'service', 'id': s['id'], 'name': s['name'],
@@ -320,12 +369,15 @@ class DbTreeOpsMixin(DbBase):
             "UPDATE accounts SET deleted_at = NULL WHERE id = ?", (account_id,))
 
     def get_deleted_count(self):
-        """Количество записей в корзине (аккаунты + финансовые записи)."""
+        """Количество записей в корзине (аккаунты + финансовые записи + серверы)."""
         self.cursor.execute(
             "SELECT COUNT(*) AS n FROM accounts WHERE deleted_at IS NOT NULL")
         n = self.cursor.fetchone()["n"]
         self.cursor.execute(
             "SELECT COUNT(*) AS n FROM fin_items WHERE deleted_at IS NOT NULL")
+        n += self.cursor.fetchone()["n"]
+        self.cursor.execute(
+            "SELECT COUNT(*) AS n FROM servers WHERE deleted_at IS NOT NULL")
         return n + self.cursor.fetchone()["n"]
 
     def get_deleted_accounts(self):
@@ -361,24 +413,32 @@ class DbTreeOpsMixin(DbBase):
         return result
 
     def get_deleted_records(self):
-        """Обобщённая выдача корзины: аккаунты и финансовые записи вместе,
-        каждая с полем type ('account'/'card'/'wallet'). Сортировка по времени
-        удаления (последние — сверху)."""
+        """Обобщённая выдача корзины: аккаунты, финансовые записи и серверы
+        вместе, каждая с полем type ('account'/'card'/'wallet'/'server').
+        Серверы в корзине видны независимо от тумблера show_servers (как
+        фин-записи от show_fin_instruments). Сортировка по времени удаления
+        (последние — сверху)."""
         records = [{"type": "account", "id": r["id"], "name": r["name"],
                     "deleted_at": r["deleted_at"]}
                    for r in self.get_deleted_accounts()]
         records += [{"type": r["type"], "id": r["id"], "name": r["name"],
                      "deleted_at": r["deleted_at"]}
                     for r in self.get_deleted_fin_items()]
+        records += [{"type": SERVER, "id": r["id"], "name": r["name"],
+                     "deleted_at": r["deleted_at"]}
+                    for r in self.get_deleted_servers()]
         # Последние удалённые — сверху (deleted_at убыв.; None — в конец).
         records.sort(key=lambda x: (x["deleted_at"] or ""), reverse=True)
         return records
 
     def empty_bin(self):
-        """Безвозвратно удаляет все записи из корзины (аккаунты и финансовые)."""
+        """Безвозвратно удаляет все записи из корзины (аккаунты, финансовые
+        записи и серверы)."""
         with self.conn:
             self.cursor.execute(
                 "DELETE FROM accounts WHERE deleted_at IS NOT NULL")
+            self.cursor.execute(
+                "DELETE FROM servers WHERE deleted_at IS NOT NULL")
             self.cursor.execute(
                 "DELETE FROM fin_items WHERE deleted_at IS NOT NULL")
         self._invalidate_gallery_bytes()   # каскад мог удалить картинки (M-9)
@@ -406,6 +466,9 @@ class DbTreeOpsMixin(DbBase):
         self.cursor.execute(
             "UPDATE fin_items SET service_id = NULL WHERE service_id = ?", (service_id,)
         )
+        self.cursor.execute(
+            "UPDATE servers SET service_id = NULL WHERE service_id = ?", (service_id,)
+        )
         self.cursor.execute("DELETE FROM services WHERE id = ?", (service_id,))
 
     def delete_folder_keep_content(self, folder_id):
@@ -423,15 +486,19 @@ class DbTreeOpsMixin(DbBase):
     def _descendant_leaf_keys_rows(self, node_type, node_id):
         """Ключи всех листьев внутри контейнера до его каскадного удаления.
 
-        Возвращает типизированные ``(node_type, id)``: id аккаунта и fin_items
-        находятся в разных таблицах и могут совпадать, поэтому голого id для
-        очистки UI-черновиков недостаточно.
+        Возвращает типизированные ``(node_type, id)``: id аккаунта, fin_items
+        и servers находятся в разных таблицах и могут совпадать, поэтому
+        голого id для очистки UI-черновиков недостаточно.
         """
         if node_type == "service":
             self.cursor.execute("SELECT id FROM accounts WHERE service_id = ?", (node_id,))
             account_ids = [r["id"] for r in self.cursor.fetchall()]
             self.cursor.execute(
                 "SELECT id, item_type FROM fin_items WHERE service_id = ?", (node_id,))
+            fin_rows = self.cursor.fetchall()
+            self.cursor.execute(
+                "SELECT id FROM servers WHERE service_id = ?", (node_id,))
+            server_ids = [r["id"] for r in self.cursor.fetchall()]
         elif node_type == "folder":
             self.cursor.execute(
                 "SELECT id FROM accounts WHERE service_id IN "
@@ -440,10 +507,16 @@ class DbTreeOpsMixin(DbBase):
             self.cursor.execute(
                 "SELECT id, item_type FROM fin_items WHERE service_id IN "
                 "(SELECT id FROM services WHERE folder_id = ?)", (node_id,))
+            fin_rows = self.cursor.fetchall()
+            self.cursor.execute(
+                "SELECT id FROM servers WHERE service_id IN "
+                "(SELECT id FROM services WHERE folder_id = ?)", (node_id,))
+            server_ids = [r["id"] for r in self.cursor.fetchall()]
         else:
             return []
         keys = [("account", aid) for aid in account_ids]
-        for row in self.cursor.fetchall():
+        keys += [(SERVER, sid) for sid in server_ids]
+        for row in fin_rows:
             spec = FIN_TYPES.get(row["item_type"])
             if spec is not None:
                 keys.append((spec.node_type, row["id"]))
@@ -453,9 +526,10 @@ class DbTreeOpsMixin(DbBase):
         """Атомарно удаляет набор узлов дерева в ОДНОЙ транзакции (M7-04).
 
         items — список кортежей (type, id) в заданном порядке, где type это
-        "folder" | "service" | "account" | "card" | "wallet" (финансовые листья).
-        keep=True — удалять контейнеры с сохранением содержимого (на уровень
-        выше). to_bin=True — листья отправлять в корзину (мягко), а не удалять.
+        "folder" | "service" | "account" | "card" | "wallet" (финансовые листья)
+        | "server". keep=True — удалять контейнеры с сохранением содержимого
+        (на уровень выше). to_bin=True — листья отправлять в корзину (мягко),
+        а не удалять.
 
         Возвращает типизированные ключи реально удалённых/перемещённых в
         корзину листьев (для очистки UI-кэша несохранённых правок ПОСЛЕ
@@ -492,12 +566,20 @@ class DbTreeOpsMixin(DbBase):
                         self._delete_account_rows(node_id)
                         gallery_touched = True
                     affected.append(("account", node_id))
+                elif node_type == SERVER:
+                    if to_bin:
+                        self._move_server_to_bin_rows(node_id)
+                    else:
+                        self._delete_server_rows(node_id)
+                        gallery_touched = True
+                    affected.append((SERVER, node_id))
                 else:
-                    # Тип вне дерева (folder/service/account/FIN_LEAF_TYPES) —
-                    # ошибка вызывающей стороны. Раньше это молча роутилось в
-                    # ветку account и удаляло чужой аккаунт с совпадающим id
-                    # (записи в корзине неизвестного/убранного из реестра
-                    # фин-типа отдавали свой сырой item_type как node_type).
+                    # Тип вне дерева (folder/service/account/FIN_LEAF_TYPES/
+                    # SERVER) — ошибка вызывающей стороны. Раньше это молча
+                    # роутилось в ветку account и удаляло чужой аккаунт с
+                    # совпадающим id (записи в корзине неизвестного/убранного
+                    # из реестра фин-типа отдавали свой сырой item_type как
+                    # node_type).
                     raise ValueError(f"Неизвестный тип узла: {node_type!r}")
         if gallery_touched:
             self._invalidate_gallery_bytes()   # каскад мог удалить картинки (M-9)

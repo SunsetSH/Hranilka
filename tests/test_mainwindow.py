@@ -13,15 +13,14 @@ from hranilka.core.nodetypes import ACCOUNT
 
 
 @pytest.fixture
-def window(qapp, tmp_path, monkeypatch):
+def window(qapp, tmp_path, monkeypatch, dispose_window):
     from hranilka.core import config
     monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "config.json")
     from hranilka.ui import main_window as main
     monkeypatch.setattr(main, "BASE_DIR", tmp_path)
     win = main.MainWindow()
     yield win
-    win.vault.shutdown()
-    win._instance_lock.release()
+    dispose_window(win)
 
 
 def test_window_builds_and_mixins_wired(window):
@@ -101,6 +100,152 @@ def test_idle_check_locks_plaintext_card(window, monkeypatch):
     window._last_activity = QDateTime.currentDateTime()
     window._check_idle()
     assert "locked" not in called
+
+
+@pytest.mark.parametrize("attr", ["_current_fin", "_current_server"])
+def test_idle_check_detects_open_fin_and_server_cards(window, monkeypatch, attr):
+    """H-01: раньше _check_idle в plaintext-режиме считал карточку открытой
+    только по _current_account_id и молча выходил, если была открыта
+    фин-запись/сервер (_current_account_id остаётся None) — секреты
+    оставались на экране без ограничения времени. Теперь используется общий
+    предикат _any_card_open()."""
+    from PySide6.QtCore import QDateTime
+
+    window.config.set("idle_lock_mins", 1)
+    setattr(window, attr, ("dummy", 1))        # как будто открыта карточка
+    window.is_editing = False
+    window._last_activity = QDateTime.currentDateTime().addSecs(-600)
+
+    called = {}
+    monkeypatch.setattr(window, "_lock_screen", lambda: called.setdefault("locked", True))
+    window._check_idle()
+    assert called.get("locked") is True
+
+
+@pytest.mark.parametrize("kind,editing", [
+    ("account", False), ("account", True),
+    ("fin", False), ("fin", True),
+    ("server", False), ("server", True),
+])
+def test_idle_lock_hides_and_stashes_every_card_type(window, kind, editing):
+    """H-01: idle-lock в plaintext-режиме прячет ЛЮБУЮ открытую карточку —
+    аккаунт, фин-запись или VPS-сервер — не только аккаунт (chrome.py
+    _check_idle/_lock_screen). В режиме редактирования черновик стэшится
+    (правки не теряются, узел получает маркер «НЕ СОХРАНЕНО»), все три
+    current-состояния и их data-объекты сбрасываются."""
+    from PySide6.QtCore import QDateTime
+    from hranilka.core.nodetypes import ACCOUNT, CARD, SERVER
+
+    db = window.db
+    window.config.set("idle_lock_mins", 1)
+    window.config.set("show_fin_instruments", True)
+    window.config.set("show_servers", True)
+    window.apply_config()
+
+    if kind == "account":
+        rec_id = db.add_account(None, "Акк")
+        node_type = ACCOUNT
+    elif kind == "fin":
+        sid = db.add_service("S")
+        rec_id = db.add_fin_item(sid, "bank_card", "Карта")
+        node_type = CARD
+    else:
+        rec_id = db.add_server(None, "Сервер")
+        node_type = SERVER
+
+    window._reload_tree()
+    window._select_node(node_type, rec_id)
+
+    if editing:
+        window.edit_current()
+        assert window.is_editing
+        if kind == "account":
+            window.tabs.f_notes.set_text("ЧЕРНОВИК")
+        elif kind == "fin":
+            window.fin_tabs._widgets["cvv"].set_text("999")
+        else:
+            window.server_tabs._widgets["hosting"].set_text("ЧЕРНОВИК")
+
+    window._last_activity = QDateTime.currentDateTime().addSecs(-600)
+    window._check_idle()
+
+    # Карточка скрыта, все current-состояния и data-объекты сброшены.
+    assert window.right_stack.currentWidget() is window.placeholder_label
+    assert window._current_account_id is None
+    assert window._current_fin is None
+    assert window._current_server is None
+    assert window.current_fin_data is None
+    assert window.current_server_data is None
+    assert not window.is_editing
+
+    if editing:
+        key = (node_type, rec_id)
+        assert key in window._edit_cache            # черновик не потерян
+        assert key in window._dirty_ids
+        item = window._find_leaf_item(node_type, rec_id)
+        assert "НЕ СОХРАНЕНО" in item.text(0)
+
+
+def test_lock_screen_encrypted_smoke(window, monkeypatch):
+    """Смоук на зашифрованный путь блокировки (H-01 не должен его сломать):
+    без несохранённых правок _lock_screen сбрасывает current-состояния и
+    маршрутизируется в _lock_vault; при незавершённых правках — откладывает
+    блокировку (H6-05), current-состояния НЕ трогает."""
+    window.db.encrypted = True
+    called = {}
+    monkeypatch.setattr(window, "_lock_vault", lambda: called.setdefault("vault", True))
+
+    window._current_account_id = 1
+    window.is_editing = False
+    window._lock_screen()
+    assert called.get("vault") is True
+    assert window._current_account_id is None
+
+    # Есть незавершённые правки -> блокировка откладывается, состояние не трогается.
+    called.clear()
+    window._current_fin = ("card", 2)
+    window.is_editing = True
+    window._lock_screen()
+    assert "vault" not in called
+    assert window._current_fin == ("card", 2)
+    assert window.is_editing is True
+
+
+def test_shortcut_edit_account_still_works(window):
+    """M-01 регрессия: шорткат «Редактировать» на открытом аккаунте работает
+    как раньше (has_target теперь считается через _any_card_open(), но для
+    аккаунта поведение не меняется)."""
+    db = window.db
+    aid = db.add_account(None, "Акк")
+    window._reload_tree()
+    window._select_node(ACCOUNT, aid)
+    assert not window.is_editing
+
+    window._sc_edit_account()
+    assert window.is_editing
+
+
+def test_shortcut_generators_work_on_account(window, monkeypatch):
+    """M-01 регрессия: генераторы пароля/ПД по-прежнему срабатывают в режиме
+    правки открытого аккаунта (позитивная проверка _current_account_id вместо
+    отрицания _current_fin не должна ничего сломать для аккаунта)."""
+    db = window.db
+    aid = db.add_account(None, "Акк")
+    window._reload_tree()
+    window._select_node(ACCOUNT, aid)
+    window.edit_current()
+    assert window.is_editing
+
+    called = {"password": False, "personal": False}
+    monkeypatch.setattr(window, "generate_password",
+                        lambda: called.__setitem__("password", True))
+    monkeypatch.setattr(window, "generate_personal_data",
+                        lambda: called.__setitem__("personal", True))
+
+    window._sc_gen_password()
+    window._sc_gen_personal()
+    assert called["password"] is True
+    assert called["personal"] is True
 
 
 def test_restore_plaintext_backup_no_winerror(window, tmp_path):
@@ -202,6 +347,121 @@ def test_orphan_upload_builds_draft_from_db(window):
     assert (ACCOUNT, aid) in window._dirty_ids
 
 
+# ─── H-02: сбой чтения fin_links/server_links в orphan-черновике аккаунта ──
+# (симметрично серверам/фин-записям, tests/test_server_ui.py/test_fin_ui.py)
+
+def test_orphan_draft_fin_and_server_links_unknown_on_read_failure(window, monkeypatch):
+    """Если чтение fin_links/server_links падает во время построения
+    черновика осиротевшей загрузки, черновик получает None («неизвестно»),
+    а НЕ [] («снять все связи») — иначе автосохранение при выходе стёрло бы
+    реальные привязки аккаунта."""
+    db = window.db
+    window.config.set("show_fin_instruments", True)
+    window.config.set("show_servers", True)
+
+    aid = db.add_account(None, "Акк")
+    iid = db.add_fin_item(None, "bank_card", "Карта")
+    db.set_item_links(iid, [aid])
+    sid = db.add_server(None, "Сервер")
+    db.set_server_links(sid, [aid])
+
+    window._current_account_id = None            # мы уже не на этой карточке
+    window._edit_cache.pop((ACCOUNT, aid), None)
+
+    def boom(*_a, **_k):
+        raise RuntimeError("database is locked")
+
+    with monkeypatch.context() as m:
+        m.setattr(db, "get_account_fin_links", boom)
+        m.setattr(db, "get_account_server_links", boom)
+        window._on_gallery_orphan_upload(aid, "скрин", b"\x89PNGfake")
+
+    assert (ACCOUNT, aid) in window._edit_cache
+    cached = window._edit_cache[(ACCOUNT, aid)]
+    assert cached["fin_links"] is None
+    assert cached["server_links"] is None
+
+    assert window._save_unsaved_before_exit() is True
+    assert db.get_item_links(iid) == [aid]        # fin_links НЕ стёрты
+    assert db.get_server_links(sid) == [aid]      # server_links НЕ стёрты
+
+
+def test_open_account_orphan_draft_with_unknown_links_refetches_and_preserves(
+        window):
+    """Черновик с fin_links=server_links=None (сконструирован напрямую):
+    обычное ОТКРЫТИЕ карточки аккаунта должно перечитать связи из БД, а не
+    показать пустые списки. Последующее ручное сохранение не стирает
+    исходные fin_links/server_links (симметрично серверам/записям,
+    tests/test_server_ui.py, tests/test_fin_ui.py)."""
+    from hranilka.core.nodetypes import ACCOUNT
+
+    db = window.db
+    window.config.set("show_fin_instruments", True)
+    window.config.set("show_servers", True)
+
+    aid = db.add_account(None, "Акк")
+    iid = db.add_fin_item(None, "bank_card", "Карта")
+    db.set_item_links(iid, [aid])
+    sid = db.add_server(None, "Сервер")
+    db.set_server_links(sid, [aid])
+    window._reload_tree()
+
+    window._edit_cache[(ACCOUNT, aid)] = {
+        "storage": db.load_account(aid), "links": [],
+        "fin_links": None, "server_links": None}
+    window._dirty_ids.add((ACCOUNT, aid))
+
+    window._select_node(ACCOUNT, aid)
+
+    cached = window._edit_cache[(ACCOUNT, aid)]
+    assert cached["fin_links"] == [iid]
+    assert cached["server_links"] == [sid]
+
+    window.save_current()
+
+    assert db.get_item_links(iid) == [aid]        # fin_links НЕ стёрты
+    assert db.get_server_links(sid) == [aid]      # server_links НЕ стёрты
+
+
+def test_open_account_orphan_draft_with_unknown_links_fails_closed_on_second_error(
+        window, monkeypatch):
+    """Если и повторное чтение fin_links/server_links при открытии черновика
+    падает — карточка НЕ открывается (fail-closed), а не молча показывает []."""
+    from hranilka.core.nodetypes import ACCOUNT
+    import hranilka.ui.theme as theme_mod
+
+    db = window.db
+    window.config.set("show_fin_instruments", True)
+    window.config.set("show_servers", True)
+
+    aid = db.add_account(None, "Акк")
+    iid = db.add_fin_item(None, "bank_card", "Карта")
+    db.set_item_links(iid, [aid])
+    sid = db.add_server(None, "Сервер")
+    db.set_server_links(sid, [aid])
+    window._reload_tree()
+
+    window._edit_cache[(ACCOUNT, aid)] = {
+        "storage": db.load_account(aid), "links": [],
+        "fin_links": None, "server_links": None}
+    window._dirty_ids.add((ACCOUNT, aid))
+
+    def boom(*_a, **_k):
+        raise RuntimeError("database is locked")
+
+    with monkeypatch.context() as m:
+        # _show_card_error зовёт модальный themed_info (d.exec) — гасим.
+        m.setattr(theme_mod, "themed_info", lambda *a, **k: None)
+        m.setattr(db, "get_account_fin_links", boom)
+        window._select_node(ACCOUNT, aid)
+
+    assert window._current_account_id is None      # карточка не открыта
+    cached = window._edit_cache[(ACCOUNT, aid)]
+    assert cached["fin_links"] is None              # черновик цел
+    assert db.get_item_links(iid) == [aid]          # связь в БД не тронута
+    assert db.get_server_links(sid) == [aid]
+
+
 # ─── H-07: fail-closed при повреждённом файле БД ──────────────────────────────
 
 def test_corrupt_db_fail_closed_offers_recovery(qapp, tmp_path, monkeypatch):
@@ -227,7 +487,7 @@ def test_corrupt_db_fail_closed_offers_recovery(qapp, tmp_path, monkeypatch):
     assert (tmp_path / "hranilka.db").read_bytes() == garbage
 
 
-def test_corrupt_db_recovery_restores_and_opens(qapp, tmp_path, monkeypatch):
+def test_corrupt_db_recovery_restores_and_opens(qapp, tmp_path, monkeypatch, dispose_window):
     """Восстановление из валидного бэкапа после обнаружения порчи: окно
     открывается, повреждённый файл отложен рядом (*.corrupt-*)."""
     from hranilka.core import config
@@ -241,6 +501,7 @@ def test_corrupt_db_recovery_restores_and_opens(qapp, tmp_path, monkeypatch):
     bdb.connect()
     bdb.create_tables()
     bdb.close()
+    bdb.shutdown_executor()
 
     (tmp_path / "hranilka.db").write_bytes(b"garbage-not-sqlite" * 64)
 
@@ -257,8 +518,7 @@ def test_corrupt_db_recovery_restores_and_opens(qapp, tmp_path, monkeypatch):
         assert win.db.conn is not None
         assert list(tmp_path.glob("hranilka.db.corrupt-*"))
     finally:
-        win.vault.shutdown()
-        win._instance_lock.release()
+        dispose_window(win)
 
 
 def test_busy_db_not_treated_as_corrupt(qapp, tmp_path, monkeypatch):
@@ -277,6 +537,7 @@ def test_busy_db_not_treated_as_corrupt(qapp, tmp_path, monkeypatch):
     d.connect()
     d.create_tables()
     d.close()
+    d.shutdown_executor()
 
     # Внешний процесс держит эксклюзивную блокировку.
     holder = sqlite3.connect(str(db_path))

@@ -30,18 +30,20 @@ from hranilka.data.database.gallery_ops import DbGalleryOpsMixin
 from hranilka.data.database.persistence import DbPersistenceMixin
 from hranilka.data.database.schema import (SCHEMA_VERSION, _REQUIRED_TABLES,
                                            DbSchemaMixin)
+from hranilka.data.database.servers import DbServersMixin
 from hranilka.data.database.tree_ops import DbTreeOpsMixin
-from hranilka.data.errors import (FutureSchemaError, PreMigrationBackupError,
-                                  StaleSessionError, VaultConflictError)
+from hranilka.data.errors import (CorruptedPayloadError, FutureSchemaError,
+                                  PreMigrationBackupError, StaleSessionError,
+                                  VaultConflictError)
 
-__all__ = ["Database", "SCHEMA_VERSION", "FutureSchemaError",
-           "PreMigrationBackupError", "StaleSessionError",
-           "VaultConflictError"]
+__all__ = ["Database", "SCHEMA_VERSION", "CorruptedPayloadError",
+           "FutureSchemaError", "PreMigrationBackupError",
+           "StaleSessionError", "VaultConflictError"]
 
 
 class Database(DbConcurrencyMixin, DbPersistenceMixin, DbSchemaMixin,
                DbTreeOpsMixin, DbAccountCardMixin, DbGalleryOpsMixin,
-               DbFinItemsMixin, DbBulkOpsMixin):
+               DbFinItemsMixin, DbServersMixin, DbBulkOpsMixin):
     def __init__(self, db_path: str = "hranilka.db") -> None:
         self.db_path = db_path
         # conn/cursor — None вне открытой сессии (до connect()/после lock()); все
@@ -98,10 +100,12 @@ class Database(DbConcurrencyMixin, DbPersistenceMixin, DbSchemaMixin,
         после очистки FK оставались ВЫКЛЮЧЕННЫМИ до перезапуска — все
         последующие ON DELETE CASCADE/SET NULL переставали работать."""
         with self.conn:
-            # Финансовые записи не являются дочерними accounts: свободные
-            # карты/кошельки пережили бы очистку, если не удалить их явно.
-            # Удаляем дочерние таблицы раньше владельцев и не отключаем FK.
-            for table in ("fin_gallery", "fin_links", "fin_items", "gallery",
+            # Финансовые записи и серверы не являются дочерними accounts:
+            # свободные карты/кошельки/серверы пережили бы очистку, если не
+            # удалить их явно. Удаляем дочерние таблицы раньше владельцев и
+            # не отключаем FK.
+            for table in ("fin_gallery", "fin_links", "fin_items",
+                           "server_gallery", "server_links", "servers", "gallery",
                            "recovery_codes", "recovery_phrases",
                            "secret_questions", "personal_data", "linked_accounts",
                            "accounts", "services", "folders"):

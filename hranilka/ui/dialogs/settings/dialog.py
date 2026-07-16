@@ -214,6 +214,7 @@ class SettingsDialog(SettingsAppearanceMixin, SettingsSecurityMixin,
             "clipboard_clear_on_exit": self.clip_clear_exit_check.isChecked(),
             "recycle_bin_enabled": self.recycle_bin_check.isChecked(),
             "show_fin_instruments": self.show_fin_check.isChecked(),
+            "show_servers": self.show_servers_check.isChecked(),
             "gallery_thumb_preload": self._thumb_preload_value(),
             "text_color": self.config.get("text_color"),
             "tree_bg_color": self.config.get("tree_bg_color"),
@@ -394,6 +395,24 @@ class SettingsDialog(SettingsAppearanceMixin, SettingsSecurityMixin,
                 return True
         return new_val
 
+    def _resolve_show_servers(self) -> bool:
+        """Значение show_servers для применения. При переходе True→False с
+        существующими серверами (включая корзину) — themed-подтверждение;
+        отказ возвращает чекбокс в True (остальные настройки применяются)."""
+        new_val = self.show_servers_check.isChecked()
+        old_val = self.config.get("show_servers", False)
+        if (old_val and not new_val and self._db is not None
+                and self._db.count_servers() > 0):
+            if not themed_confirm(
+                    self.config, self, "Скрыть серверы",
+                    "Серверы будут скрыты из интерфейса (дерево, связи, "
+                    "создание). Записи останутся в БД, корзина продолжит их "
+                    "показывать. Несохранённые правки серверов будут "
+                    "сброшены. Продолжить?"):
+                self.show_servers_check.setChecked(True)
+                return True
+        return new_val
+
     def _apply_settings(self):
         self.config.set("font",              self.font_combo.currentText())
         self.config.set("font_size",         int(self.font_size_combo.currentText()))
@@ -408,9 +427,10 @@ class SettingsDialog(SettingsAppearanceMixin, SettingsSecurityMixin,
         self.config.set("clipboard_clear_secs",    int(self.clip_clear_secs.text() or "0"))
         self.config.set("clipboard_clear_on_exit", self.clip_clear_exit_check.isChecked())
         self.config.set("recycle_bin_enabled",     self.recycle_bin_check.isChecked())
-        # show_fin_instruments — с предупреждением при переходе True→False с
-        # существующими фин-записями (до записи нового значения).
+        # show_fin_instruments / show_servers — с предупреждением при переходе
+        # True→False с существующими записями (до записи нового значения).
         self.config.set("show_fin_instruments",    self._resolve_show_fin())
+        self.config.set("show_servers",             self._resolve_show_servers())
         self.config.set("image_downscale",         self.image_downscale_check.isChecked())
         self.config.set("gallery_thumb_preload",   self._thumb_preload_value())
         # Шорткаты: в конфиг кладём только отличия от дефолтов (компактно и

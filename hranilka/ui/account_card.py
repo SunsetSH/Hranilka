@@ -9,11 +9,11 @@ import logging
 from PySide6.QtCore import QDateTime
 from PySide6.QtWidgets import QDialog
 
-from hranilka.core.nodetypes import ACCOUNT
+from hranilka.core.nodetypes import ACCOUNT, SERVER
 from hranilka.data.database import StaleSessionError
 from hranilka.data.models import AccountData
 from hranilka.ui.generator_dialog import GeneratorSettingsDialog
-from hranilka.ui.widgets import fin_item_display
+from hranilka.ui.widgets import fin_item_display, server_item_display
 from hranilka.generators import password_gen
 from hranilka.generators import pd_generator
 from hranilka.core import util
@@ -33,6 +33,23 @@ class AccountCardMixin:
         выключенной опции возвращает None: скрытый пустой виджет НЕ должен
         стереть реальные связи fin_links (None не трогает их в БД)."""
         return self.tabs.f_fin_linked.get_data() if self._fin_enabled() else None
+
+    def _server_enabled(self):
+        """Показывать ли VPS-серверы в интерфейсе (docs/ТЗ_VPS_Серверы.md §4)."""
+        return self.config.get("show_servers", False)
+
+    def _current_server_link_ids(self):
+        """id привязанных серверов карточки для сохранения/стеша. При
+        выключенной опции возвращает None: скрытый пустой виджет НЕ должен
+        стереть реальные связи server_links (None не трогает их в БД)."""
+        return self.tabs.f_server_linked.get_data() if self._server_enabled() else None
+
+    def _resolve_server_link_rows(self, ids):
+        """Строки привязанных серверов по их id (восстановление из кеша
+        правок). Вызывается в фоновом потоке БД; серверы из корзины/удалённые
+        отфильтровываются (list_servers отдаёт только живые)."""
+        by_id = {r["id"]: r for r in self.db.list_servers()}
+        return [by_id[i] for i in ids if i in by_id]
 
     def _show_placeholder(self):
         # Правая панель — QStackedWidget (заглушка / аккаунт / фин-запись);
@@ -151,16 +168,35 @@ class AccountCardMixin:
                     fin_rows = await self.db.run_async(
                         self.db.get_account_fin_links, account_id,
                         _session=session)
+                    fin_link_ids = [r["id"] for r in fin_rows]
                 except StaleSessionError:
                     return
                 except Exception as e:           # noqa: BLE001
+                    # H-02: fin_link_ids остаётся None («неизвестно»), а НЕ []
+                    # — иначе последующее сохранение этого черновика стёрло бы
+                    # реальные fin_links (см. _current_fin_link_ids/
+                    # save_account_with_links: None = «не трогать»).
                     logging.error("Не удалось подгрузить фин-связи для "
                                   "осиротевшей загрузки: %s", e, exc_info=e)
-                    fin_rows = []
-                fin_link_ids = [r["id"] for r in fin_rows]
+            # Привязанные серверы — тот же паттерн, независимо (docs
+            # /ТЗ_VPS_Серверы.md §4): None при выключенной опции.
+            server_link_ids = None
+            if self._server_enabled():
+                try:
+                    server_rows = await self.db.run_async(
+                        self.db.get_account_server_links, account_id,
+                        _session=session)
+                    server_link_ids = [r["id"] for r in server_rows]
+                except StaleSessionError:
+                    return
+                except Exception as e:           # noqa: BLE001
+                    # H-02: server_link_ids остаётся None — то же обоснование,
+                    # что у fin_link_ids выше.
+                    logging.error("Не удалось подгрузить связи серверов для "
+                                  "осиротевшей загрузки: %s", e, exc_info=e)
             self._edit_cache[(ACCOUNT, account_id)] = {
                 "storage": acc.to_storage(), "links": link_ids,
-                "fin_links": fin_link_ids}
+                "fin_links": fin_link_ids, "server_links": server_link_ids}
         self._dirty_ids.add((ACCOUNT, account_id))
         self._refresh_dirty_markers(account_id)
 
@@ -177,6 +213,8 @@ class AccountCardMixin:
             # Галереи фин-карточек (по одной на тип реестра) — тоже гасим.
             for fin_tabs in self.fin_tabs_by_type.values():
                 fin_tabs.f_gallery_widget.cancel_all_tasks()
+            # Галерея серверной карточки — независимо (docs/ТЗ_VPS_Серверы.md §2).
+            self.server_tabs.f_gallery_widget.cancel_all_tasks()
         except Exception as e:                       # noqa: BLE001 — teardown-хардненинг
             logging.warning("Не удалось отменить задачи галереи: %s", e)
 
@@ -246,20 +284,47 @@ class AccountCardMixin:
                 cached = self._edit_cache[(ACCOUNT, new_id)]
                 links = await self.db.run_async(
                     self._resolve_link_names, cached["links"], _session=session)
-                # fin_links в черновике может быть None (стеш при выключенной
-                # опции); при выключенной опции фин-связи не читаем вовсе.
+                # fin_links/server_links в черновике могут быть None (H-02:
+                # сбой чтения при осиротевшей загрузке галереи, либо стеш при
+                # выключенной опции). При выключенной опции секция скрыта и
+                # связи не читаем вовсе; но если опция ВКЛЮЧЕНА, а связи всё же
+                # None — это именно H-02: не подменяем молча пустым списком
+                # (сохранение стёрло бы реальные привязки), пытаемся
+                # перечитать снимок из БД; вторая неудача — fail-closed.
                 fin_links = []
                 if self._fin_enabled():
+                    fin_link_ids = cached.get("fin_links")
+                    if fin_link_ids is None:
+                        fin_link_ids = await self._recover_none_draft_links(
+                            new_id, self.db.get_account_fin_links, session, gen,
+                            "карт/кошельков")
+                        if fin_link_ids is None:
+                            return
+                        cached["fin_links"] = fin_link_ids
                     fin_links = await self.db.run_async(
-                        self._resolve_fin_link_rows,
-                        cached.get("fin_links") or [], _session=session)
+                        self._resolve_fin_link_rows, fin_link_ids,
+                        _session=session)
+                # server_links — тот же паттерн, независимо (docs/ТЗ_VPS_Серверы.md §4).
+                server_links = []
+                if self._server_enabled():
+                    server_link_ids = cached.get("server_links")
+                    if server_link_ids is None:
+                        server_link_ids = await self._recover_none_draft_links(
+                            new_id, self.db.get_account_server_links, session,
+                            gen, "серверов")
+                        if server_link_ids is None:
+                            return
+                        cached["server_links"] = server_link_ids
+                    server_links = await self.db.run_async(
+                        self._resolve_server_link_rows, server_link_ids,
+                        _session=session)
                 other_bytes = await self.db.run_async(
                     self.db.gallery_total_bytes, new_id, _session=session)
                 if gen != self._card_gen:
                     return
                 self.current_account_data = AccountData.from_storage(cached["storage"])
                 self.load_data_to_ui(links=links, other_bytes=other_bytes,
-                                     fin_links=fin_links)
+                                     fin_links=fin_links, server_links=server_links)
                 self.is_editing = True
                 self.tabs.set_all_editable(True)
                 self.edit_btn.hide(); self.save_btn.show(); self.cancel_btn.show()
@@ -283,6 +348,11 @@ class AccountCardMixin:
                 if self._fin_enabled():
                     fin_links = await self.db.run_async(
                         self.db.get_account_fin_links, new_id, _session=session)
+                # Связи серверов — тот же паттерн, независимо (docs/ТЗ_VPS_Серверы.md §4).
+                server_links = []
+                if self._server_enabled():
+                    server_links = await self.db.run_async(
+                        self.db.get_account_server_links, new_id, _session=session)
                 other_bytes = await self.db.run_async(
                     self.db.gallery_total_bytes, new_id, _session=session)
                 if gen != self._card_gen:
@@ -290,7 +360,7 @@ class AccountCardMixin:
                 self.current_account_data = AccountData.from_storage(storage)
                 self.is_editing = False
                 self.load_data_to_ui(links=links, other_bytes=other_bytes,
-                                     fin_links=fin_links)
+                                     fin_links=fin_links, server_links=server_links)
                 self.tabs.set_all_editable(False)
                 self.edit_btn.show(); self.save_btn.hide(); self.cancel_btn.hide()
                 if self._edit_on_load_id == new_id:
@@ -335,6 +405,29 @@ class AccountCardMixin:
         отфильтровываются (list_fin_items отдаёт только живые)."""
         by_id = {r["id"]: r for r in self.db.list_fin_items()}
         return [by_id[i] for i in ids if i in by_id]
+
+    async def _recover_none_draft_links(self, account_id, getter, session, gen, what):
+        """H-02: fin_links/server_links черновика неизвестны (None) — вместо
+        молчаливой подмены на [] пытается перечитать актуальный список id из
+        БД (getter — db.get_account_fin_links/get_account_server_links).
+        StaleSessionError пробрасывается вызывающему (его перехватывает общий
+        except в _load_account_into_ui — молчаливый выход). Любая другая
+        ошибка — карточка открывается fail-closed вместо показа пустого
+        списка; возвращает None как сигнал вызывающему прервать открытие."""
+        try:
+            rows = await self.db.run_async(getter, account_id, _session=session)
+        except StaleSessionError:
+            raise
+        except Exception as e:                            # noqa: BLE001
+            if gen == self._card_gen:
+                self._current_account_id = None
+                self.is_editing = False
+                self._show_placeholder()
+                self._show_card_error(
+                    "Не удалось восстановить связи черновика — открытие "
+                    f"отменено, чтобы не потерять привязанные {what}", e)
+            return None
+        return [r["id"] for r in rows]
 
     def _collect_account_data(self):
         """Собирает AccountData из полей UI (без записи в БД)."""
@@ -385,13 +478,15 @@ class AccountCardMixin:
 
     def _stash_current_edits(self, account_id):
         """Сохраняет несохранённые правки аккаунта в память (не в БД).
-        fin_links=None при выключенной опции — сохранение из такого черновика
-        не тронет связи fin_links (см. _current_fin_link_ids)."""
+        fin_links/server_links=None при выключенной опции — сохранение из
+        такого черновика не тронет соответствующие связи (см.
+        _current_fin_link_ids/_current_server_link_ids)."""
         d = self._collect_account_data()
         self._edit_cache[(ACCOUNT, account_id)] = {
             "storage": d.to_storage(),
             "links": self.tabs.f_linked.get_data(),
             "fin_links": self._current_fin_link_ids(),
+            "server_links": self._current_server_link_ids(),
         }
         self._dirty_ids.add((ACCOUNT, account_id))
 
@@ -406,7 +501,8 @@ class AccountCardMixin:
         for it in self._iter_items():
             self._apply_item_style(it, self._node(it))
 
-    def load_data_to_ui(self, links=None, other_bytes=None, fin_links=None):
+    def load_data_to_ui(self, links=None, other_bytes=None, fin_links=None,
+                        server_links=None):
         d = self.current_account_data
         self.tabs.f_name.set_text(d.name)
         self.tabs.f_url.set_text(d.url)
@@ -472,6 +568,15 @@ class AccountCardMixin:
                          if node and self._fin_enabled() else [])
         self.tabs.f_fin_linked.set_data(fin_links)
 
+        # Привязанные серверы — тот же горячий/холодный паттерн, независимо
+        # (docs/ТЗ_VPS_Серверы.md §4). При выключенной опции секция скрыта —
+        # БД не читаем, список пуст.
+        if server_links is None:
+            node = self._node(self.current_tree_item)
+            server_links = (self.db.get_account_server_links(node["id"])
+                            if node and self._server_enabled() else [])
+        self.tabs.f_server_linked.set_data(server_links)
+
     def toggle_edit_mode(self):
         if self._card_busy:
             return                              # идёт загрузка/сохранение — не входим в правку
@@ -513,13 +618,17 @@ class AccountCardMixin:
             if self._fin_enabled():
                 fin_links = await self.db.run_async(
                     self.db.get_account_fin_links, aid, _session=session)
+            server_links = []
+            if self._server_enabled():
+                server_links = await self.db.run_async(
+                    self.db.get_account_server_links, aid, _session=session)
             other_bytes = await self.db.run_async(
                 self.db.gallery_total_bytes, aid, _session=session)
             if gen != self._card_gen:
                 return
             self.current_account_data = AccountData.from_storage(storage)
             self.load_data_to_ui(links=links, other_bytes=other_bytes,
-                                 fin_links=fin_links)
+                                 fin_links=fin_links, server_links=server_links)
             self.tabs.set_all_editable(False)
             self.edit_btn.show()
             self.save_btn.hide()
@@ -569,22 +678,25 @@ class AccountCardMixin:
         d = self._collect_account_data()
         storage = d.to_storage()
         link_ids = self.tabs.f_linked.get_data()
-        # При выключенной опции показа фин-инструментов — None: скрытый пустой
-        # виджет НЕ должен стереть реальные связи fin_links (КРИТИЧНЫЙ инвариант).
+        # При выключенной опции показа фин-инструментов/серверов — None:
+        # скрытый пустой виджет НЕ должен стереть реальные связи
+        # fin_links/server_links (КРИТИЧНЫЙ инвариант).
         fin_link_ids = self._current_fin_link_ids()
-        # Запись карточки и всех связей (аккаунты + карты/кошельки) — атомарно,
-        # в ОДНОЙ транзакции, в фоновом потоке.
+        server_link_ids = self._current_server_link_ids()
+        # Запись карточки и всех связей (аккаунты + карты/кошельки + серверы) —
+        # атомарно, в ОДНОЙ транзакции, в фоновом потоке.
         try:
             gallery_ids = await self.db.run_async(
                 self.db.save_account_with_links, aid, storage, link_ids,
-                fin_link_ids, _session=session)
+                fin_link_ids, server_link_ids, _session=session)
         except StaleSessionError:
             # БД сменена во время записи (restore, вкл/выкл шифрования) — запись
             # не выполнена. Если карточка всё ещё открыта (gen совпал), её НЕЛЬЗЯ
             # оставлять busy/read-only: возвращаем черновик в кеш и разблокируем.
             if gen == self._card_gen:
                 self._edit_cache[(ACCOUNT, aid)] = {"storage": storage, "links": link_ids,
-                                                    "fin_links": fin_link_ids}
+                                                    "fin_links": fin_link_ids,
+                                                    "server_links": server_link_ids}
                 self._dirty_ids.add((ACCOUNT, aid))
                 self._refresh_dirty_markers(aid)
                 self.tabs.set_all_editable(True)
@@ -599,7 +711,8 @@ class AccountCardMixin:
                 # мог повторить сохранение, и показываем причину. Поля возвращаем в
                 # editable — пользователь остаётся в режиме правки (H65-01).
                 self._edit_cache[(ACCOUNT, aid)] = {"storage": storage, "links": link_ids,
-                                                    "fin_links": fin_link_ids}
+                                                    "fin_links": fin_link_ids,
+                                                    "server_links": server_link_ids}
                 self._dirty_ids.add((ACCOUNT, aid))
                 self._refresh_dirty_markers(aid)
                 self.tabs.set_all_editable(True)
@@ -733,6 +846,42 @@ class AccountCardMixin:
             links = [it for it in items if it["id"] in chosen_set]
             self.tabs.f_fin_linked.set_data(links)
             self.tabs.f_fin_linked.set_editable(self.is_editing)
+
+    # ----- Привязанные серверы (docs/ТЗ_VPS_Серверы.md §4) -----
+    # Независимая связь account↔server (не финансовая, docs §2) — тот же
+    # UX-паттерн, что и привязка карт/кошельков выше.
+
+    def on_server_link_navigate(self, server_id):
+        """Клик по привязанному серверу — выделить его узел в дереве."""
+        self._select_node(SERVER, server_id)
+
+    def on_add_server_link_requested(self):
+        """«+ ПРИВЯЗАТЬ» секции «Привязанные серверы»: выбор из живых серверов.
+        Чтение списка — в фоновом потоке БД (H-8), диалог — после загрузки."""
+        if self._node(self.current_tree_item) is None:
+            return
+        util.fire(self._add_server_link_async())
+
+    async def _add_server_link_async(self):
+        session = self.db.current_session()
+        try:
+            servers = await self.db.run_async(
+                self.db.list_servers, _session=session)
+        except StaleSessionError:
+            return
+        except Exception as e:                       # noqa: BLE001
+            self._show_card_error("Не удалось загрузить список серверов", e)
+            return
+        candidates = [{"id": s["id"], "name": server_item_display(s)}
+                      for s in servers]
+        chosen, ok = theme.themed_multiselect(
+            self.config, self, "Привязать серверы", candidates,
+            self.tabs.f_server_linked.get_data())
+        if ok:
+            chosen_set = set(chosen)
+            links = [s for s in servers if s["id"] in chosen_set]
+            self.tabs.f_server_linked.set_data(links)
+            self.tabs.f_server_linked.set_editable(self.is_editing)
 
     # ----- Статус-бар -----
 

@@ -16,7 +16,7 @@ from hranilka.ui.dialogs.export_dialog import ExportDialog
 
 
 @pytest.fixture
-def window(qapp, tmp_path, monkeypatch):
+def window(qapp, tmp_path, monkeypatch, dispose_window):
     from hranilka.core import config
     monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "config.json")
     from hranilka.ui import main_window as main
@@ -26,8 +26,7 @@ def window(qapp, tmp_path, monkeypatch):
     win.config.set("show_fin_instruments", True)
     win.apply_config()
     yield win
-    win.vault.shutdown()
-    win._instance_lock.release()
+    dispose_window(win)
 
 
 # ─── 1. Дескриптор bank_card ──────────────────────────────────────────────────
@@ -358,23 +357,25 @@ def test_export_dialog_show_fin_false_hides_and_excludes(window, tmp_path,
     """ExportDialog при show_fin=False: чекбоксы фин/секретов скрыты, Options
     жёстко include_fin=False/include_fin_secrets=False."""
     from hranilka.ui.dialogs import export_dialog as ed_mod
+    from pathlib import Path
     from PySide6.QtWidgets import QFileDialog
     db = window.db
     db.add_fin_item(None, "bank_card", "Карта")
-    tree = db.export_subtree()
-    dlg = ExportDialog(window.config, tree, "Т", None, show_fin=False)
+    dlg = ExportDialog(window.config, db, None, None, "Т", None, show_fin=False)
     assert dlg._chk_fin.isHidden()
     assert dlg._chk_fin_secrets.isHidden()
 
     captured = {}
-    monkeypatch.setitem(
-        export_mod.FORMATS, "html",
-        (lambda t, o, p: captured.update(opts=o), ".html", "f"))
+
+    def _fake_html(t, o, p):
+        captured["opts"] = o
+        Path(p).write_text("")           # write_atomic делает os.replace(p, target)
+    monkeypatch.setitem(export_mod.FORMATS, "html", (_fake_html, ".html", "f"))
     monkeypatch.setattr(
         QFileDialog, "getSaveFileName",
         staticmethod(lambda *a, **k: (str(tmp_path / "e.html"), "")))
     monkeypatch.setattr(ed_mod, "themed_info", lambda *a, **k: None)
-    dlg._do_export()
+    dlg._do_export()                      # util.fire без loop — выполняется синхронно
     assert captured["opts"].include_fin is False
     assert captured["opts"].include_fin_secrets is False
     dlg.deleteLater()
@@ -382,9 +383,38 @@ def test_export_dialog_show_fin_false_hides_and_excludes(window, tmp_path,
 
 def test_export_dialog_show_fin_true_renamed_checkbox(window):
     """При show_fin=True чекбокс переименован в «Финансовые инструменты»."""
-    dlg = ExportDialog(window.config, [], "Т", None, show_fin=True)
+    dlg = ExportDialog(window.config, window.db, None, None, "Т", None, show_fin=True)
     assert dlg._chk_fin.text() == "Финансовые инструменты"
     assert not dlg._chk_fin.isHidden()
+    dlg.deleteLater()
+
+
+def test_export_dialog_all_checkboxes_checked_by_default(window):
+    """Все чекбоксы «Что включить» по умолчанию ВКЛЮЧЕНЫ (УИ §2026-07-15) —
+    в т.ч. критичные секреты фин/серверов, когда сами разделы включены."""
+    dlg = ExportDialog(window.config, window.db, None, None, "Т", None,
+                       show_fin=True, show_servers=True)
+    for chk in (dlg._chk_basic, dlg._chk_other, dlg._chk_gallery,
+               dlg._chk_fin, dlg._chk_fin_secrets,
+               dlg._chk_servers, dlg._chk_server_secrets):
+        assert chk.isChecked(), chk.text()
+    assert dlg._chk_fin_secrets.isEnabled()
+    assert dlg._chk_server_secrets.isEnabled()
+    dlg.deleteLater()
+
+
+def test_export_dialog_fin_secrets_disabled_when_fin_unchecked(window):
+    """Снятие «Финансовые инструменты» деактивирует чекбокс критичных
+    секретов; возврат галки — активирует обратно (значение при этом не
+    сбрасывается — семантика «не включать» уже следует из include_fin=False)."""
+    dlg = ExportDialog(window.config, window.db, None, None, "Т", None, show_fin=True)
+    assert dlg._chk_fin.isChecked() and dlg._chk_fin_secrets.isEnabled()
+
+    dlg._chk_fin.setChecked(False)
+    assert not dlg._chk_fin_secrets.isEnabled()
+
+    dlg._chk_fin.setChecked(True)
+    assert dlg._chk_fin_secrets.isEnabled()
     dlg.deleteLater()
 
 
@@ -392,13 +422,15 @@ def test_export_dialog_show_fin_true_renamed_checkbox(window):
 
 def test_backup_page_export_all_resolves_and_passes_show_fin(window, monkeypatch):
     """_do_export_all резолвит имя ExportDialog (раньше NameError) и передаёт
-    show_fin из config."""
+    show_fin/show_servers из config."""
     from hranilka.ui.dialogs.settings import backup_page
     calls = {}
 
     class FakeDialog:
-        def __init__(self, config, tree, title, parent, show_fin=True):
+        def __init__(self, config, db, node_type, node_id, title, parent,
+                    show_fin=True, show_servers=False):
             calls["show_fin"] = show_fin
+            calls["show_servers"] = show_servers
 
         def exec(self):
             calls["exec"] = True
@@ -406,8 +438,9 @@ def test_backup_page_export_all_resolves_and_passes_show_fin(window, monkeypatch
     monkeypatch.setattr(backup_page, "ExportDialog", FakeDialog)
     dlg = _settings_dialog(window)
     window.config.set("show_fin_instruments", False)
+    window.config.set("show_servers", True)
     dlg._do_export_all()
-    assert calls == {"show_fin": False, "exec": True}
+    assert calls == {"show_fin": False, "show_servers": True, "exec": True}
     dlg.deleteLater()
 
 

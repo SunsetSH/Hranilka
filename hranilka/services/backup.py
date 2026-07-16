@@ -62,8 +62,11 @@ def create_backup(db_path: str, backup_folder: str, keep_count: int = 5) -> Path
         os.replace(tmp, dest)
         _fsync_dir(folder)              # устойчивость самого переименования
     finally:
+        # tmp остаётся только при обрыве копирования — это частичная plaintext-
+        # копия БД (пароли/BLOB при выключенном шифровании), затираем перед
+        # удалением, как и остальные временные полные копии БД (M-02).
         if tmp.exists():
-            tmp.unlink(missing_ok=True)
+            best_effort_wipe(str(tmp))
     _rotate(folder, keep_count)
     return dest
 
@@ -213,20 +216,25 @@ def _rollback_or_preserve(rollback: Path, dst: Path, had_dst: bool) -> None:
 
 
 def delete_all_backups(backup_folder: str) -> int:
-    """Удаляет все файлы бэкапов в папке. Возвращает число удалённых файлов."""
+    """Удаляет все файлы бэкапов в папке. Возвращает число удалённых файлов.
+
+    Бэкап при выключенном шифровании — полная plaintext-копия БД, поэтому
+    содержимое затирается через best_effort_wipe перед удалением, как и
+    остальные временные/удаляемые полные копии БД в проекте (M-02)."""
     count = 0
     for p in list_backups(backup_folder):
-        try:
-            p.unlink(missing_ok=True)
+        best_effort_wipe(str(p))
+        if not p.exists():
             count += 1
-        except OSError:
-            pass
     return count
 
 
 def _rotate(folder: Path, keep_count: int) -> None:
+    """Оставляет keep_count самых новых бэкапов, старые затирает и удаляет
+    (best_effort_wipe — ротируемый файл может быть полной plaintext-копией
+    БД при выключенном шифровании, M-02)."""
     if keep_count <= 0:
         return
     backups = sorted(folder.glob(_GLOB))
     while len(backups) > keep_count:
-        backups.pop(0).unlink(missing_ok=True)
+        best_effort_wipe(str(backups.pop(0)))

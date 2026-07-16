@@ -9,4 +9,4 @@
 Не путать со SCHEMA_VERSION (hranilka/data/database/schema.py) — это версия схемы БД
 для миграций, она меняется независимо."""
 
-__version__ = "1.2"
+__version__ = "1.4"

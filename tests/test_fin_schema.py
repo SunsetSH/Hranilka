@@ -145,7 +145,7 @@ def test_v8_db_migrates_to_current(tmp_path):
     d = _open(path)
     try:
         d.create_tables()
-        assert d.get_schema_version() == SCHEMA_VERSION == 11
+        assert d.get_schema_version() == SCHEMA_VERSION == 12
         tables = d._table_names()
         assert set(_FIN_TABLES) <= tables
         d.cursor.execute("SELECT account_name, login, password FROM accounts")
@@ -158,7 +158,7 @@ def test_v8_db_migrates_to_current(tmp_path):
 
 def test_empty_db_is_current(db):
     """Пустая новая база создаётся сразу на актуальной версии с fin-таблицами."""
-    assert db.get_schema_version() == SCHEMA_VERSION == 11
+    assert db.get_schema_version() == SCHEMA_VERSION == 12
     assert set(_FIN_TABLES) <= db._table_names()
 
 
@@ -184,7 +184,7 @@ def test_v9_db_migrates_to_v10_drops_bank_account(tmp_path):
     d = _open(path)
     try:
         d.create_tables()
-        assert d.get_schema_version() == SCHEMA_VERSION == 11
+        assert d.get_schema_version() == SCHEMA_VERSION == 12
         # bank_account исчез, карта осталась.
         d.cursor.execute("SELECT id, item_type FROM fin_items ORDER BY id")
         rows = [(r["id"], r["item_type"]) for r in d.cursor.fetchall()]
@@ -228,7 +228,7 @@ def test_v10_db_migrates_to_v11_drops_ewallet(tmp_path):
     d = _open(path)
     try:
         d.create_tables()
-        assert d.get_schema_version() == SCHEMA_VERSION == 11
+        assert d.get_schema_version() == SCHEMA_VERSION == 12
         # ewallet исчез, карта и криптокошелёк остались.
         d.cursor.execute("SELECT id, item_type FROM fin_items ORDER BY id")
         rows = [(r["id"], r["item_type"]) for r in d.cursor.fetchall()]

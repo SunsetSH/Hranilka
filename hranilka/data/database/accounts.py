@@ -165,18 +165,23 @@ class DbAccountCardMixin(DbBase):
         return account_id
 
     def save_account_with_links(self, account_id, data, target_ids,
-                                fin_item_ids=None):
+                                fin_item_ids=None, server_ids=None):
         """Атомарно сохраняет карточку и её связи В ОДНОЙ транзакции (H6-02):
         раньше save_account и set_links были двумя транзакциями — сбой второй
         оставлял карточку записанной, а связи нет. Теперь либо обе, либо ни одна.
         fin_item_ids — привязанные карты/кошельки (концепт §8): перезаписываются
         той же транзакцией; None — связи fin_links не трогаются (старые вызовы).
+        server_ids — привязанные VPS-серверы (docs/ТЗ_VPS_Серверы.md §4),
+        независимая связь server_links; None — не трогаются (старые вызовы/
+        выключенная опция show_servers).
         Возвращает список id строк галереи (как save_account)."""
         with self.conn:
             gallery_ids = self._save_account_rows(account_id, data)
             self._set_links_rows(account_id, target_ids)
             if fin_item_ids is not None:
                 self._set_account_fin_links_rows(account_id, fin_item_ids)
+            if server_ids is not None:
+                self._set_account_server_links_rows(account_id, server_ids)
         self._mark_dirty()
         return gallery_ids
 

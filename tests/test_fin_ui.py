@@ -16,7 +16,7 @@ from hranilka.ui.widgets import MaskedCardNumberField, ExpiryField
 
 
 @pytest.fixture
-def window(qapp, tmp_path, monkeypatch):
+def window(qapp, tmp_path, monkeypatch, dispose_window):
     from hranilka.core import config
     monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "config.json")
     from hranilka.ui import main_window as main
@@ -28,8 +28,7 @@ def window(qapp, tmp_path, monkeypatch):
     win.config.set("show_fin_instruments", True)
     win.apply_config()
     yield win
-    win.vault.shutdown()
-    win._instance_lock.release()
+    dispose_window(win)
 
 
 # ─── FinItemTabs строится из дескриптора ──────────────────────────────────────
@@ -423,3 +422,159 @@ def test_recycle_bin_restores_card(window):
     assert db.get_deleted_count() == 0
     db.cursor.execute("SELECT deleted_at FROM fin_items WHERE id = ?", (iid,))
     assert db.cursor.fetchone()["deleted_at"] is None
+
+
+# ─── H-02: сбой чтения связей при осиротевшей загрузке не стирает links ────
+# (симметрично серверам, tests/test_server_ui.py)
+
+def test_fin_orphan_draft_link_read_failure_preserves_links_on_exit_flush(
+        window, monkeypatch):
+    """get_item_links падает во время осиротевшей orphan-загрузки —
+    черновик получает links=None («неизвестно»), а НЕ [] («снять все»).
+    Сохранение черновика при выходе (_save_unsaved_before_exit) не должно
+    стереть реальные связи фин-записи."""
+    db = window.db
+    aid = db.add_account(None, "Провайдер")
+    iid = db.add_fin_item(None, "bank_card", "Карта")
+    db.set_item_links(iid, [aid])
+    window._current_fin = None                    # мы уже не на этой карточке
+    window._edit_cache.pop((CARD, iid), None)
+
+    def boom(*_a, **_k):
+        raise RuntimeError("database is locked")
+    with monkeypatch.context() as m:
+        m.setattr(db, "get_item_links", boom)
+        window._on_fin_gallery_orphan_upload((CARD, iid), "скрин", b"\x89PNGfake")
+
+    assert (CARD, iid) in window._edit_cache
+    assert window._edit_cache[(CARD, iid)]["links"] is None
+    assert (CARD, iid) in window._dirty_ids
+
+    assert window._save_unsaved_before_exit() is True
+    assert db.get_item_links(iid) == [aid]         # связь НЕ стёрта
+
+
+def test_open_fin_orphan_draft_with_unknown_links_refetches_and_preserves(window):
+    """Черновик с links=None (сконструирован напрямую): обычное ОТКРЫТИЕ
+    карточки должно перечитать связи из БД, а не показать пустой список.
+    Последующее ручное сохранение не стирает исходные fin_links (симметрично
+    серверам, tests/test_server_ui.py)."""
+    db = window.db
+    aid = db.add_account(None, "Провайдер")
+    iid = db.add_fin_item(None, "bank_card", "Карта")
+    db.set_item_links(iid, [aid])
+    window._reload_tree()
+
+    window._edit_cache[(CARD, iid)] = {
+        "storage": db.load_fin_item(iid), "links": None}
+    window._dirty_ids.add((CARD, iid))
+
+    window._select_node(CARD, iid)
+
+    assert window._edit_cache[(CARD, iid)]["links"] == [aid]
+    assert window.fin_tabs.f_linked_accounts.get_data()
+
+    window.save_current()
+
+    assert db.get_item_links(iid) == [aid]         # связь НЕ стёрта
+
+
+def test_open_fin_orphan_draft_with_unknown_links_fails_closed_on_second_error(
+        window, monkeypatch):
+    """Если и повторное чтение связей при открытии черновика падает —
+    карточка НЕ открывается (fail-closed), а не молча показывает []."""
+    import hranilka.ui.theme as theme_mod
+    db = window.db
+    aid = db.add_account(None, "Провайдер")
+    iid = db.add_fin_item(None, "bank_card", "Карта")
+    db.set_item_links(iid, [aid])
+    window._reload_tree()
+
+    window._edit_cache[(CARD, iid)] = {
+        "storage": db.load_fin_item(iid), "links": None}
+    window._dirty_ids.add((CARD, iid))
+
+    def boom(*_a, **_k):
+        raise RuntimeError("database is locked")
+
+    with monkeypatch.context() as m:
+        # _show_card_error зовёт модальный themed_info (d.exec) — гасим.
+        m.setattr(theme_mod, "themed_info", lambda *a, **k: None)
+        m.setattr(db, "get_item_links", boom)
+        window._select_node(CARD, iid)
+
+    assert window._current_fin is None              # карточка не открыта
+    assert window._edit_cache[(CARD, iid)]["links"] is None  # черновик цел
+    assert db.get_item_links(iid) == [aid]          # связь в БД не тронута
+
+
+# ─── M-02: выключение show_fin_instruments гасит незавершённые операции ───
+# (симметрично серверам, tests/test_server_ui.py — управляемый delayed-future,
+# паттерн tests/test_review_07_gallery.py)
+
+async def test_hide_fin_invalidates_pending_load(window, monkeypatch):
+    import asyncio
+    db = window.db
+    iid = db.add_fin_item(None, "bank_card", "Карта")
+    window._reload_tree()
+
+    gate = asyncio.Event()
+    orig_run_async = db.run_async
+
+    async def gated_run_async(method, *args, **kwargs):
+        if getattr(method, "__name__", "") == "load_fin_item":
+            await gate.wait()
+        return await orig_run_async(method, *args, **kwargs)
+
+    monkeypatch.setattr(db, "run_async", gated_run_async)
+
+    window._select_node(CARD, iid)
+    await asyncio.sleep(0.01)                  # дать задаче дойти до gate.wait()
+    assert window._card_busy is True
+    gen_before = window._card_gen
+
+    window.config.set("show_fin_instruments", False)
+    window.apply_config()                      # _hide_fin_everywhere: gen++, busy сброшен
+
+    assert window._card_gen != gen_before
+    assert window._card_busy is False
+    assert window._current_fin is None
+    assert window.right_stack.currentWidget() is window.placeholder_label
+
+    gate.set()
+    await asyncio.sleep(0.01)
+    db.wait_executor_idle()
+    await asyncio.sleep(0.05)
+
+    assert window._current_fin is None
+    assert window.right_stack.currentWidget() is window.placeholder_label
+    assert window.is_editing is False
+
+
+async def test_hide_fin_cancels_pending_gallery_upload(window, monkeypatch):
+    import asyncio
+    db = window.db
+    iid = db.add_fin_item(None, "bank_card", "Карта")
+    window._reload_tree()
+    window._select_node(CARD, iid)
+    window.edit_current()
+
+    gw = window.fin_tabs.f_gallery_widget
+    gate = asyncio.Event()                     # никогда не выставляем — задача висит
+    orphans = []
+
+    async def _gated_pipeline(item, path, gen, account_id=None, limit_context=None):
+        await gate.wait()
+        orphans.append(account_id)             # сюда дойти не должны
+
+    monkeypatch.setattr(gw, "_upload_pipeline", _gated_pipeline)
+    gw._queue_file_load("x.png")
+    assert gw.has_pending_uploads() is True
+
+    window.config.set("show_fin_instruments", False)
+    window.apply_config()                      # M-02: cancel_all_tasks фин-галерей
+
+    assert gw.has_pending_uploads() is False
+    await gw.wait_pending_uploads()
+    assert orphans == []
+    assert not any(k[0] == CARD for k in window._edit_cache)

@@ -11,7 +11,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QBrush
 
 from hranilka.core import domain
-from hranilka.core.nodetypes import (FOLDER, SERVICE, ACCOUNT,
+from hranilka.core.nodetypes import (FOLDER, SERVICE, ACCOUNT, SERVER,
                                      LEAF_TYPES, FIN_LEAF_TYPES)
 from hranilka.core.fin_domain import EXPIRY_WARN_DAYS
 from hranilka.core.fin_types import FIN_TYPES
@@ -72,9 +72,10 @@ class TreeMixin:
     """Построение/перестроение дерева, сортировка, поиск, контекстное меню и
     операции над папками/сервисами/аккаунтами."""
 
-    # Префиксы-«иконки» для элементов дерева. Контейнеры/аккаунт — здесь; фин-часть
-    # берётся из реестра дескрипторов (единый источник tree_prefix, без дублирования).
-    PREFIX = {FOLDER: "[+] ", SERVICE: "[o] ", ACCOUNT: "(i) ",
+    # Префиксы-«иконки» для элементов дерева. Контейнеры/аккаунт/сервер — здесь;
+    # фин-часть берётся из реестра дескрипторов (единый источник tree_prefix,
+    # без дублирования).
+    PREFIX = {FOLDER: "[+] ", SERVICE: "[o] ", ACCOUNT: "(i) ", SERVER: "[#] ",
               **{spec.node_type: spec.tree_prefix for spec in FIN_TYPES.values()}}
 
     def _node_display(self, node):
@@ -92,6 +93,10 @@ class TreeMixin:
                 days = node.get("days_until_expiry")
                 if days is not None and days <= EXPIRY_WARN_DAYS:
                     text += "  [!]"   # карта истекает/истекла
+            elif node["type"] == SERVER:
+                days = node.get("paid_days_left")
+                if days is not None and days <= 0:
+                    text += "  [!]"   # оплата сервера просрочена
             if (node["type"], node["id"]) in self._dirty_ids:
                 text = "● НЕ СОХРАНЕНО ▸ " + text   # есть несохранённые правки
         return text
@@ -178,7 +183,8 @@ class TreeMixin:
         сервисы / корневые аккаунты), т.к. они в разных таблицах со своим
         sort_order. Единый воркер БД сохраняет порядок вызовов (a)."""
         if parent_item is None:
-            folder_ids, service_ids, account_ids, fin_ids = [], [], [], []
+            folder_ids, service_ids, account_ids, fin_ids, server_ids = (
+                [], [], [], [], [])
             for i in range(self.tree.topLevelItemCount()):
                 node = self._node(self.tree.topLevelItem(i))
                 if node["type"] == FOLDER:
@@ -189,11 +195,14 @@ class TreeMixin:
                     account_ids.append(node["id"])
                 elif node["type"] in FIN_LEAF_TYPES:
                     fin_ids.append(node["id"])
+                elif node["type"] == SERVER:
+                    server_ids.append(node["id"])
             util.fire(self._save_order_async(
                 [(self.db.set_folders_order, folder_ids),
                  (self.db.set_services_order, service_ids),
                  (self.db.set_accounts_order, account_ids),
-                 (self.db.set_fin_items_order, fin_ids)]))
+                 (self.db.set_fin_items_order, fin_ids),
+                 (self.db.set_servers_order, server_ids)]))
             return
 
         parent_node = self._node(parent_item)
@@ -202,17 +211,21 @@ class TreeMixin:
                            for i in range(parent_item.childCount())]
             ops = [(self.db.set_services_order, service_ids)]
         elif parent_node["type"] == SERVICE:
-            # Аккаунты и fin-записи — братья одного сервиса, но в разных таблицах;
-            # порядок каждой группы снимаем в порядке их появления в дереве.
-            account_ids, fin_ids = [], []
+            # Аккаунты, fin-записи и серверы — братья одного сервиса, но в
+            # разных таблицах; порядок каждой группы снимаем в порядке их
+            # появления в дереве.
+            account_ids, fin_ids, server_ids = [], [], []
             for i in range(parent_item.childCount()):
                 cn = self._node(parent_item.child(i))
                 if cn["type"] == ACCOUNT:
                     account_ids.append(cn["id"])
                 elif cn["type"] in FIN_LEAF_TYPES:
                     fin_ids.append(cn["id"])
+                elif cn["type"] == SERVER:
+                    server_ids.append(cn["id"])
             ops = [(self.db.set_accounts_order, account_ids),
-                   (self.db.set_fin_items_order, fin_ids)]
+                   (self.db.set_fin_items_order, fin_ids),
+                   (self.db.set_servers_order, server_ids)]
         else:
             return
         util.fire(self._save_order_async(ops))
@@ -242,8 +255,10 @@ class TreeMixin:
         try:
             self.tree.clear()
             include_fin = self.config.get("show_fin_instruments", False)
+            include_servers = self.config.get("show_servers", False)
             for node in self.db.get_tree_structure(
-                    self.sort_mode, self.sort_desc, include_fin=include_fin):
+                    self.sort_mode, self.sort_desc, include_fin=include_fin,
+                    include_servers=include_servers):
                 self._add_tree_node(self.tree, node)
         finally:
             self.tree.setUpdatesEnabled(True)
@@ -383,6 +398,17 @@ class TreeMixin:
                 menu.addSeparator()
                 menu.addAction("Экспорт…", lambda: self.open_export(node))
                 menu.addAction("Удалить", lambda: self.delete_items(selected))
+            elif t == SERVER:
+                # Те же пункты, что у фин-листа, плюс переименование (правка
+                # имени доступна и отсюда, независимо от карточки).
+                self._add_move_server_to_service_menu(menu, selected)
+                fav = node.get("is_favorite")
+                menu.addAction("Убрать из избранного" if fav else "В избранное",
+                               lambda: self._set_server_favorite(selected, not fav))
+                menu.addSeparator()
+                menu.addAction("Экспорт…", lambda: self.open_export(node))
+                menu.addAction("Переименовать", lambda: self.rename_item(item))
+                menu.addAction("Удалить", lambda: self.delete_items(selected))
             elif t == SERVICE:
                 self._add_create_record_menu(menu)
                 menu.addAction("Переименовать", lambda: self.rename_item(item))
@@ -409,6 +435,13 @@ class TreeMixin:
                 self._add_move_to_service_menu(menu, selected)
                 menu.addAction("В избранное", lambda: self._set_favorite(selected, True))
                 menu.addAction("Убрать из избранного", lambda: self._set_favorite(selected, False))
+                menu.addSeparator()
+                menu.addAction("Удалить", lambda: self.delete_items(selected))
+            elif types == {SERVER}:
+                self._add_move_server_to_service_menu(menu, selected)
+                menu.addAction("В избранное", lambda: self._set_server_favorite(selected, True))
+                menu.addAction("Убрать из избранного",
+                               lambda: self._set_server_favorite(selected, False))
                 menu.addSeparator()
                 menu.addAction("Удалить", lambda: self.delete_items(selected))
             else:
@@ -461,15 +494,17 @@ class TreeMixin:
 
     def _add_create_record_menu(self, menu):
         """Подменю создания записи в выбранном контейнере: аккаунт + типы
-        FIN_TYPES (пункты строятся из реестра). Фин-типы предлагаются только при
-        включённой опции «Показывать фин. инструменты». Возвращает подменю."""
+        FIN_TYPES (пункты строятся из реестра) + сервер. Фин-типы предлагаются
+        только при включённой опции «Показывать фин. инструменты», пункт
+        «Сервер» — только при «Показывать серверы». Возвращает подменю."""
         sub = menu.addMenu("Создать запись")
         sub.addAction("(i) Аккаунт", self.add_account)
-        if not self.config.get("show_fin_instruments", False):
-            return sub
-        for type_id, spec in FIN_TYPES.items():
-            sub.addAction(spec.tree_prefix + spec.title,
-                          lambda checked=False, tid=type_id: self.add_fin_record(tid))
+        if self.config.get("show_fin_instruments", False):
+            for type_id, spec in FIN_TYPES.items():
+                sub.addAction(spec.tree_prefix + spec.title,
+                              lambda checked=False, tid=type_id: self.add_fin_record(tid))
+        if self.config.get("show_servers", False):
+            sub.addAction("[#] Сервер", self.add_server)
         return sub
 
     def _add_move_fin_to_service_menu(self, menu, selected):
@@ -483,6 +518,17 @@ class TreeMixin:
         sub.addAction("Сделать свободной (без сервиса)",
                       lambda: self._move_fin_items(selected, None))
 
+    def _add_move_server_to_service_menu(self, menu, selected):
+        """Перемещение серверов между сервисами (по образцу
+        _add_move_fin_to_service_menu — без создания нового сервиса)."""
+        sub = menu.addMenu("Переместить в сервис")
+        for s in self.db.get_services():
+            sub.addAction(s["name"],
+                          lambda checked=False, sid=s["id"]: self._move_servers(selected, sid))
+        sub.addSeparator()
+        sub.addAction("Сделать свободным (без сервиса)",
+                      lambda: self._move_servers(selected, None))
+
     # ----- Операции меню -----
 
     def rename_item(self, item):
@@ -495,6 +541,8 @@ class TreeMixin:
                 method = self.db.rename_folder
             elif node["type"] == SERVICE:
                 method = self.db.rename_service
+            elif node["type"] == SERVER:
+                method = self.db.rename_server
             else:
                 return
             # Запись в фоне, дерево перестраиваем ТОЛЬКО после завершения (H-8).
@@ -543,6 +591,12 @@ class TreeMixin:
         self.current_tree_item = None
         self._current_account_id = None
         self._current_fin = None
+        # M-01: сервер сбрасываем симметрично аккаунту/фин-записи — иначе
+        # после удаления открытого сервера (или контейнера с ним)
+        # _current_server/current_server_data продолжают указывать на уже
+        # удалённую запись, хотя правая панель уже заменена на заглушку.
+        self._current_server = None
+        self.current_server_data = None
         self.is_editing = False
         self._reload_tree()
         self._show_placeholder()
@@ -624,6 +678,24 @@ class TreeMixin:
         ids = self._fin_ids(selected)
         util.fire(self._run_then_reload(
             self.db.move_fin_items, (ids, service_id),
+            "Не удалось переместить", status="Перемещено"))
+
+    def _server_ids(self, selected):
+        """id выбранных серверов."""
+        return [n["id"] for n in (self._node(i) for i in selected)
+                if n["type"] == SERVER]
+
+    def _set_server_favorite(self, selected, value):
+        ids = self._server_ids(selected)
+        # Пакетный метод — ОДНА транзакция БД (M7-04), по образцу
+        # _set_fin_favorite/set_fin_favorites.
+        util.fire(self._run_then_reload(
+            self.db.set_server_favorites, (ids, value), "Не удалось выполнить операцию"))
+
+    def _move_servers(self, selected, service_id):
+        ids = self._server_ids(selected)
+        util.fire(self._run_then_reload(
+            self.db.move_servers, (ids, service_id),
             "Не удалось переместить", status="Перемещено"))
 
     def _find_leaf_item(self, node_type, node_id):
@@ -791,3 +863,42 @@ class TreeMixin:
         # Новая запись сразу в режим правки после загрузки (одноразовый флаг).
         self._fin_edit_on_load = (spec.node_type, item_id)
         self._select_node(spec.node_type, item_id)
+
+    def add_server(self):
+        """Создание VPS-сервера (docs/ТЗ_VPS_Серверы.md §4). Флоу как у
+        аккаунта/фин-записи: контейнер (выбранный сервис или корень) → имя →
+        пустая запись в БД → выбор узла → карточка сразу в правке."""
+        current = self.tree.currentItem()
+        node = self._node(current)
+        if node and node["type"] == SERVICE:
+            service_id = node["id"]
+        elif node and node["type"] in LEAF_TYPES:
+            # Лист под сервисом → тот же сервис; свободный → корень.
+            parent = current.parent()
+            pnode = self._node(parent) if parent else None
+            service_id = pnode["id"] if pnode and pnode["type"] == SERVICE else None
+        else:
+            # Папка или ничего не выбрано → свободный сервер (в корне).
+            service_id = None
+
+        name, ok = theme.themed_input(
+            self.config, self, "Новый сервер", "Название:")
+        if ok and name:
+            util.fire(self._add_server_async(service_id, name))
+
+    async def _add_server_async(self, service_id, name):
+        session = self.db.current_session()
+        try:
+            server_id = await self.db.run_async(
+                self.db.add_server, service_id, name, _session=session)
+        except StaleSessionError:
+            return
+        except Exception as e:                       # noqa: BLE001
+            self._show_card_error("Не удалось создать сервер", e)
+            self._reload_tree()
+            return
+        self._any_db_changes = True
+        self._reload_tree()
+        # Новый сервер сразу в режим правки после загрузки (одноразовый флаг).
+        self._server_edit_on_load = server_id
+        self._select_node(SERVER, server_id)

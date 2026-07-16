@@ -11,10 +11,10 @@ from hranilka.data.errors import FutureSchemaError
 
 def test_registry_covers_legacy_base_plus_one():
     """Реестр покрывает ровно версии LEGACY_BASE+1..SCHEMA_VERSION.
-    Зарегистрированы шаги m009 (fin-таблицы), m010 (чистка bank_account)
-    и m011 (чистка ewallet)."""
+    Зарегистрированы шаги m009 (fin-таблицы), m010 (чистка bank_account),
+    m011 (чистка ewallet) и m012 (VPS-серверы)."""
     assert migrations.LEGACY_BASE == 8
-    assert SCHEMA_VERSION == 11
+    assert SCHEMA_VERSION == 12
     assert set(migrations.MIGRATIONS) == set(
         range(migrations.LEGACY_BASE + 1, SCHEMA_VERSION + 1))
 
@@ -112,3 +112,110 @@ def test_numbered_step_not_rerun_from_reached_version(db, monkeypatch):
     runner.run(db)
     assert calls == [SCHEMA_VERSION + 2]
     assert db.get_schema_version() == SCHEMA_VERSION + 2
+
+
+# ─── m012: v11 → v12 (VPS-серверы) ─────────────────────────────────────────
+
+def _make_v11_db(path):
+    """Sqlite-файл со схемой v11 (fin-таблицы есть, server-таблиц ещё нет)."""
+    import sqlite3
+    from hranilka.data.database.schema import DbSchemaMixin
+
+    con = sqlite3.connect(path)
+    con.executescript("""
+        CREATE TABLE folders (id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            sort_order INTEGER DEFAULT 0);
+        CREATE TABLE services (id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL, folder_id INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            sort_order INTEGER DEFAULT 0);
+        CREATE TABLE app_meta (key TEXT PRIMARY KEY, value TEXT);
+    """)
+    con.execute(DbSchemaMixin._accounts_create_sql("accounts"))
+    con.execute(DbSchemaMixin._linked_accounts_create_sql("linked_accounts"))
+    con.execute(DbSchemaMixin._fin_items_create_sql())
+    con.execute(DbSchemaMixin._fin_links_create_sql())
+    con.execute(DbSchemaMixin._fin_gallery_create_sql())
+    for stmt in DbSchemaMixin._fin_index_sql():
+        con.execute(stmt)
+    con.execute("INSERT INTO app_meta (key, value) VALUES ('schema_version', '11')")
+    con.execute("INSERT INTO services (name) VALUES ('Провайдер')")
+    con.execute(
+        "INSERT INTO accounts (service_id, account_name, login, password) "
+        "VALUES (1, 'Акк', 'user', 'secret')")
+    con.commit()
+    con.close()
+
+
+def test_v11_db_migrates_to_v12_creates_server_tables(tmp_path, monkeypatch):
+    """База v11 (без server-таблиц) → открытие → v12: таблицы servers/
+    server_links/server_gallery созданы, старые данные (аккаунт) целы,
+    страховочная копия базы (.pre-migrate*) создана перед миграцией (H7-03;
+    удаляется в конце успешного прогона — перехватываем через monkeypatch,
+    чтобы убедиться, что она вообще была создана)."""
+    import glob
+    from hranilka.data.database import Database
+
+    path = str(tmp_path / "v11.db")
+    _make_v11_db(path)
+    d = Database(path)
+    d.connect()
+
+    created_copies = []
+    real_finish = type(d)._finish_premigration_backup
+
+    def spy_finish(self, copy_path):
+        if copy_path:
+            created_copies.append(copy_path)
+        return real_finish(self, copy_path)
+
+    monkeypatch.setattr(type(d), "_finish_premigration_backup", spy_finish)
+
+    try:
+        d.create_tables()
+        assert d.get_schema_version() == SCHEMA_VERSION == 12
+        assert {"servers", "server_links", "server_gallery"} <= d._table_names()
+        d.cursor.execute("SELECT account_name, login, password FROM accounts")
+        row = d.cursor.fetchone()
+        assert (row["account_name"], row["login"], row["password"]) == \
+               ("Акк", "user", "secret")
+        # H7-03: страховочная копия была создана перед миграцией версии
+        # (и удалена best_effort_wipe после успеха — на диске её уже нет).
+        assert created_copies
+        assert not glob.glob(path + ".pre-migrate*")
+    finally:
+        d.close(persist=False)
+
+    # Повторное открытие уже мигрированной базы — идемпотентно (fast path).
+    d2 = Database(path)
+    d2.connect()
+    try:
+        d2.create_tables()
+        assert d2.get_schema_version() == SCHEMA_VERSION
+        assert {"servers", "server_links", "server_gallery"} <= d2._table_names()
+    finally:
+        d2.close(persist=False)
+
+
+def test_m012_idempotent(tmp_path):
+    """Повторный прогон m012 на той же базе не падает (CREATE ... IF NOT EXISTS)."""
+    import sqlite3
+    from hranilka.data.database.migrations.m012_servers import migrate as m012
+
+    path = str(tmp_path / "v11.db")
+    _make_v11_db(path)
+    con = sqlite3.connect(path)
+    con.row_factory = sqlite3.Row
+    try:
+        m012(con)
+        m012(con)                       # второй раз — no-op, без ошибок
+        con.commit()
+        names = {r["name"] for r in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        assert {"servers", "server_links", "server_gallery"} <= names
+        idx = {r["name"] for r in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='index'")}
+        assert "uq_server_link" in idx
+    finally:
+        con.close()

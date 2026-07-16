@@ -10,13 +10,16 @@ SERVICE = "service"
 ACCOUNT = "account"
 CARD = "card"
 WALLET = "wallet"
+SERVER = "server"
 
 # Листовые узлы: открываются карточкой, поддерживают корзину, избранное, DnD.
-LEAF_TYPES = frozenset({ACCOUNT, CARD, WALLET})
+LEAF_TYPES = frozenset({ACCOUNT, CARD, WALLET, SERVER})
 
 # Финансовые листья (fin_items): карточка строится из дескриптора типа.
 # Новые типы добавляются сюда — вся листовая механика (корзина, избранное, DnD,
-# поиск, точечное обновление) работает generic-ом.
+# поиск, точечное обновление) работает generic-ом. SERVER сюда НЕ входит —
+# сервер логически не связан с фин-инструментами (docs/ТЗ_VPS_Серверы.md §2):
+# собственная таблица/связи/карточка, свой предикат is_server_node.
 FIN_LEAF_TYPES = frozenset({CARD, WALLET})
 
 
@@ -31,3 +34,11 @@ def is_fin_node(node_type) -> bool:
     tree_ops._build_fin_node), поэтому проверка членством эквивалентна
     исключению контейнеров/аккаунта, но не расползается по модулям."""
     return node_type in FIN_LEAF_TYPES
+
+
+def is_server_node(node_type) -> bool:
+    """Узел дерева — VPS-сервер. Сервер не финансовый лист (is_fin_node с ним
+    False по построению — FIN_LEAF_TYPES его не содержит): отдельная сущность
+    со своей таблицей/карточкой/связями (docs/ТЗ_VPS_Серверы.md §2). Один
+    тип, поэтому предикат — прямое сравнение, без реестра, как у FIN_TYPES."""
+    return node_type == SERVER

@@ -20,7 +20,7 @@ from hranilka.ui.widgets import GalleryWidget
 
 
 @pytest.fixture
-def window(qapp, tmp_path, monkeypatch):
+def window(qapp, tmp_path, monkeypatch, dispose_window):
     from hranilka.core import config
     monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "config.json")
     from hranilka.ui import main_window as main
@@ -30,8 +30,7 @@ def window(qapp, tmp_path, monkeypatch):
     win.config.set("show_fin_instruments", True)
     win.apply_config()
     yield win
-    win.vault.shutdown()
-    win._instance_lock.release()
+    dispose_window(win)
 
 
 def _png_bytes(w=10, h=10):
