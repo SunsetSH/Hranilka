@@ -54,3 +54,9 @@ def test_date_passed_where_datetime_expected():
     d = AccountData()
     d.creation_date = date(2026, 7, 4)
     assert d.to_storage()["fields"]["creation_date"] == "2026-07-04 00:00:00"
+
+
+def test_new_account_does_not_prefill_device_id():
+    d = AccountData()
+    assert d.device_id == ""
+    assert d.to_storage()["recovery"]["device_id"] == ""

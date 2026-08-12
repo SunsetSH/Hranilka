@@ -39,7 +39,7 @@ def test_crypto_wallet_registered():
     spec = FIN_TYPES["crypto_wallet"]
     assert spec.node_type == WALLET
     assert spec.tree_prefix == "[₿] "
-    assert spec.tabs == ("Кошелёк", "Seed-фраза", "Адреса", "Ключи", "Заметки")
+    assert spec.tabs == ("База", "Seed-фраза", "Адреса", "Ключи", "Заметки")
     assert {ls.key for ls in spec.lists} == {"addresses", "private_keys"}
     # У кошелька нет last4/срока — экстракт-колонки пустые.
     assert spec.extract({"seed_phrase": _SEED12}) == ("", None)

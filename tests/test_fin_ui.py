@@ -144,8 +144,8 @@ def test_fin_name_edit_ui_to_db_and_node(window, monkeypatch):
     assert "Новое имя" in item.text(0)
 
 
-def test_fin_name_empty_keeps_previous(window, monkeypatch):
-    """Пустое/пробельное имя при сохранении не затирает прежнее."""
+def test_fin_empty_name_blocks_save_and_opens_base(window, monkeypatch):
+    """Пустое имя блокирует Save и возвращает к обязательной «Базе»."""
     import hranilka.ui.theme as theme_mod
     monkeypatch.setattr(theme_mod, "themed_input", lambda *a, **k: ("Имя", True))
     window.add_fin_record("bank_card")
@@ -155,9 +155,42 @@ def test_fin_name_empty_keeps_previous(window, monkeypatch):
 
     window.tree.setCurrentItem(None)
     window._select_node(CARD, iid)
+    assert window.is_editing
+    window.fin_tabs.setCurrentIndex(window.fin_tabs.count() - 1)
     window.fin_tabs.f_name.set_text("   ")               # только пробелы
+    shown = []
+    monkeypatch.setattr(
+        theme_mod, "themed_info", lambda *a, **k: shown.append(a))
     window.save_current()
-    assert db.load_fin_item(iid)["name"] == "Имя"        # прежнее имя сохранено
+
+    assert db.load_fin_item(iid)["name"] == "Имя"
+    assert window.is_editing
+    assert window._card_busy is False
+    assert window.fin_tabs.currentIndex() == 0
+    assert shown and shown[0][2] == "Не заполнено название"
+
+
+def test_fin_save_failure_restores_active_tab(window, monkeypatch):
+    from hranilka.data.database import StaleSessionError
+
+    db = window.db
+    iid = db.add_fin_item(None, "bank_card", "Карта")
+    window._reload_tree()
+    window._select_node(CARD, iid)
+    window.edit_current()
+    active_tab = window.fin_tabs.count() - 1  # пустая «Галерея»
+    window.fin_tabs.setCurrentIndex(active_tab)
+
+    def boom(*a, **k):
+        raise StaleSessionError()
+    monkeypatch.setattr(db, "save_fin_item_with_links", boom)
+
+    window.save_current()
+
+    assert window._card_busy is False
+    assert window.is_editing
+    assert window.fin_tabs.currentIndex() == active_tab
+    assert (CARD, iid) in window._edit_cache
 
 
 def test_fin_tabs_bin_autodetect(qapp):

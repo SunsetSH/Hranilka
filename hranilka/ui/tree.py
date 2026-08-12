@@ -151,9 +151,99 @@ class TreeMixin:
         self._update_sort_dir_btn()
         self._reload_tree()
 
+    def _tree_has_expanded_branches(self):
+        """Есть ли сейчас хотя бы одна раскрытая ветка с дочерними узлами."""
+        return any(it.childCount() and it.isExpanded()
+                   for it in self._iter_items())
+
+    def _tree_has_branches(self):
+        """Есть ли в дереве хотя бы одна ветка, которую можно раскрыть."""
+        return any(it.childCount() for it in self._iter_items())
+
+    def on_tree_toggle_all(self):
+        """Свернуть всё дерево, если раскрыта хоть одна ветка, иначе раскрыть."""
+        if getattr(self, "search_text", "") or not self._tree_has_branches():
+            self._update_tree_toggle_btn()
+            return
+        collapse = self._tree_has_expanded_branches()
+        # expandAll/collapseAll испускают сигнал на каждый узел. Обновляем
+        # динамическую иконку один раз после пакетной операции.
+        was_blocked = self.tree.blockSignals(True)
+        try:
+            if collapse:
+                self.tree.collapseAll()
+            else:
+                self.tree.expandAll()
+        finally:
+            self.tree.blockSignals(was_blocked)
+        self._update_tree_toggle_btn()
+
+    def _update_tree_toggle_btn(self, *_):
+        """Обновить подсказку и тематическую иконку предстоящего действия."""
+        btn = getattr(self, "tree_toggle_btn", None)
+        tree = getattr(self, "tree", None)
+        if btn is None or tree is None or getattr(self, "_building_tree", False):
+            return
+        search_active = bool(getattr(self, "search_text", ""))
+        has_branches = self._tree_has_branches()
+        collapse = has_branches and self._tree_has_expanded_branches()
+        # Иконка остаётся понятной и в disabled-состоянии (пустое дерево или
+        # активный поиск), а не превращается в пустую квадратную кнопку.
+        btn.setIcon(self._tree_action_icon(expand=not collapse))
+        btn.setEnabled(has_branches and not search_active)
+        if search_active:
+            btn.setToolTip("Сворачивание дерева недоступно во время поиска")
+            btn.setAccessibleName(btn.toolTip())
+            return
+        if not has_branches:
+            btn.setToolTip("В дереве нет вложенных ветвей")
+            btn.setAccessibleName(btn.toolTip())
+            return
+        btn.setToolTip("Свернуть всё дерево" if collapse
+                       else "Развернуть всё дерево")
+        btn.setAccessibleName(btn.toolTip())
+
+    def _tree_action_icon(self, expand):
+        """Нарисовать иконку-иерархию: крупную для раскрытия, малую для свёртки.
+
+        В ней намеренно нет стрелок — соседняя кнопка уже управляет направлением
+        сортировки. Цвет берётся из темы и потому остаётся читаемым во всех
+        пользовательских сочетаниях фона/текста.
+        """
+        from PySide6.QtCore import QPoint, QSize
+        from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
+
+        pixmap = QPixmap(24, 24)
+        pixmap.fill(Qt.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        color = QColor(self.config.get("text_color", "#000000"))
+        painter.setPen(QPen(color, 1.7, Qt.SolidLine, Qt.RoundCap))
+        painter.setBrush(color)
+
+        if expand:                 # крупное дерево — действие «развернуть»
+            cx, top, joint, bottom, half, node = 12, 3, 12, 20, 8, 3
+        else:                      # маленькое дерево — действие «свернуть»
+            cx, top, joint, bottom, half, node = 12, 7, 13, 17, 5, 2
+
+        painter.drawLine(QPoint(cx, top + node), QPoint(cx, joint))
+        painter.drawLine(QPoint(cx - half, joint), QPoint(cx + half, joint))
+        for x in (cx - half, cx, cx + half):
+            painter.drawLine(QPoint(x, joint), QPoint(x, bottom - node))
+            painter.drawRect(x - node // 2, bottom - node, node, node)
+        painter.drawRect(cx - node // 2, top, node, node)
+        painter.end()
+
+        icon = QIcon(pixmap)
+        btn = getattr(self, "tree_toggle_btn", None)
+        if btn is not None:
+            btn.setIconSize(QSize(24, 24))
+        return icon
+
     def on_search_changed(self, text):
         self.search_text = text.strip().lower()
         self._apply_filter()
+        self._update_tree_toggle_btn()
 
     def _apply_filter(self):
         text = self.search_text
@@ -251,6 +341,7 @@ class TreeMixin:
         # Отключаем перерисовку на время массовой вставки: дерево не
         # перерисовывается на каждый добавленный узел, а один раз в конце —
         # заметно быстрее на больших базах (ускорение запуска).
+        self._building_tree = True
         self.tree.setUpdatesEnabled(False)
         try:
             self.tree.clear()
@@ -262,7 +353,9 @@ class TreeMixin:
                 self._add_tree_node(self.tree, node)
         finally:
             self.tree.setUpdatesEnabled(True)
+            self._building_tree = False
         self._apply_filter()
+        self._update_tree_toggle_btn()
 
     def _add_tree_node(self, parent, node):
         data = {k: v for k, v in node.items() if k != "children"}
@@ -305,6 +398,7 @@ class TreeMixin:
                 self.tree.setCurrentItem(it)
                 self.current_tree_item = it
         self.tree.blockSignals(False)
+        self._update_tree_toggle_btn()
 
     # ----- Точечное обновление узла (без перестройки всего дерева) -----
 
@@ -793,6 +887,7 @@ class TreeMixin:
             service_id = None
 
         name, ok = theme.themed_input(self.config, self, "Новый аккаунт", "Название:")
+        name = name.strip()
         if ok and name:
             data = AccountData()
             data.name = name
@@ -843,6 +938,7 @@ class TreeMixin:
 
         name, ok = theme.themed_input(
             self.config, self, spec.create_title, "Название:")
+        name = name.strip()
         if ok and name:
             util.fire(self._add_fin_record_async(service_id, type_id, name))
 
@@ -883,6 +979,7 @@ class TreeMixin:
 
         name, ok = theme.themed_input(
             self.config, self, "Новый сервер", "Название:")
+        name = name.strip()
         if ok and name:
             util.fire(self._add_server_async(service_id, name))
 

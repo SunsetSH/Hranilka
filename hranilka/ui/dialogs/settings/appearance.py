@@ -81,6 +81,19 @@ class SettingsAppearanceMixin:
         self._refresh_color_btns()
         lay.addWidget(colors_group)
 
+        cards_group = QGroupBox("Карточки")
+        cgl = QVBoxLayout(cards_group)
+        self.hide_empty_card_fields_check = QCheckBox(
+            "Скрывать пустые поля и вкладки в режиме просмотра")
+        self.hide_empty_card_fields_check.setChecked(
+            self.config.get("hide_empty_card_fields", True))
+        cgl.addWidget(self.hide_empty_card_fields_check)
+        cards_note = QLabel(
+            "В режиме редактирования все поля и вкладки остаются доступными.")
+        cards_note.setWordWrap(True)
+        cgl.addWidget(cards_note)
+        lay.addWidget(cards_group)
+
         geo_group = QGroupBox("Окно")
         gl = QVBoxLayout(geo_group)
         self.remember_geo_check = QCheckBox("Запоминать размер и положение окна")

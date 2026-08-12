@@ -203,6 +203,8 @@ class SettingsDialog(SettingsAppearanceMixin, SettingsSecurityMixin,
             "font": self.font_combo.currentText(),
             "font_size": int(self.font_size_combo.currentText()),
             "selected_theme": self.theme_combo.currentText(),
+            "hide_empty_card_fields":
+                self.hide_empty_card_fields_check.isChecked(),
             "remember_geometry": self.remember_geo_check.isChecked(),
             "screenshot_protect": self.ss_protect_check.isChecked(),
             "idle_lock_mins": int(self.idle_mins.text() or "0"),
@@ -417,6 +419,8 @@ class SettingsDialog(SettingsAppearanceMixin, SettingsSecurityMixin,
         self.config.set("font",              self.font_combo.currentText())
         self.config.set("font_size",         int(self.font_size_combo.currentText()))
         self.config.set("selected_theme",    self.theme_combo.currentText())
+        self.config.set("hide_empty_card_fields",
+                        self.hide_empty_card_fields_check.isChecked())
         self.config.set("remember_geometry", self.remember_geo_check.isChecked())
         self.config.set("screenshot_protect",  self.ss_protect_check.isChecked())
         self.config.set("idle_lock_mins",      int(self.idle_mins.text() or "0"))

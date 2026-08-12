@@ -110,6 +110,52 @@ def test_edit_and_save_server_payload(window):
     assert "Переименованный" in item.text(0)
 
 
+def test_server_empty_name_blocks_save_and_opens_base(window, monkeypatch):
+    import hranilka.ui.theme as theme_mod
+
+    db = window.db
+    sid = db.add_server(None, "Сервер")
+    window._reload_tree()
+    window._select_node(SERVER, sid)
+    window.edit_current()
+    window.server_tabs.setCurrentIndex(window.server_tabs.count() - 1)
+    window.server_tabs.f_name.set_text("   ")
+    shown = []
+    monkeypatch.setattr(
+        theme_mod, "themed_info", lambda *a, **k: shown.append(a))
+
+    window.save_current()
+
+    assert db.get_server(sid)["name"] == "Сервер"
+    assert window.is_editing
+    assert window._card_busy is False
+    assert window.server_tabs.currentIndex() == 0
+    assert shown and shown[0][2] == "Не заполнено название"
+
+
+def test_server_save_failure_restores_active_tab(window, monkeypatch):
+    from hranilka.data.database import StaleSessionError
+
+    db = window.db
+    sid = db.add_server(None, "Сервер")
+    window._reload_tree()
+    window._select_node(SERVER, sid)
+    window.edit_current()
+    active_tab = window.server_tabs.count() - 1  # пустая «Галерея»
+    window.server_tabs.setCurrentIndex(active_tab)
+
+    def boom(*a, **k):
+        raise StaleSessionError()
+    monkeypatch.setattr(db, "save_server_with_links", boom)
+
+    window.save_current()
+
+    assert window._card_busy is False
+    assert window.is_editing
+    assert window.server_tabs.currentIndex() == active_tab
+    assert (SERVER, sid) in window._edit_cache
+
+
 def test_ssh_keys_and_panels_roundtrip(window):
     db = window.db
     sid = db.add_server(None, "Сервер")

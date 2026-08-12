@@ -242,13 +242,34 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, ServerCardMixin, FinCardMixi
         wait_executor_idle идёт следом по существующему коду закрытия).
         True — всё записано (кеш очищен); False — ошибка (показана, не выходим)."""
         if self.is_editing and self._current_fin is not None:
+            if not self._validate_card_name(
+                    self.fin_tabs, "финансовой записи"):
+                return False
             self._stash_current_fin_edits()
         elif self.is_editing and self._current_server is not None:
+            if not self._validate_card_name(self.server_tabs, "сервера"):
+                return False
             self._stash_current_server_edits()
         elif self.is_editing and self._current_account_id is not None:
+            if not self._validate_card_name(self.tabs, "аккаунта"):
+                return False
             self._stash_current_edits(self._current_account_id)
         show_fin = self.config.get("show_fin_instruments", False)
         show_servers = self.config.get("show_servers", False)
+
+        # Сначала проверяем весь кеш, чтобы «Сохранить и выйти» не успело
+        # частично записать другие черновики перед карточкой без названия.
+        for (node_type, _rec_id), cached in self._edit_cache.items():
+            storage = cached.get("storage") or {}
+            name = (storage.get("fields", {}).get("account_name")
+                    if node_type == ACCOUNT else storage.get("name"))
+            if not str(name or "").strip():
+                theme.themed_info(
+                    self.config, self, "Не заполнено название",
+                    "У одной из карточек в черновиках не заполнено "
+                    "обязательное название. Выход отменён.")
+                return False
+
         for (node_type, rec_id), cached in list(self._edit_cache.items()):
             # Защита: при выключенной опции фин-правок/серверов в кеше быть не
             # должно (сброшены при выключении) — пропускаем, не пишем вслепую.
@@ -512,6 +533,14 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, ServerCardMixin, FinCardMixi
         self.sort_dir_btn.clicked.connect(self.on_sort_dir_toggled)
         self._update_sort_dir_btn()
         sort_layout.addWidget(self.sort_dir_btn)
+
+        # Общее сворачивание/разворачивание дерева. Размер совпадает с кнопкой
+        # направления сортировки; иконка — дерево, без ещё одной двусмысленной
+        # стрелки рядом с сортировкой.
+        self.tree_toggle_btn = QPushButton()
+        self.tree_toggle_btn.setFixedWidth(36)
+        self.tree_toggle_btn.clicked.connect(self.on_tree_toggle_all)
+        sort_layout.addWidget(self.tree_toggle_btn)
         left_layout.addLayout(sort_layout)
 
         self.tree = AccountTree()
@@ -531,8 +560,11 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, ServerCardMixin, FinCardMixi
                 "Для переноса используйте ПКМ → «Переместить…»", 4000)
         )
         self.tree.currentItemChanged.connect(self.on_item_selected)
+        self.tree.itemExpanded.connect(self._update_tree_toggle_btn)
+        self.tree.itemCollapsed.connect(self._update_tree_toggle_btn)
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self.show_tree_context_menu)
+        self._update_tree_toggle_btn()
         left_layout.addWidget(self.tree)
         self.splitter.addWidget(left_panel)
         
@@ -716,6 +748,7 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, ServerCardMixin, FinCardMixi
             QTreeWidget::item:hover {{ background-color: {main_bg}; }}
             QTreeWidget::item:selected {{ background-color: {text_color}; color: {tree_bg}; }}
         """ + self._branch_arrow_css(text_color, tree_bg, main_bg))
+        self._update_tree_toggle_btn()
 
     def _branch_arrow_css(self, text_color, tree_bg, main_bg):
         """Стрелки сворачивания/разворачивания, перекрашенные под тему.
@@ -827,9 +860,27 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, ServerCardMixin, FinCardMixi
         # кроме корзины (по образцу _apply_fin_visibility).
         self._apply_server_visibility()
 
+        # Новая настройка внешнего вида применяется к уже открытой карточке
+        # сразу, без её закрытия/повторного выбора в дереве.
+        self._apply_empty_card_visibility()
+
         # Раскладка рядов кнопок создания зависит от обоих тумблеров сразу —
         # пересчитывается один раз после того, как оба флага применены.
         self._relayout_create_buttons()
+
+    def _apply_empty_card_visibility(self):
+        """Обновить пустые поля/вкладки только у открытой карточки."""
+        current = self.right_stack.currentWidget()
+        if current is self.tabs:
+            self.tabs.refresh_empty_visibility(self.is_editing)
+            return
+        if current is self.server_tabs:
+            self.server_tabs.refresh_empty_visibility(self.is_editing)
+            return
+        for fin_tabs in self.fin_tabs_by_type.values():
+            if current is fin_tabs:
+                fin_tabs.refresh_empty_visibility(self.is_editing)
+                return
 
     def _relayout_create_buttons(self):
         """Перестроить состав рядов кнопок создания по флагам show_fin_instruments/

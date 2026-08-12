@@ -66,6 +66,9 @@ class Config:
             "text_color": "#000000",
             "tree_bg_color": "#FFFFFF",
             "main_bg_color": "#F0F0F0",
+            # В режиме просмотра не занимать место пустыми полями и целыми
+            # пустыми вкладками карточек. В редактировании они видны всегда.
+            "hide_empty_card_fields": True,
             "remember_geometry": False,
             "clipboard_clear_secs": 0,
             "clipboard_clear_on_exit": False,

@@ -44,6 +44,46 @@ def test_tree_build_and_navigation(window):
     assert node and node["type"] == "account" and node["id"] == aid
 
 
+def test_save_from_empty_tab_returns_to_filled_account_tab(window):
+    """Save не оставляет стек на скрывшейся пустой вкладке (чёрный экран)."""
+    aid = window.db.add_account(None, "Акк")
+    window._reload_tree()
+    window._select_node(ACCOUNT, aid)
+    window.toggle_edit_mode()
+
+    recovery_index = 4
+    window.tabs.setCurrentIndex(recovery_index)
+    assert window.tabs.currentIndex() == recovery_index
+    window.save_current()
+
+    assert not window.is_editing
+    assert not window.tabs.isTabVisible(recovery_index)
+    assert window.tabs.currentIndex() == 0
+    assert window.tabs.f_name.get_text() == "Акк"
+
+
+def test_account_empty_name_blocks_save_and_opens_base(window, monkeypatch):
+    import hranilka.ui.theme as theme_mod
+
+    aid = window.db.add_account(None, "Акк")
+    window._reload_tree()
+    window._select_node(ACCOUNT, aid)
+    window.toggle_edit_mode()
+    window.tabs.setCurrentIndex(4)
+    window.tabs.f_name.set_text("   ")
+    shown = []
+    monkeypatch.setattr(
+        theme_mod, "themed_info", lambda *a, **k: shown.append(a))
+
+    window.save_current()
+
+    assert window.db.load_account(aid)["fields"]["account_name"] == "Акк"
+    assert window.is_editing
+    assert window._card_busy is False
+    assert window.tabs.currentIndex() == 0
+    assert shown and shown[0][2] == "Не заполнено название"
+
+
 def test_vault_gate_runs_on_window(window):
     ok, res = window.vault.run_exclusive(lambda: "готово")
     assert ok and res == "готово"
@@ -600,6 +640,7 @@ def test_save_unblocks_card_on_stale_session(window, monkeypatch):
     window._select_node("account", aid)
     window.toggle_edit_mode()
     window.tabs.f_login.set_text("user@example.com")
+    window.tabs.setCurrentIndex(4)  # пустая вкладка скрывается на время записи
 
     def boom(*a, **k):
         raise StaleSessionError()
@@ -610,3 +651,4 @@ def test_save_unblocks_card_on_stale_session(window, monkeypatch):
     assert not window.tabs.f_login.input.isReadOnly()
     assert ("account", aid) in window._edit_cache
     assert ("account", aid) in window._dirty_ids
+    assert window.tabs.currentIndex() == 4

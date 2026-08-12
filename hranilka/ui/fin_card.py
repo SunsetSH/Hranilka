@@ -214,10 +214,10 @@ class FinCardMixin:
             list_widget.set_items(value if isinstance(value, list) else [])
 
     def _collect_fin_storage(self):
-        """Собрать storage записи из полей UI (без записи в БД). Имя редактируется
-        на карточке (f_name); пустое/пробельное имя не сохраняем — оставляем
-        прежнее (запись без имени недопустима). Галерея снимается из виджета
-        (контракт H-6/M7-03).
+        """Собрать storage записи из полей UI (без записи в БД).
+
+        Обязательное имя проверяется до вызова этого метода в fin_save().
+        Галерея снимается из виджета (контракт H-6/M7-03).
 
         collect_payload() отдаёт только ключи ТЕКУЩЕГО дескриптора типа —
         сливаем их поверх уже загруженного payload, а не заменяем целиком:
@@ -225,9 +225,7 @@ class FinCardMixin:
         более новой версией — концепт §1 гарантирует толерантное чтение
         именно ради таких случаев), стирались бы при первом же сохранении."""
         data = self.current_fin_data
-        name = self.fin_tabs.f_name.get_text().strip()
-        if name:
-            data.name = name
+        data.name = self.fin_tabs.f_name.get_text().strip()
         data.payload = {**data.payload, **self.fin_tabs.collect_payload()}
         data.gallery = self.fin_tabs.f_gallery_widget.get_data()
         return data.to_storage()
@@ -263,6 +261,8 @@ class FinCardMixin:
     def fin_save(self):
         if self._card_busy:
             return
+        if not self._validate_card_name(self.fin_tabs, "финансовой записи"):
+            return
         self._set_card_busy(True)
         util.fire(self._fin_save_async(self._card_gen))
 
@@ -274,6 +274,7 @@ class FinCardMixin:
             return
         node_type, item_id = fin
         # Блокируем поля на время записи (снимок согласован до await), H65-01.
+        active_tab = self.fin_tabs.currentIndex()
         self.fin_tabs.set_all_editable(False)
         # Дождаться незавершённых загрузок картинок галереи: иначе get_data()
         # пропустит ещё не дочитанные BLOB и Save «потеряет» изображение (M6-01).
@@ -299,6 +300,7 @@ class FinCardMixin:
                 self._dirty_ids.add(fin)
                 self._refresh_fin_marker(node_type, item_id)
                 self.fin_tabs.set_all_editable(True)
+                self.fin_tabs.setCurrentIndex(active_tab)
                 self._set_card_busy(False)
                 self.statusBar().showMessage(
                     "База была переоткрыта — сохранение не выполнено, "
@@ -311,6 +313,7 @@ class FinCardMixin:
                 self._dirty_ids.add(fin)
                 self._refresh_fin_marker(node_type, item_id)
                 self.fin_tabs.set_all_editable(True)
+                self.fin_tabs.setCurrentIndex(active_tab)
                 self._show_card_error("Не удалось сохранить запись", e)
                 self._set_card_busy(False)
             return

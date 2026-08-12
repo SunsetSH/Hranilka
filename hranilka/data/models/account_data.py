@@ -6,7 +6,6 @@ SQLite CURRENT_TIMESTAMP («ГГГГ-ММ-ДД ЧЧ:ММ:СС») — тот же
 в Qt-типы для отображения происходит на границе UI
 (hranilka/ui/widgets/fields.py, CopyableDateField)."""
 import platform
-import uuid
 from datetime import date, datetime, time
 from typing import Any, Optional
 
@@ -34,7 +33,9 @@ class AccountData:
         self.address = ""
         self.secret_questions: list[dict[str, str]] = []  # [{"q": "", "a": ""}]
         self.recovery_phrase = ""
-        self.device_id = str(uuid.uuid4())[:8].upper()
+        # ID устройства — пользовательские данные, не генерируем фиктивное
+        # значение при создании аккаунта.
+        self.device_id = ""
         self.one_time_codes: list[str] = []
         self.gallery: list[dict[str, Any]] = []  # [{"data": bytes, "desc": str}]
         self.ip = ""
@@ -155,7 +156,7 @@ class AccountData:
 
         d.secret_questions = list(storage["questions"])
         d.recovery_phrase = storage["recovery"].get("phrase") or ""
-        d.device_id = storage["recovery"].get("device_id") or d.device_id
+        d.device_id = storage["recovery"].get("device_id") or ""
         d.one_time_codes = list(storage["codes"])
         d.gallery = list(storage["gallery"])
         return d

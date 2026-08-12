@@ -239,8 +239,9 @@ class ServerCardMixin:
         self.server_tabs.resync_lists(payload)
 
     def _collect_server_storage(self):
-        """Собрать storage сервера из полей UI (без записи в БД). Пустое имя
-        не сохраняем — оставляем прежнее (сервер без имени недопустим).
+        """Собрать storage сервера из полей UI (без записи в БД).
+
+        Обязательное имя проверяется до вызова этого метода в server_save().
 
         История паролей (docs/ТЗ_VPS_Серверы.md §8.3): если пароль
         пользователя ОС/панели изменился (сопоставление старого/нового
@@ -249,9 +250,7 @@ class ServerCardMixin:
         AccountCardMixin._collect_account_data/_append_password_history."""
         data = self.current_server_data
         old_payload = data.payload
-        name = self.server_tabs.f_name.get_text().strip()
-        if name:
-            data.name = name
+        data.name = self.server_tabs.f_name.get_text().strip()
         new_payload = self.server_tabs.collect_payload()
         new_payload["notes"] = self._append_server_password_history(
             new_payload.get("notes", ""), old_payload, new_payload)
@@ -284,6 +283,8 @@ class ServerCardMixin:
     def server_save(self):
         if self._card_busy:
             return
+        if not self._validate_card_name(self.server_tabs, "сервера"):
+            return
         self._set_card_busy(True)
         util.fire(self._server_save_async(self._card_gen))
 
@@ -294,6 +295,7 @@ class ServerCardMixin:
             self._set_card_busy(False)
             return
         _node_type, item_id = server
+        active_tab = self.server_tabs.currentIndex()
         self.server_tabs.set_all_editable(False)
         gallery = self.server_tabs.f_gallery_widget
         if gallery.has_pending_uploads():
@@ -313,6 +315,7 @@ class ServerCardMixin:
                 self._dirty_ids.add(server)
                 self._refresh_server_marker(item_id)
                 self.server_tabs.set_all_editable(True)
+                self.server_tabs.setCurrentIndex(active_tab)
                 self._set_card_busy(False)
                 self.statusBar().showMessage(
                     "База была переоткрыта — сохранение не выполнено, "
@@ -324,6 +327,7 @@ class ServerCardMixin:
                 self._dirty_ids.add(server)
                 self._refresh_server_marker(item_id)
                 self.server_tabs.set_all_editable(True)
+                self.server_tabs.setCurrentIndex(active_tab)
                 self._show_card_error("Не удалось сохранить сервер", e)
                 self._set_card_busy(False)
             return

@@ -53,7 +53,24 @@ class AccountTabs(WrappingTabWidget):
     def _add_scroll_tab(self, inner: QWidget, title: str) -> None:
         sa = wrap_scrollable(inner, self)
         self._scroll_areas.append(sa)
-        self.addTab(sa, title)
+        index = self.addTab(sa, title)
+        self.bind_empty_page(inner, index)
+
+    @staticmethod
+    def _has_text(widget) -> bool:
+        return bool(widget.get_text().strip())
+
+    def _add_labeled_field(self, page, layout, title, widget,
+                           has_content=None, available=None, required=False):
+        """Добавить подпись + поле и зарегистрировать их как одну секцию."""
+        label = heading_label(title)
+        layout.addWidget(label)
+        layout.addWidget(widget)
+        predicate = has_content or (lambda w=widget: self._has_text(w))
+        self.register_empty_section(
+            page, (label, widget), predicate, available=available,
+            required=required)
+        return label
 
     def build_tabs(self):
         self._add_scroll_tab(self.create_tab_baza(), "База")
@@ -78,27 +95,39 @@ class AccountTabs(WrappingTabWidget):
         self.f_fin_linked = LinkedFinItemsWidget()
         self.f_server_linked = LinkedServersWidget()
 
-        l.addWidget(heading_label("Название аккаунта:"))
-        l.addWidget(self.f_name)
-        l.addWidget(heading_label("Адрес сайта (URL):"))
-        l.addWidget(self.f_url)
-        l.addWidget(heading_label("Дата создания:"))
-        l.addWidget(self.f_creation_date)
-        l.addWidget(heading_label("Заметки:"))
-        l.addWidget(self.f_notes)
-        l.addWidget(heading_label("Связанные аккаунты:"))
-        l.addWidget(self.f_linked)
+        self._add_labeled_field(
+            w, l, "Название аккаунта (обязательно):", self.f_name,
+            required=True)
+        self._add_labeled_field(w, l, "Адрес сайта (URL):", self.f_url)
+        self._add_labeled_field(
+            w, l, "Дата создания:", self.f_creation_date,
+            lambda: self.f_creation_date.get_date() is not None)
+        self._add_labeled_field(w, l, "Заметки:", self.f_notes)
+        self._add_labeled_field(
+            w, l, "Связанные аккаунты:", self.f_linked,
+            lambda: bool(self.f_linked.get_data()))
         # Секция привязанных карт/кошельков — скрывается при выключенной опции
         # «Показывать фин. инструменты» (заголовок + виджет, см.
         # set_fin_section_visible).
         self.f_fin_linked_heading = heading_label("ПРИВЯЗАННЫЕ КАРТЫ И КОШЕЛЬКИ:")
         l.addWidget(self.f_fin_linked_heading)
         l.addWidget(self.f_fin_linked)
+        self.register_empty_section(
+            w, (self.f_fin_linked_heading, self.f_fin_linked),
+            lambda: bool(self.f_fin_linked.get_data()),
+            available=lambda: bool(
+                self.config is None
+                or self.config.get("show_fin_instruments", False)))
         # Секция привязанных серверов — независимый аналог (docs/ТЗ_VPS_Серверы.md
         # §4), скрывается при выключенной опции «Показывать серверы».
         self.f_server_linked_heading = heading_label("ПРИВЯЗАННЫЕ СЕРВЕРЫ:")
         l.addWidget(self.f_server_linked_heading)
         l.addWidget(self.f_server_linked)
+        self.register_empty_section(
+            w, (self.f_server_linked_heading, self.f_server_linked),
+            lambda: bool(self.f_server_linked.get_data()),
+            available=lambda: bool(
+                self.config is None or self.config.get("show_servers", False)))
         l.addStretch()
         return w
 
@@ -127,19 +156,19 @@ class AccountTabs(WrappingTabWidget):
         self.f_password_date = CopyableDateField(is_datetime=False)
         self.f_pwd_interval = IntervalField()
 
-        l.addWidget(heading_label("Логин:"))
-        l.addWidget(self.f_login)
-        l.addWidget(heading_label("Пароль:"))
-        l.addWidget(self.f_password)
+        self._add_labeled_field(w, l, "Логин:", self.f_login)
+        self._add_labeled_field(w, l, "Пароль:", self.f_password)
         gen_row = QHBoxLayout()
         gen_row.setSpacing(5)
         gen_row.addWidget(self.gen_pass_btn)
         gen_row.addWidget(self.gen_pass_cfg_btn)
         l.addLayout(gen_row)
-        l.addWidget(heading_label("Пароль сменён:"))
-        l.addWidget(self.f_password_date)
-        l.addWidget(heading_label("Сменять пароль каждые:"))
-        l.addWidget(self.f_pwd_interval)
+        self._add_labeled_field(
+            w, l, "Пароль сменён:", self.f_password_date,
+            lambda: self.f_password_date.get_date() is not None)
+        self._add_labeled_field(
+            w, l, "Сменять пароль каждые:", self.f_pwd_interval,
+            lambda: self.f_pwd_interval.get_value() is not None)
         l.addStretch()
         return w
 
@@ -156,18 +185,14 @@ class AccountTabs(WrappingTabWidget):
         self.f_address = CopyableField()
         self.gen_pd_btn = QPushButton("СГЕНЕРИРОВАТЬ (RU/EN)")
 
-        l.addWidget(heading_label("Мобильный номер:"))
-        l.addWidget(self.f_mobile)
-        l.addWidget(heading_label("Имя:"))
-        l.addWidget(self.f_first)
-        l.addWidget(heading_label("Фамилия:"))
-        l.addWidget(self.f_last)
-        l.addWidget(heading_label("Отчество:"))
-        l.addWidget(self.f_middle)
-        l.addWidget(heading_label("Дата рождения:"))
-        l.addWidget(self.f_birth)
-        l.addWidget(heading_label("Адрес:"))
-        l.addWidget(self.f_address)
+        self._add_labeled_field(w, l, "Мобильный номер:", self.f_mobile)
+        self._add_labeled_field(w, l, "Имя:", self.f_first)
+        self._add_labeled_field(w, l, "Фамилия:", self.f_last)
+        self._add_labeled_field(w, l, "Отчество:", self.f_middle)
+        self._add_labeled_field(
+            w, l, "Дата рождения:", self.f_birth,
+            lambda: self.f_birth.get_date() is not None)
+        self._add_labeled_field(w, l, "Адрес:", self.f_address)
         l.addWidget(self.gen_pd_btn)
         l.addStretch()
         return w
@@ -179,6 +204,9 @@ class AccountTabs(WrappingTabWidget):
         l.setContentsMargins(0, 8, 0, 0)
         self.f_questions_widget = SecretQuestionsWidget(config=self.config, parent=w)
         l.addWidget(self.f_questions_widget)
+        self.register_empty_section(
+            w, self.f_questions_widget,
+            lambda: bool(self.f_questions_widget.get_data()))
         return w
 
     def create_tab_recovery(self):
@@ -189,10 +217,9 @@ class AccountTabs(WrappingTabWidget):
         # Секрет: в просмотре текст скрыт, раскрывается кнопкой (M-02).
         self.f_recovery = MaskedTextEdit()
         self.f_device_id = CopyableField()
-        l.addWidget(heading_label("Фраза восстановления:"))
-        l.addWidget(self.f_recovery)
-        l.addWidget(heading_label("ID устройства:"))
-        l.addWidget(self.f_device_id)
+        self._add_labeled_field(
+            w, l, "Фраза восстановления:", self.f_recovery)
+        self._add_labeled_field(w, l, "ID устройства:", self.f_device_id)
         l.addStretch()
         return w
 
@@ -202,10 +229,16 @@ class AccountTabs(WrappingTabWidget):
 
     def create_tab_codes(self):
         self.f_codes_widget = CodeListWidget(config=self.config, parent=self)
+        self.register_empty_section(
+            self.f_codes_widget, self.f_codes_widget,
+            lambda: bool(self.f_codes_widget.get_data()))
         return self.f_codes_widget
 
     def create_tab_gallery(self):
         self.f_gallery_widget = GalleryWidget(config=self.config, parent=self)
+        self.register_empty_section(
+            self.f_gallery_widget, self.f_gallery_widget,
+            lambda: bool(self.f_gallery_widget.items))
         return self.f_gallery_widget
 
     def create_tab_tech(self):
@@ -217,12 +250,9 @@ class AccountTabs(WrappingTabWidget):
         self.f_browser = CopyableField()
         self.f_browser.set_placeholder("Chrome/Firefox/...")
         self.f_os = CopyableField()
-        l.addWidget(heading_label("IP адрес:"))
-        l.addWidget(self.f_ip)
-        l.addWidget(heading_label("Браузер:"))
-        l.addWidget(self.f_browser)
-        l.addWidget(heading_label("ОС:"))
-        l.addWidget(self.f_os)
+        self._add_labeled_field(w, l, "IP адрес:", self.f_ip)
+        self._add_labeled_field(w, l, "Браузер:", self.f_browser)
+        self._add_labeled_field(w, l, "ОС:", self.f_os)
         l.addStretch()
         return w
 
@@ -251,3 +281,4 @@ class AccountTabs(WrappingTabWidget):
         self.f_questions_widget.set_editable(editable)
         self.f_codes_widget.set_editable(editable)
         self.f_gallery_widget.set_editable(editable)
+        self.refresh_empty_visibility(editable)

@@ -15,6 +15,12 @@ def test_bool_string_false_is_false(pure_config):
     assert pure_config._sanitize({"remember_geometry": 1})["remember_geometry"] is True
 
 
+def test_hide_empty_card_fields_defaults_on_and_sanitizes(pure_config):
+    assert pure_config.get("hide_empty_card_fields") is True
+    assert pure_config._sanitize(
+        {"hide_empty_card_fields": "false"})["hide_empty_card_fields"] is False
+
+
 def test_int_ranges_clamped(pure_config):
     assert pure_config._sanitize({"font_size": "999"})["font_size"] == 96      # max
     assert pure_config._sanitize({"font_size": -10})["font_size"] == 6         # min

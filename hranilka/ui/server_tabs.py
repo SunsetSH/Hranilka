@@ -187,7 +187,8 @@ class ServerTabs(WrappingTabWidget):
     def _add_scroll_tab(self, inner: QWidget, title: str) -> None:
         sa = wrap_scrollable(inner, self)
         self._scroll_areas.append(sa)
-        self.addTab(sa, title)
+        index = self.addTab(sa, title)
+        self.bind_empty_page(inner, index)
 
     def build_tabs(self):
         self._add_scroll_tab(self._build_base_tab(), "База")
@@ -207,20 +208,27 @@ class ServerTabs(WrappingTabWidget):
 
     # ----- Вкладка «База» -----
 
-    def _row(self, left_key, left_label, left_widget,
+    def _row(self, page, left_key, left_label, left_widget,
             right_key, right_label, right_widget):
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(10)
         for key, label, widget in ((left_key, left_label, left_widget),
                                    (right_key, right_label, right_widget)):
+            column_index = row.count()
             col = QVBoxLayout()
             col.setContentsMargins(0, 0, 0, 0)
             col.setSpacing(4)
-            col.addWidget(heading_label(label + ":"))
+            heading = heading_label(label + ":")
+            col.addWidget(heading)
             col.addWidget(widget)
             row.addLayout(col, 1)
             self._widgets[key] = widget
+            self.register_empty_section(
+                page, (heading, widget),
+                lambda w=widget: bool(w.get_text().strip()),
+                visibility_changed=lambda shown, r=row, i=column_index:
+                    r.setStretch(i, 1 if shown else 0))
         return row
 
     def _build_base_tab(self):
@@ -230,39 +238,55 @@ class ServerTabs(WrappingTabWidget):
         layout.setContentsMargins(0, 8, 0, 0)
 
         self.f_name = CopyableField()
-        layout.addWidget(heading_label("Название:"))
+        name_label = heading_label("Название (обязательно):")
+        layout.addWidget(name_label)
         layout.addWidget(self.f_name)
+        self.register_empty_section(
+            w, (name_label, self.f_name),
+            lambda: bool(self.f_name.get_text().strip()), required=True)
 
         hosting = CopyableField()
         self._widgets["hosting"] = hosting
-        layout.addWidget(heading_label("Провайдер / тариф:"))
+        hosting_label = heading_label("Провайдер / тариф:")
+        layout.addWidget(hosting_label)
         layout.addWidget(hosting)
+        self.register_empty_section(
+            w, (hosting_label, hosting),
+            lambda: bool(hosting.get_text().strip()))
 
-        layout.addLayout(self._row(
+        layout.addLayout(self._row(w,
             "paid_until", "Оплачен до", _PaidUntilField(),
             "price", "Стоимость", CopyableField()))
 
-        layout.addLayout(self._row(
+        layout.addLayout(self._row(w,
             "host", "Хост / IP", CopyableField(),
             "ssh_port", "Порт SSH", CopyableField()))
 
-        layout.addLayout(self._row(
+        layout.addLayout(self._row(w,
             "os_name", "ОС", CopyableField(),
             "location", "Локация", CopyableField()))
 
         self._extra_ips_widget = KeyValueListWidget(
             _EXTRA_IP_FIELDS, config=self.config)
-        layout.addWidget(heading_label("Доп. IP:"))
+        ips_label = heading_label("Доп. IP:")
+        layout.addWidget(ips_label)
         layout.addWidget(self._extra_ips_widget)
+        self.register_empty_section(
+            w, (ips_label, self._extra_ips_widget),
+            lambda: bool(self._extra_ips_widget.get_items()))
 
-        self._add_links_section(layout)
+        self._add_links_section(w, layout)
         layout.addStretch()
         return w
 
-    def _add_links_section(self, layout):
+    def _add_links_section(self, page, layout):
         self.f_linked_accounts = LinkedAccountsWidget()
-        layout.addWidget(heading_label("ПРИВЯЗАН К АККАУНТАМ:"))
+        label = heading_label("ПРИВЯЗАН К АККАУНТАМ:")
+        layout.addWidget(label)
         layout.addWidget(self.f_linked_accounts)
+        self.register_empty_section(
+            page, (label, self.f_linked_accounts),
+            lambda: bool(self.f_linked_accounts.get_data()))
 
     # ----- Списковые вкладки (пользователи/ключи/панели) -----
 
@@ -277,7 +301,8 @@ class ServerTabs(WrappingTabWidget):
         layout = QVBoxLayout(w)
         layout.setSpacing(10)
         layout.setContentsMargins(0, 8, 0, 0)
-        layout.addWidget(heading_label(heading + ":"))
+        label = heading_label(heading + ":")
+        layout.addWidget(label)
         if gen_settings:
             list_widget = KeyValueListWidget(
                 item_fields, config=self.config,
@@ -287,6 +312,9 @@ class ServerTabs(WrappingTabWidget):
             list_widget = KeyValueListWidget(item_fields, config=self.config)
         self._list_widgets[key] = list_widget
         layout.addWidget(list_widget)
+        self.register_empty_section(
+            w, (label, list_widget),
+            lambda lw=list_widget: bool(lw.get_items()))
         layout.addStretch()
         return w
 
@@ -319,8 +347,11 @@ class ServerTabs(WrappingTabWidget):
         notes = CopyableTextEdit()
         self.f_notes = notes
         self._widgets["notes"] = notes
-        layout.addWidget(heading_label("Заметки:"))
+        label = heading_label("Заметки:")
+        layout.addWidget(label)
         layout.addWidget(notes)
+        self.register_empty_section(
+            w, (label, notes), lambda: bool(notes.get_text().strip()))
         return w
 
     def _build_gallery_tab(self):
@@ -330,6 +361,9 @@ class ServerTabs(WrappingTabWidget):
         layout.setContentsMargins(0, 8, 0, 0)
         self.f_gallery_widget = GalleryWidget(config=self.config)
         layout.addWidget(self.f_gallery_widget)
+        self.register_empty_section(
+            w, self.f_gallery_widget,
+            lambda: bool(self.f_gallery_widget.items))
         return w
 
     # ----- Контракт (по образцу FinItemTabs) -----
@@ -354,6 +388,7 @@ class ServerTabs(WrappingTabWidget):
         self._extra_ips_widget.set_editable(editable)
         self.f_linked_accounts.set_editable(editable)
         self.f_gallery_widget.set_editable(editable)
+        self.refresh_empty_visibility(editable)
 
     def load_payload(self, payload: dict) -> None:
         for key, widget in self.fields():

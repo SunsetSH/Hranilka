@@ -134,7 +134,8 @@ class FinItemTabs(WrappingTabWidget):
     def _add_scroll_tab(self, inner: QWidget, title: str) -> None:
         sa = wrap_scrollable(inner, self)
         self._scroll_areas.append(sa)
-        self.addTab(sa, title)
+        index = self.addTab(sa, title)
+        self.bind_empty_page(inner, index)
 
     def build_tabs(self):
         for tab_name in self.spec.tabs:
@@ -157,23 +158,31 @@ class FinItemTabs(WrappingTabWidget):
         if first_tab:
             # Имя записи — первое поле первой вкладки каждого типа (часть storage).
             self.f_name = CopyableField()
-            layout.addWidget(heading_label("Название:"))
+            name_label = heading_label("Название (обязательно):")
+            layout.addWidget(name_label)
             layout.addWidget(self.f_name)
-        self._add_field_widgets(layout, tab_name)
+            self.register_empty_section(
+                w, (name_label, self.f_name),
+                lambda: bool(self.f_name.get_text().strip()), required=True)
+        self._add_field_widgets(w, layout, tab_name)
         # Повторяемые блоки (адреса, приватные ключи) — генерик по ListSpec.
         for ls in self.spec.lists:
             if ls.tab != tab_name:
                 continue
             list_widget = KeyValueListWidget(ls.item_fields, config=self.config)
             self._list_widgets[ls.key] = list_widget
-            layout.addWidget(heading_label(ls.label + ":"))
+            list_label = heading_label(ls.label + ":")
+            layout.addWidget(list_label)
             layout.addWidget(list_widget)
+            self.register_empty_section(
+                w, (list_label, list_widget),
+                lambda lw=list_widget: bool(lw.get_items()))
         if first_tab:
-            self._add_links_section(layout)
+            self._add_links_section(w, layout)
         layout.addStretch()
         return w
 
-    def _add_field_widgets(self, layout, tab_name):
+    def _add_field_widgets(self, page, layout, tab_name):
         """Разложить поля вкладки: подряд идущие поля с общим row_group — в одну
         строку (generic для любых будущих групп), остальные — колонкой."""
         fields = [f for f in self.spec.fields if f.tab == tab_name]
@@ -183,8 +192,12 @@ class FinItemTabs(WrappingTabWidget):
             if field.row_group is None:
                 widget = self._make_widget(field)
                 self._widgets[field.key] = widget
-                layout.addWidget(heading_label(field.label + ":"))
+                label = heading_label(field.label + ":")
+                layout.addWidget(label)
                 layout.addWidget(widget)
+                self.register_empty_section(
+                    page, (label, widget),
+                    lambda w=widget: bool(w.get_text().strip()))
                 i += 1
                 continue
             # Собираем подряд идущие поля одной группы в общую строку.
@@ -193,26 +206,33 @@ class FinItemTabs(WrappingTabWidget):
             while j < len(fields) and fields[j].row_group == field.row_group:
                 group.append(fields[j])
                 j += 1
-            layout.addLayout(self._build_field_row(group))
+            layout.addLayout(self._build_field_row(page, group))
             i = j
 
-    def _build_field_row(self, group):
+    def _build_field_row(self, page, group):
         """Строка из мини-колонок (подпись над полем), делящих ширину поровну."""
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(10)
         for field in group:
+            column_index = row.count()
             col = QVBoxLayout()
             col.setContentsMargins(0, 0, 0, 0)
             col.setSpacing(4)                # подпись плотно над своим полем
             widget = self._make_widget(field)
             self._widgets[field.key] = widget
-            col.addWidget(heading_label(field.label + ":"))
+            label = heading_label(field.label + ":")
+            col.addWidget(label)
             col.addWidget(widget)
             row.addLayout(col, 1)            # равная доля ширины
+            self.register_empty_section(
+                page, (label, widget),
+                lambda w=widget: bool(w.get_text().strip()),
+                visibility_changed=lambda shown, r=row, i=column_index:
+                    r.setStretch(i, 1 if shown else 0))
         return row
 
-    def _add_links_section(self, layout):
+    def _add_links_section(self, page, layout):
         """Секция «ИСПОЛЬЗУЕТСЯ В АККАУНТАХ» внизу первой вкладки (у всех типов,
         концепт §8): отделяется горизонтальной линией. Отдельной вкладки нет."""
         line = QFrame()
@@ -220,8 +240,12 @@ class FinItemTabs(WrappingTabWidget):
         line.setFrameShadow(QFrame.Sunken)
         layout.addWidget(line)
         self.f_linked_accounts = LinkedAccountsWidget()
-        layout.addWidget(heading_label("ИСПОЛЬЗУЕТСЯ В АККАУНТАХ:"))
+        label = heading_label("ИСПОЛЬЗУЕТСЯ В АККАУНТАХ:")
+        layout.addWidget(label)
         layout.addWidget(self.f_linked_accounts)
+        self.register_empty_section(
+            page, (line, label, self.f_linked_accounts),
+            lambda: bool(self.f_linked_accounts.get_data()))
 
     def _build_gallery_tab(self):
         """Вкладка «Галерея»: переиспользованный GalleryWidget аккаунта (§5).
@@ -233,6 +257,9 @@ class FinItemTabs(WrappingTabWidget):
         layout.setContentsMargins(0, 8, 0, 0)
         self.f_gallery_widget = GalleryWidget(config=self.config)
         layout.addWidget(self.f_gallery_widget)
+        self.register_empty_section(
+            w, self.f_gallery_widget,
+            lambda: bool(self.f_gallery_widget.items))
         return w
 
     def _make_widget(self, field):
@@ -281,6 +308,7 @@ class FinItemTabs(WrappingTabWidget):
             widget.set_editable(editable)
         self.f_linked_accounts.set_editable(editable)
         self.f_gallery_widget.set_editable(editable)
+        self.refresh_empty_visibility(editable)
 
     def load_payload(self, payload: dict) -> None:
         """Заполнить поля из payload. Программная установка — не триггерит

@@ -167,14 +167,14 @@ _WALLET_KINDS = ("hot", "cold", "hardware", "exchange", "custodial")
 _NETWORKS = ("BTC", "ETH", "TRON", "SOL", "TON", "other")
 
 _CRYPTO_WALLET_FIELDS = (
-    # Вкладка «Кошелёк»
-    FieldSpec("wallet_kind", "Тип кошелька", "enum", "Кошелёк",
+    # Вкладка «База»
+    FieldSpec("wallet_kind", "Тип кошелька", "enum", "База",
               options=_WALLET_KINDS),
-    FieldSpec("vendor", "Приложение/устройство", "text", "Кошелёк",
+    FieldSpec("vendor", "Приложение/устройство", "text", "База",
               placeholder="MetaMask / Ledger / Trezor / Binance"),
-    FieldSpec("derivation_path", "Derivation path", "text", "Кошелёк",
+    FieldSpec("derivation_path", "Derivation path", "text", "База",
               placeholder="m/44'/60'/0'/0/0"),
-    FieldSpec("created", "Дата создания", "date", "Кошелёк"),
+    FieldSpec("created", "Дата создания", "date", "База"),
     # Вкладка «Seed-фраза» (счётчик слов живёт внутри SeedPhraseWidget —
     # отдельного поля seed_words_count нет; старый ключ в payload игнорируется).
     FieldSpec("seed_phrase", "Seed-фраза", "seed", "Seed-фраза", secret=True),
@@ -210,7 +210,7 @@ _CRYPTO_WALLET = ItemTypeSpec(
     title="Криптокошелёк",
     node_type=WALLET,
     tree_prefix="[₿] ",
-    tabs=("Кошелёк", "Seed-фраза", "Адреса", "Ключи", "Заметки"),
+    tabs=("База", "Seed-фраза", "Адреса", "Ключи", "Заметки"),
     fields=_CRYPTO_WALLET_FIELDS,
     lists=_CRYPTO_WALLET_LISTS,
     extract=_crypto_wallet_extract,

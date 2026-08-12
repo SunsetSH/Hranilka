@@ -230,6 +230,19 @@ class AccountCardMixin:
             f"Операция не выполнена ({type(exc).__name__}).\n"
             "Подробности — в логе программы.")
 
+    def _validate_card_name(self, tabs, entity_name):
+        """Проверить и нормализовать обязательное название карточки."""
+        name = tabs.f_name.get_text().strip()
+        if name:
+            tabs.f_name.set_text(name)
+            return True
+        tabs.setCurrentIndex(0)  # обязательное название всегда на «Базе»
+        tabs.f_name.input.setFocus()
+        theme.themed_info(
+            self.config, self, "Не заполнено название",
+            f"Укажите название {entity_name}. Без названия карточку сохранить нельзя.")
+        return False
+
     def on_item_selected(self, current, previous):
         node = self._node(current)
         new_id = node["id"] if (node and node["type"] == ACCOUNT) else None
@@ -439,7 +452,7 @@ class AccountCardMixin:
         notes = self._append_password_history(
             self.tabs.f_notes.get_text(), old_password, new_password)
 
-        d.name = self.tabs.f_name.get_text()
+        d.name = self.tabs.f_name.get_text().strip()
         d.url = self.tabs.f_url.get_text()
         d.creation_date = self.tabs.f_creation_date.get_date()
         _pwd = self.tabs.f_password_date.get_date()
@@ -650,6 +663,8 @@ class AccountCardMixin:
     def save_account(self):
         if self._card_busy:
             return                              # повторный Save во время записи запрещён
+        if not self._validate_card_name(self.tabs, "аккаунта"):
+            return
         self._set_card_busy(True)
         util.fire(self._save_account_async(self._card_gen))
 
@@ -666,6 +681,7 @@ class AccountCardMixin:
         # уже заблокированы (_set_card_busy), но сами поля оставались editable —
         # текст, введённый во время await, не попадал бы ни в снимок, ни в БД и
         # тихо терялся. Блокируем ДО первого await (ожидание загрузок картинок).
+        active_tab = self.tabs.currentIndex()
         self.tabs.set_all_editable(False)
         # Дождаться незавершённых загрузок картинок: иначе get_data() пропустит
         # ещё не дочитанные BLOB и Save «потеряет» изображение (M6-01).
@@ -700,6 +716,7 @@ class AccountCardMixin:
                 self._dirty_ids.add((ACCOUNT, aid))
                 self._refresh_dirty_markers(aid)
                 self.tabs.set_all_editable(True)
+                self.tabs.setCurrentIndex(active_tab)
                 self._set_card_busy(False)
                 self.statusBar().showMessage(
                     "База была переоткрыта — сохранение не выполнено, "
@@ -716,6 +733,7 @@ class AccountCardMixin:
                 self._dirty_ids.add((ACCOUNT, aid))
                 self._refresh_dirty_markers(aid)
                 self.tabs.set_all_editable(True)
+                self.tabs.setCurrentIndex(active_tab)
                 self._show_card_error("Не удалось сохранить аккаунт", e)
                 self._set_card_busy(False)
             return
