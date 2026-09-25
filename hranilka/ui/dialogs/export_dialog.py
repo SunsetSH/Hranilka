@@ -45,7 +45,7 @@ class ExportDialog(ThemedDialog):
     VPS-серверов (docs/ТЗ_VPS_Серверы.md §5), независимая ветка."""
 
     def __init__(self, config, db, node_type, node_id, title="Вся база", parent=None,
-                 show_fin=True, show_servers=False):
+                 show_fin=True, show_servers=False, selected_nodes=None):
         super().__init__(config, parent)
         self.setWindowTitle("Экспорт")
         self.setModal(True)
@@ -53,6 +53,7 @@ class ExportDialog(ThemedDialog):
         self._db = db
         self._node_type = node_type
         self._node_id = node_id
+        self._selected_nodes = tuple(selected_nodes or ())
         self._title = title
         self._show_fin = show_fin
         self._show_servers = show_servers
@@ -249,8 +250,12 @@ class ExportDialog(ThemedDialog):
         session = self._db.current_session()
         stream_gallery = opts.include_gallery and func is export.export_html
         try:
+            snapshot_method = (self._db.export_selected if self._selected_nodes
+                               else self._db.export_subtree)
+            snapshot_args = ((self._selected_nodes,) if self._selected_nodes
+                             else (self._node_type, self._node_id))
             tree = await self._db.run_async(
-                self._db.export_subtree, self._node_type, self._node_id,
+                snapshot_method, *snapshot_args,
                 include_gallery=opts.include_gallery,
                 include_fin=opts.include_fin,
                 include_servers=opts.include_servers,

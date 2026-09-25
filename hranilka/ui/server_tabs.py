@@ -306,6 +306,7 @@ class ServerTabs(WrappingTabWidget):
         if gen_settings:
             list_widget = KeyValueListWidget(
                 item_fields, config=self.config,
+                copy_key="url" if key == "panels" else None,
                 gen_callback=self._generate_secret,
                 gen_settings_callback=self._open_gen_settings_for_row)
         else:

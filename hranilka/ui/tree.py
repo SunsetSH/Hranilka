@@ -7,8 +7,8 @@ TreeMixin: построение/перестроение дерева, сорт�
 идентично прежнему. Подмешивается в MainWindow перед QMainWindow."""
 from PySide6.QtWidgets import (QTreeWidget, QTreeWidgetItem, QMenu,
                                QAbstractItemView)
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QBrush
+from PySide6.QtCore import Qt, Signal, QItemSelectionModel
+from PySide6.QtGui import QBrush, QColor, QCursor, QDrag, QPainter, QPen
 
 from hranilka.core import domain
 from hranilka.core.nodetypes import (FOLDER, SERVICE, ACCOUNT, SERVER,
@@ -22,14 +22,25 @@ from hranilka.data.models import AccountData
 
 
 class AccountTree(QTreeWidget):
-    """Дерево с ограниченным drag&drop (вариант A): перетаскиванием можно менять
-    порядок только среди соседей ТОГО ЖЕ ТИПА и ТОГО ЖЕ родителя — включая
-    верхний уровень (папки среди папок, корневые сервисы среди корневых сервисов,
-    корневые аккаунты среди корневых аккаунтов). Перенос между родителями и смена
-    типа — через контекстное меню."""
+    """Дерево с безопасным переупорядочиванием внутри логической группы.
 
-    order_changed = Signal(object)   # параметр: элемент-родитель (или None для корня)
+    Вся верхняя половина строки означает вставку перед ней, нижняя — после.
+    Перенос между родителями остаётся в контекстном меню. Карты и кошельки
+    считаются одной группой, потому что хранят общий ``sort_order``.
+    """
+
+    FIN_GROUP = "fin_items"
+
+    # Параметры: элемент-родитель (или None для корня) и логическая группа.
+    order_changed = Signal(object, str)
     drop_rejected = Signal()
+    drop_hint_changed = Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._drop_line_y = None
+        self._drop_hint = ""
+        self._drop_indicator_color = self.palette().text().color()
 
     @staticmethod
     def _item_type(item):
@@ -38,34 +49,225 @@ class AccountTree(QTreeWidget):
         data = item.data(0, Qt.UserRole)
         return data["type"] if data else None
 
-    def dropEvent(self, event):
+    @classmethod
+    def item_order_group(cls, item):
+        """Группа с единым ``sort_order`` в БД."""
+        item_type = cls._item_type(item)
+        return cls.FIN_GROUP if item_type in FIN_LEAF_TYPES else item_type
+
+    @staticmethod
+    def _favorite_bucket(item):
+        data = item.data(0, Qt.UserRole) if item is not None else None
+        return bool(data and data.get("is_favorite"))
+
+    @staticmethod
+    def _item_name(item):
+        data = item.data(0, Qt.UserRole) if item is not None else None
+        return str(data.get("name", "")) if data else ""
+
+    def set_drop_indicator_color(self, color):
+        """Подстроить индикатор вставки под текущую тему."""
+        themed = QColor(color)
+        self._drop_indicator_color = (
+            themed if themed.isValid() else self.palette().text().color())
+        if self._drop_line_y is not None:
+            self.viewport().update()
+
+    def clear_drop_feedback(self):
+        """Убрать линию вставки и подсказку после завершения drag."""
+        had_line = self._drop_line_y is not None
+        self._drop_line_y = None
+        if had_line:
+            self.viewport().update()
+        if self._drop_hint:
+            self._drop_hint = ""
+            self.drop_hint_changed.emit("")
+
+    def _set_drop_feedback(self, plan, hint):
+        line_y = None
+        if plan is not None:
+            _sources, _parent, _group, target, before = plan
+            rect = self.visualItemRect(target)
+            if rect.isValid():
+                line_y = rect.top() if before else rect.bottom() + 1
+                line_y = max(1, min(line_y, self.viewport().height() - 2))
+        if line_y != self._drop_line_y:
+            self._drop_line_y = line_y
+            self.viewport().update()
+        if hint != self._drop_hint:
+            self._drop_hint = hint
+            self.drop_hint_changed.emit(hint)
+
+    def _validated_sources(self):
         sources = self.selectedItems()
         if not sources:
-            event.ignore()
+            return None, "Нет выбранных элементов"
+        parents = {item.parent() for item in sources}
+        groups = {self.item_order_group(item) for item in sources}
+        favorite_buckets = {self._favorite_bucket(item) for item in sources}
+        if len(parents) != 1 or len(groups) != 1 or len(favorite_buckets) != 1:
+            return None, "Выберите элементы одной группы для перетаскивания"
+        group = next(iter(groups))
+        if group is None:
+            return None, "Этот элемент нельзя переупорядочить"
+        return (sources, next(iter(parents)), group,
+                next(iter(favorite_buckets))), ""
+
+    def _drop_plan(self, point):
+        """Рассчитать вставку по половине полной строки под курсором."""
+        source_data, reason = self._validated_sources()
+        if source_data is None:
+            return None, reason
+        sources, source_parent, group, favorite_bucket = source_data
+
+        target = self.itemAt(point)
+        if target is None:
+            return None, "Наведите указатель на строку целевой группы"
+        if target in sources:
+            return None, "Выберите соседнюю строку как место вставки"
+        if target.parent() is not source_parent or self.item_order_group(target) != group:
+            return None, "Порядок можно менять только внутри одной группы"
+        if self._favorite_bucket(target) != favorite_bucket:
+            return None, "Избранные и обычные элементы упорядочиваются отдельно"
+
+        rect = self.visualItemRect(target)
+        if not rect.isValid():
+            return None, "Наведите указатель на видимую строку"
+        before = point.y() < rect.top() + rect.height() / 2
+        side = "перед" if before else "после"
+        hint = f"Вставить {side} «{self._item_name(target)}»"
+        return (sources, source_parent, group, target, before), hint
+
+    @staticmethod
+    def _siblings(parent, tree):
+        if parent is None:
+            return [tree.topLevelItem(i)
+                    for i in range(tree.topLevelItemCount())]
+        return [parent.child(i) for i in range(parent.childCount())]
+
+    def _apply_reorder(self, plan):
+        """Переставить элементы без стандартного Qt InternalMove.
+
+        Базовая реализация Qt удаляет исходные строки после MoveAction. Здесь
+        drop уже выполнен вручную, поэтому drag также запускается нашим
+        ``startDrag`` и повторного удаления нет.
+        """
+        sources, parent, _group, target, before = plan
+        siblings = self._siblings(parent, self)
+        ordered_sources = [item for item in siblings if item in sources]
+        remaining = [item for item in siblings if item not in sources]
+        if not ordered_sources or target not in remaining:
+            return False
+
+        insert_at = remaining.index(target) + (0 if before else 1)
+        new_order = (remaining[:insert_at] + ordered_sources
+                     + remaining[insert_at:])
+        if new_order == siblings:
+            return False
+
+        current = self.currentItem()
+        was_blocked = self.blockSignals(True)
+        try:
+            for item in ordered_sources:
+                if parent is None:
+                    self.takeTopLevelItem(self.indexOfTopLevelItem(item))
+                else:
+                    parent.takeChild(parent.indexOfChild(item))
+            for offset, item in enumerate(ordered_sources):
+                if parent is None:
+                    self.insertTopLevelItem(insert_at + offset, item)
+                else:
+                    parent.insertChild(insert_at + offset, item)
+            for item in ordered_sources:
+                item.setSelected(True)
+            if current is not None:
+                self.setCurrentItem(
+                    current, 0, QItemSelectionModel.SelectionFlag.NoUpdate)
+        finally:
+            self.blockSignals(was_blocked)
+        self.viewport().update()
+        return True
+
+    def startDrag(self, _supported_actions):
+        """Запустить Move drag без автоматического удаления строк Qt."""
+        source_data, _reason = self._validated_sources()
+        if source_data is None:
+            self.drop_rejected.emit()
+            return
+        sources, _parent, _group, _favorite_bucket = source_data
+        indexes = [self.indexFromItem(item, 0) for item in sources]
+        mime_data = self.model().mimeData(indexes)
+        if mime_data is None:
             return
 
-        # Все перетаскиваемые элементы — одного родителя и одного типа
-        src_parents = {it.parent() for it in sources}
-        src_types = {self._item_type(it) for it in sources}
-        if len(src_parents) != 1 or len(src_types) != 1:
-            event.ignore(); self.drop_rejected.emit(); return
-        src_parent = next(iter(src_parents))
-        src_type = next(iter(src_types))
+        drag = QDrag(self)
+        drag.setMimeData(mime_data)
+        preview_item = self.currentItem()
+        if preview_item not in sources:
+            preview_item = sources[0]
+        rect = self.visualItemRect(preview_item).intersected(
+            self.viewport().rect())
+        if rect.isValid() and not rect.isEmpty():
+            drag.setPixmap(self.viewport().grab(rect))
+            hotspot = self.viewport().mapFromGlobal(QCursor.pos()) - rect.topLeft()
+            drag.setHotSpot(hotspot)
+        try:
+            drag.exec(Qt.DropAction.MoveAction, Qt.DropAction.MoveAction)
+        finally:
+            self.clear_drop_feedback()
 
-        # Куда бросаем: только «между строками» (Above/Below), не «внутрь»
-        target = self.itemAt(event.position().toPoint())
-        indicator = self.dropIndicatorPosition()
-        if indicator not in (QAbstractItemView.AboveItem, QAbstractItemView.BelowItem):
-            event.ignore(); self.drop_rejected.emit(); return
-        dest_parent = target.parent() if target else None
-        dest_type = self._item_type(target)
+    def dragEnterEvent(self, event):
+        if event.source() is self:
+            event.setDropAction(Qt.DropAction.MoveAction)
+            event.accept()
+        else:
+            event.ignore()
 
-        # Тот же родитель И тот же тип, что у строки-цели
-        if dest_parent is not src_parent or dest_type != src_type:
-            event.ignore(); self.drop_rejected.emit(); return
+    def dragMoveEvent(self, event):
+        # QAbstractItemView сохраняет штатную прокрутку у верхней/нижней границы.
+        super().dragMoveEvent(event)
+        if event.source() is not self:
+            self.clear_drop_feedback()
+            event.ignore()
+            return
+        plan, hint = self._drop_plan(event.position().toPoint())
+        self._set_drop_feedback(plan, hint)
+        if plan is None:
+            event.ignore()
+            return
+        event.setDropAction(Qt.DropAction.MoveAction)
+        event.accept()
 
-        super().dropEvent(event)
-        self.order_changed.emit(src_parent)
+    def dragLeaveEvent(self, event):
+        self.clear_drop_feedback()
+        super().dragLeaveEvent(event)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self._drop_line_y is None:
+            return
+        painter = QPainter(self.viewport())
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(self._drop_indicator_color, 3,
+                            Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        painter.drawLine(3, self._drop_line_y,
+                         max(3, self.viewport().width() - 4), self._drop_line_y)
+        painter.end()
+
+    def dropEvent(self, event):
+        plan, _hint = self._drop_plan(event.position().toPoint())
+        self.clear_drop_feedback()
+        if plan is None:
+            event.ignore()
+            self.drop_rejected.emit()
+            return
+        _sources, parent, group, _target, _before = plan
+        if not self._apply_reorder(plan):
+            event.ignore()
+            return
+        event.setDropAction(Qt.DropAction.MoveAction)
+        event.accept()
+        self.order_changed.emit(parent, group)
 
 
 class TreeMixin:
@@ -123,13 +325,34 @@ class TreeMixin:
     # ----- Сортировка / поиск / DnD -----
 
     def _update_dnd_mode(self):
-        """DnD-переупорядочивание доступно только в режиме ручной сортировки.
-        В остальных режимах перетаскивание полностью выключаем (и сам drag, и
-        приём drop), иначе тянущийся элемент превращался бы в выделение."""
-        manual = self.sort_mode == "manual"
-        self.tree.setDragEnabled(manual)
-        self.tree.setDragDropMode(QAbstractItemView.InternalMove if manual
+        """Включить DnD только для полного дерева в ручной сортировке."""
+        manual = getattr(self, "sort_mode", "manual") == "manual"
+        search_active = bool(getattr(self, "search_text", ""))
+        enabled = manual and not search_active
+        self.tree.setDragEnabled(enabled)
+        self.tree.setAcceptDrops(enabled)
+        self.tree.setDragDropMode(QAbstractItemView.InternalMove if enabled
                                   else QAbstractItemView.NoDragDrop)
+        clear_feedback = getattr(self.tree, "clear_drop_feedback", None)
+        if clear_feedback is not None:
+            clear_feedback()
+        if search_active:
+            self.tree.setToolTip(
+                "Перетаскивание недоступно во время поиска: очистите строку поиска")
+        elif not manual:
+            self.tree.setToolTip(
+                "Для перетаскивания выберите ручную сортировку")
+        else:
+            self.tree.setToolTip("")
+
+    def on_tree_drop_hint_changed(self, message):
+        """Показать живую подсказку DnD, не затирая последующий статус."""
+        if message:
+            self._tree_drop_status_active = True
+            self.statusBar().showMessage(message)
+        elif getattr(self, "_tree_drop_status_active", False):
+            self._tree_drop_status_active = False
+            self.statusBar().clearMessage()
 
     def on_sort_changed(self):
         self.sort_mode = self.sort_combo.currentData()
@@ -243,6 +466,7 @@ class TreeMixin:
     def on_search_changed(self, text):
         self.search_text = text.strip().lower()
         self._apply_filter()
+        self._update_dnd_mode()
         self._update_tree_toggle_btn()
 
     def _apply_filter(self):
@@ -265,60 +489,36 @@ class TreeMixin:
         for i in range(self.tree.topLevelItemCount()):
             visit(self.tree.topLevelItem(i))
 
-    def on_tree_order_changed(self, parent_item):
+    def on_tree_order_changed(self, parent_item, group):
         """Сохраняет новый порядок после перетаскивания (async — запись не виснет
-        на UI, H-8). Порядок id снимаем СИНХРОННО сейчас (снимок текущего дерева),
-        а сами записи выполняем в фоновом потоке БД. Для корня (parent_item is None)
-        порядок сохраняется по каждой группе типов отдельно (папки / корневые
-        сервисы / корневые аккаунты), т.к. они в разных таблицах со своим
-        sort_order. Единый воркер БД сохраняет порядок вызовов (a)."""
-        if parent_item is None:
-            folder_ids, service_ids, account_ids, fin_ids, server_ids = (
-                [], [], [], [], [])
-            for i in range(self.tree.topLevelItemCount()):
-                node = self._node(self.tree.topLevelItem(i))
-                if node["type"] == FOLDER:
-                    folder_ids.append(node["id"])
-                elif node["type"] == SERVICE:
-                    service_ids.append(node["id"])
-                elif node["type"] == ACCOUNT:
-                    account_ids.append(node["id"])
-                elif node["type"] in FIN_LEAF_TYPES:
-                    fin_ids.append(node["id"])
-                elif node["type"] == SERVER:
-                    server_ids.append(node["id"])
-            util.fire(self._save_order_async(
-                [(self.db.set_folders_order, folder_ids),
-                 (self.db.set_services_order, service_ids),
-                 (self.db.set_accounts_order, account_ids),
-                 (self.db.set_fin_items_order, fin_ids),
-                 (self.db.set_servers_order, server_ids)]))
+        на UI, H-8). Синхронно снимает id только изменённой логической группы;
+        запись выполняется фоновым воркером БД."""
+        allowed_groups = {
+            None: {FOLDER, SERVICE, ACCOUNT, AccountTree.FIN_GROUP, SERVER},
+            FOLDER: {SERVICE},
+            SERVICE: {ACCOUNT, AccountTree.FIN_GROUP, SERVER},
+        }
+        parent_type = (self._node(parent_item)["type"]
+                       if parent_item is not None else None)
+        if group not in allowed_groups.get(parent_type, set()):
             return
 
-        parent_node = self._node(parent_item)
-        if parent_node["type"] == FOLDER:
-            service_ids = [self._node(parent_item.child(i))["id"]
-                           for i in range(parent_item.childCount())]
-            ops = [(self.db.set_services_order, service_ids)]
-        elif parent_node["type"] == SERVICE:
-            # Аккаунты, fin-записи и серверы — братья одного сервиса, но в
-            # разных таблицах; порядок каждой группы снимаем в порядке их
-            # появления в дереве.
-            account_ids, fin_ids, server_ids = [], [], []
-            for i in range(parent_item.childCount()):
-                cn = self._node(parent_item.child(i))
-                if cn["type"] == ACCOUNT:
-                    account_ids.append(cn["id"])
-                elif cn["type"] in FIN_LEAF_TYPES:
-                    fin_ids.append(cn["id"])
-                elif cn["type"] == SERVER:
-                    server_ids.append(cn["id"])
-            ops = [(self.db.set_accounts_order, account_ids),
-                   (self.db.set_fin_items_order, fin_ids),
-                   (self.db.set_servers_order, server_ids)]
+        if parent_item is None:
+            items = [self.tree.topLevelItem(i)
+                     for i in range(self.tree.topLevelItemCount())]
         else:
-            return
-        util.fire(self._save_order_async(ops))
+            items = [parent_item.child(i)
+                     for i in range(parent_item.childCount())]
+        ids = [self._node(item)["id"] for item in items
+               if AccountTree.item_order_group(item) == group]
+        method_by_group = {
+            FOLDER: self.db.set_folders_order,
+            SERVICE: self.db.set_services_order,
+            ACCOUNT: self.db.set_accounts_order,
+            AccountTree.FIN_GROUP: self.db.set_fin_items_order,
+            SERVER: self.db.set_servers_order,
+        }
+        util.fire(self._save_order_async([(method_by_group[group], ids)]))
 
     async def _save_order_async(self, ops):
         """Записать порядок (список (метод, ids)) в фоновом потоке БД, сохраняя
@@ -332,7 +532,12 @@ class TreeMixin:
             return
         except Exception as e:                       # noqa: BLE001
             self._show_card_error("Не удалось сохранить порядок", e)
+            # Ручная перестановка уже видна в UI. При сбое возвращаем дерево к
+            # фактически сохранённому состоянию, чтобы следующий drag не писал
+            # порядок поверх ошибочного представления.
+            self._reload_tree()
             return
+        self._any_db_changes = True
         self.statusBar().showMessage("Порядок сохранён", 2000)
 
     # ----- Построение дерева -----
@@ -522,6 +727,9 @@ class TreeMixin:
                 menu.addAction("Свернуть всё", lambda: self.set_expanded(item, False))
         else:
             # Множественный выбор
+            menu.addAction("Экспорт выделенного…",
+                           lambda: self.open_selected_export(nodes))
+            menu.addSeparator()
             if types == {SERVICE}:
                 self._add_move_to_folder_menu(menu, selected)
                 self._add_delete_menu(menu, selected, with_keep=True)

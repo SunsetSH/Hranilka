@@ -550,10 +550,15 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, ServerCardMixin, FinCardMixi
         self.tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.tree.setDragEnabled(True)
         self.tree.setAcceptDrops(True)
-        self.tree.setDropIndicatorShown(True)
+        # AccountTree рисует собственную полноширинную линию вставки: штатный
+        # индикатор Qt использует узкие зоны Above/Below и мешает точному drop.
+        self.tree.setDropIndicatorShown(False)
         self.tree.setDefaultDropAction(Qt.MoveAction)  # InternalMove = перемещение
+        self.tree.setAutoScroll(True)
+        self.tree.setAutoScrollMargin(48)
         self._update_dnd_mode()
         self.tree.order_changed.connect(self.on_tree_order_changed)
+        self.tree.drop_hint_changed.connect(self.on_tree_drop_hint_changed)
         self.tree.drop_rejected.connect(
             lambda: self.statusBar().showMessage(
                 "Перетаскивание меняет порядок только внутри одной группы. "
@@ -748,6 +753,7 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, ServerCardMixin, FinCardMixi
             QTreeWidget::item:hover {{ background-color: {main_bg}; }}
             QTreeWidget::item:selected {{ background-color: {text_color}; color: {tree_bg}; }}
         """ + self._branch_arrow_css(text_color, tree_bg, main_bg))
+        self.tree.set_drop_indicator_color(text_color)
         self._update_tree_toggle_btn()
 
     def _branch_arrow_css(self, text_color, tree_bg, main_bg):
@@ -1092,6 +1098,18 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, ServerCardMixin, FinCardMixi
         ExportDialog(self.config, self.db, node["type"], node["id"], title, self,
                      show_fin=self.config.get("show_fin_instruments", False),
                      show_servers=self.config.get("show_servers", False)).exec()
+
+    def open_selected_export(self, nodes):
+        """Открыть обычный диалог экспорта для нескольких узлов дерева."""
+        selected_nodes = tuple((node["type"], node["id"]) for node in nodes)
+        if not selected_nodes:
+            return
+        title = f"Выбранные элементы ({len(selected_nodes)})"
+        ExportDialog(
+            self.config, self.db, None, None, title, self,
+            show_fin=self.config.get("show_fin_instruments", False),
+            show_servers=self.config.get("show_servers", False),
+            selected_nodes=selected_nodes).exec()
 
     def _update_bin_button(self):
         """Синхронизирует кнопку корзины в заголовке с числом аккаунтов в

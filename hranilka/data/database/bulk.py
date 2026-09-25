@@ -52,6 +52,43 @@ class DbBulkOpsMixin(DbBase):
             found = self._find_node(full, node_type, node_id)
             roots = [found] if found else []
 
+        return self._export_roots(
+            roots, include_gallery=include_gallery, include_fin=include_fin,
+            include_servers=include_servers, gallery_ids_only=gallery_ids_only)
+
+    def export_selected(self, selected_nodes, *, include_gallery=True,
+                        include_fin=True, include_servers=True,
+                        gallery_ids_only=False):
+        """Собрать независимые ветви выделенных пользователем узлов.
+
+        Если выделены и контейнер, и его потомок, потомок уже входит в экспорт
+        контейнера и второй раз не добавляется. Порядок соответствует дереву,
+        а неизвестные/удалённые к моменту снимка узлы безопасно игнорируются.
+        """
+        wanted = {(node_type, node_id) for node_type, node_id in selected_nodes}
+        if not wanted:
+            return []
+        full = self.get_tree_structure(include_servers=True)
+        roots = []
+
+        def visit(node, ancestor_selected=False):
+            key = (node["type"], node["id"])
+            selected = key in wanted
+            if selected and not ancestor_selected:
+                roots.append(node)
+            for child in node.get("children", []):
+                visit(child, ancestor_selected or selected)
+
+        for root in full:
+            visit(root)
+        return self._export_roots(
+            roots, include_gallery=include_gallery, include_fin=include_fin,
+            include_servers=include_servers, gallery_ids_only=gallery_ids_only)
+
+    def _export_roots(self, roots, *, include_gallery, include_fin,
+                      include_servers, gallery_ids_only):
+        """Догрузить карточки для уже выбранных корней дерева."""
+
         # Bulk-предзагрузка вместо load_account()/get_links() на каждый аккаунт
         # (устранение N+1: раньше экспорт 100 аккаунтов делал ~728 SELECT).
         ids: list[int] = []

@@ -340,6 +340,24 @@ def test_panel_login_password_have_field_copy_buttons(window):
     assert copied == [True, True]
 
 
+def test_panel_general_copy_button_copies_url_not_password(window):
+    """Кнопка рядом с URL не должна забирать секрет из второго ряда."""
+    from PySide6.QtWidgets import QApplication
+    sid = window.db.add_server(None, "Сервер")
+    window._reload_tree()
+    window._select_node(SERVER, sid)
+    window.edit_current()
+
+    panels = dict(window.server_tabs.list_fields())["panels"]
+    panels.set_items([{"panel_type": "3x-ui", "url": "https://panel.example",
+                       "login": "admin", "password": "secret"}])
+    panels.set_editable(False)
+
+    QApplication.clipboard().clear()
+    panels.rows[0].copy_btn.click()
+    assert QApplication.clipboard().text() == "https://panel.example"
+
+
 def test_panel_gen_btn_fills_password_field(window):
     db = window.db
     sid = db.add_server(None, "Сервер")

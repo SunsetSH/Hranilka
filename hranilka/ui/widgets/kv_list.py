@@ -95,7 +95,7 @@ class KeyValueListWidget(QWidget):
     copy_signal = Signal()
 
     def __init__(self, item_fields: tuple[FieldSpec, ...], config=None,
-                 parent=None,
+                 parent=None, copy_key: str | None = None,
                  gen_callback: Callable[[], str] | None = None,
                  gen_settings_callback: Callable[[], str | None] | None = None):
         super().__init__(parent)
@@ -113,7 +113,13 @@ class KeyValueListWidget(QWidget):
         # проверке пустоты не участвуют — иначе строка с одним лишь дефолтным
         # enum и пустыми текстами ошибочно сохранялась бы.
         self._text_keys = tuple(f.key for f in item_fields if f.kind != "enum")
-        self._copy_key = _pick_copy_key(item_fields)
+        # Обычно общая кнопка строки копирует секрет (пароль/ключ).  В строке
+        # панели она расположена возле URL, поэтому вызывающий код может явно
+        # задать ключ ссылки, не меняя поведение остальных списков.
+        field_keys = {field.key for field in item_fields}
+        if copy_key is not None and copy_key not in field_keys:
+            raise ValueError(f"Неизвестное поле для копирования: {copy_key}")
+        self._copy_key = copy_key or _pick_copy_key(item_fields)
         self.rows: list[_Row] = []
         self._editable = False
 
