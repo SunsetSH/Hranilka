@@ -9,10 +9,12 @@ import traceback
 from logging.handlers import RotatingFileHandler
 
 import qasync
-from PySide6.QtCore import QMetaObject, Qt
+from PySide6.QtCore import QMetaObject, Qt, QtMsgType, qInstallMessageHandler
 from PySide6.QtGui import QIcon, QImageReader
 from PySide6.QtWidgets import QApplication, QMessageBox
 
+from hranilka import __version__
+from hranilka.core import diagnostics
 from hranilka.core.paths import BASE_DIR, RESOURCE_DIR
 from hranilka.services import update_install
 from hranilka.ui.main_window import MainWindow
@@ -22,6 +24,19 @@ from hranilka.ui.retro_style import RetroStyle
 LOG_FILE_NAME = "hranilka.log"
 _LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 _handling_error = False
+_QT_LOG_LEVELS = {
+    QtMsgType.QtInfoMsg: logging.INFO,
+    QtMsgType.QtWarningMsg: logging.WARNING,
+    QtMsgType.QtCriticalMsg: logging.ERROR,
+    QtMsgType.QtFatalMsg: logging.CRITICAL,
+}
+
+
+def _on_qt_message(msg_type, _context, message) -> None:
+    """Сообщения Qt — в общий лог: в сборке без консоли они иначе теряются."""
+    level = _QT_LOG_LEVELS.get(msg_type)
+    if level is not None:
+        logging.log(level, "Qt: %s", message)
 
 
 def setup_logging(log_dir=None) -> None:
@@ -87,11 +102,20 @@ def install_excepthooks() -> None:
 def main() -> int:
     """Запуск приложения. Возвращает код выхода процесса."""
     setup_logging()
+    diagnostics.enable_fault_log(BASE_DIR)
     install_excepthooks()
+    diagnostics.install_hooks()
+    qInstallMessageHandler(_on_qt_message)
+    logging.info("Хранилка %s, Python %s, сборка: %s", __version__,
+                 sys.version.split()[0], bool(getattr(sys, "frozen", False)))
     try:
-        return _run()
-    except SystemExit as e:           # sys.exit(0) из MainWindow.__init__
+        exit_code = _run()
+        logging.info("Завершение, код %s", exit_code)
+        return exit_code
+    except SystemExit as e:           # StartupAborted из MainWindow.__init__
         code = e.code
+        logging.info("Запуск прерван: %s (код %s)",
+                     getattr(e, "reason", "") or "без причины", code)
         return code if isinstance(code, int) else (0 if code is None else 1)
     except Exception:                                   # noqa: BLE001
         _report_uncaught(*sys.exc_info())
@@ -121,13 +145,16 @@ def _run() -> int:
     # (закрытие последнего окна / app.quit()).
     event_loop = qasync.QEventLoop(app)
     asyncio.set_event_loop(event_loop)
+    event_loop.set_exception_handler(diagnostics.log_loop_exception)
     app_close_event = asyncio.Event()
     app.aboutToQuit.connect(app_close_event.set)
 
     update_install.confirm_startup(sys.argv)
+    diagnostics.startup_stage("создание главного окна")
     window = MainWindow()
     window.show()
     window.register_session_notifications()
+    diagnostics.startup_finished()
 
     with event_loop:
         event_loop.run_until_complete(app_close_event.wait())

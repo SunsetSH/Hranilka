@@ -4,8 +4,9 @@
 theme.mix). Рендер кэшируется по (вид, цвет, заливка, devicePixelRatio).
 
 Карта, кошелёк и сервер различаются силуэтом, а не деталями: в дереве иконки
-мелкие. Карта — широкий прямоугольник с полосой, кошелёк — круглая монета с
-символом биткоина, сервер — узкая высокая стойка."""
+мелкие. Карта — широкий прямоугольник с полосой, кошелёк — кольцо монеты с
+символом биткоина на прозрачном фоне (заливка глушила символ), сервер — узкая
+высокая стойка."""
 from __future__ import annotations
 
 from PySide6.QtCore import Qt
@@ -94,17 +95,17 @@ ICON_ART: dict[str, tuple[str, ...]] = {
     WALLET: (
         "................",
         ".....oooooo.....",
-        "...ooffffffoo...",
-        "..offffofofffo..",
-        ".offffooooffffo.",
-        ".offffofffofffo.",
-        ".offffofffofffo.",
-        ".offffooooffffo.",
-        ".offffofffofffo.",
-        ".offffofffofffo.",
-        ".offffooooffffo.",
-        "..offffofofffo..",
-        "...ooffffffoo...",
+        "...oo......oo...",
+        "..o...o.o....o..",
+        ".o...ooooo....o.",
+        ".o...oo..oo...o.",
+        ".o...oo..oo...o.",
+        ".o...ooooo....o.",
+        ".o...oo..oo...o.",
+        ".o...oo..oo...o.",
+        ".o...ooooo....o.",
+        "..o...o.o....o..",
+        "...oo......oo...",
         ".....oooooo.....",
         "................",
         "................",
@@ -129,19 +130,19 @@ ICON_ART: dict[str, tuple[str, ...]] = {
     ),
     FAVORITE: (
         "................",
-        ".......oo.......",
-        "......offo......",
-        "......offo......",
-        ".....offffo.....",
-        "oooooofffffoooo.",
+        ".......o........",
+        "......ofo.......",
+        "......ofo.......",
+        ".....offfo......",
+        "oooooofffoooooo.",
         ".offfffffffffo..",
         "..offfffffffo...",
         "...offfffffo....",
+        "....offfffo.....",
         "...offfffffo....",
-        "..offffooffffo..",
-        "..offfo..offfo..",
-        ".offo......offo.",
-        ".oo..........oo.",
+        "...offfofffo....",
+        "..offoo.ooffo...",
+        "..ooo.....ooo...",
         "................",
         "................",
     ),

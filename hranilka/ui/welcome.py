@@ -342,7 +342,7 @@ class WelcomeDialog(ThemedDialog):
         tree.setFixedHeight(110)
         lay.addWidget(tree)
         hint = QLabel("* — избранное, отображается сверху при автоматических сортировках"
-                      " · порядок меняется перетаскиванием в контексте одного родителя · ")
+                      " · записи и сервисы перетаскиваются между папками и сервисами · ")
         hint.setWordWrap(True)
         lay.addWidget(hint)
         lay.addStretch()

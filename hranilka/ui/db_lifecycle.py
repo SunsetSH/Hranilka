@@ -5,6 +5,7 @@ from pathlib import Path
 
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton
 
+from hranilka.core import diagnostics
 from hranilka.services import backup as bk
 from hranilka.data.database import FutureSchemaError, PreMigrationBackupError
 from hranilka.core import util
@@ -54,6 +55,7 @@ class DbLifecycleMixin:
         while True:
             try:
                 self.db.create_tables()
+                diagnostics.startup_stage("схема БД проверена")
                 return
             except FutureSchemaError as e:
                 logging.error("Несовместимая версия схемы БД: %s", e)
@@ -256,6 +258,7 @@ class DbLifecycleMixin:
                     return False
                 self.config.set("encryption_enabled", False)
                 self.config.save()
+                diagnostics.startup_stage("открыта обычная БД")
                 return True
 
             # Чтение зашифрованного контейнера (может быть крупным) выносим в
@@ -267,13 +270,21 @@ class DbLifecycleMixin:
             reader = self._read_container_async(self.db.db_path)
             dlg = UnlockDialog(self.config, b"", parent)
             dlg.set_container_future(reader)
+            diagnostics.pause_watchdog()     # ввод пароля — не зависание
+            logging.info("Запуск: показано окно разблокировки")
             dlg.exec()
 
             if dlg.result_data is not None:
+                diagnostics.startup_stage("секрет принят, открытие контейнера")
                 self.db.open_encrypted(*dlg.result_data)
+                diagnostics.startup_stage("контейнер открыт, сохранение настроек")
                 self.config.set("encryption_enabled", True)
                 self.config.save()
+                diagnostics.startup_stage("открыта зашифрованная БД")
                 return True
+
+            logging.info("Окно разблокировки закрыто без пароля: %s",
+                         dlg.recovery_action or "выход")
 
             if dlg.recovery_action == "reset":
                 try:

@@ -1,33 +1,63 @@
-"""AccountTree: дерево с ограниченным drag&drop (выделено из tree.py)."""
-from PySide6.QtWidgets import QTreeWidget
+"""AccountTree: дерево с drag&drop (выделено из tree.py).
+
+Жест начинается здесь, а не в QAbstractItemView: базовый класс решает «тащить
+или выделять» по своему pressedIndex, который теряется при перестроении дерева,
+и при выключенном drag превращает протягивание в выделение диапазона."""
+from dataclasses import dataclass
+from typing import Optional
+
+from PySide6.QtWidgets import QAbstractItemView, QApplication, QTreeWidget, QTreeWidgetItem
 from PySide6.QtCore import Qt, Signal, QItemSelectionModel
 from PySide6.QtGui import QColor, QCursor, QDrag, QPainter, QPen
 
-from hranilka.core.nodetypes import FIN_LEAF_TYPES, FOLDER, LEAF_TYPES
+from hranilka.core.nodetypes import (FIN_LEAF_TYPES, FOLDER, LEAF_TYPES,
+                                     SERVICE)
+
+_LEAF_KIND = "leaf"
+_ZONE_BEFORE, _ZONE_INTO, _ZONE_AFTER, _ZONE_END = range(4)
+_CONTAINER_EDGE = 0.25        # доля строки контейнера под вставку рядом с ним
+
+
+@dataclass(frozen=True)
+class MovePlan:
+    """Перенос в другого родителя. parent=None — корень; anchor — строка, рядом
+    с которой вставить (None — в конец), before — перед ней или после."""
+    sources: tuple
+    parent: Optional[QTreeWidgetItem]
+    anchor: Optional[QTreeWidgetItem]
+    before: bool
 
 
 class AccountTree(QTreeWidget):
-    """Дерево с безопасным переупорядочиванием внутри логической группы.
+    """Дерево с переупорядочиванием внутри группы и переносом между родителями.
 
-    Вся верхняя половина строки означает вставку перед ней, нижняя — после.
-    Перенос между родителями остаётся в контекстном меню. Карты и кошельки
-    считаются одной группой, потому что хранят общий ``sort_order``.
+    На листе верхняя половина строки — вставка перед ней, нижняя — после. На
+    папке/сервисе края строки — вставка рядом, середина — внутрь. Карты и
+    кошельки считаются одной группой: они хранят общий ``sort_order``.
     """
 
     FIN_GROUP = "fin_items"
 
     # Параметры: элемент-родитель (или None для корня) и логическая группа.
     order_changed = Signal(object, str)
-    # Drop листьев на папку: (список перетаскиваемых элементов, элемент-папка).
-    reparent_requested = Signal(object, object)
-    drop_rejected = Signal()
+    move_requested = Signal(object)      # MovePlan
+    drop_rejected = Signal(str)          # причина для строки статуса
     drop_hint_changed = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._drop_line_y = None
+        self._drop_line = None           # (x, y) начала линии вставки
+        self._drop_into_item = None      # подсвеченный контейнер
         self._drop_hint = ""
         self._drop_indicator_color = self.palette().text().color()
+        self._reorder_enabled = True
+        self._press_pos = None           # точка простого нажатия ЛКМ на строке
+        self._press_consumed = False     # жест уже обработан, Qt его не видит
+        self.setAutoExpandDelay(600)     # раскрыть свёрнутую папку под курсором
+
+    def set_reorder_enabled(self, enabled):
+        """Порядок меняется только в ручной сортировке; перенос доступен всегда."""
+        self._reorder_enabled = bool(enabled)
 
     @staticmethod
     def _item_type(item):
@@ -57,33 +87,47 @@ class AccountTree(QTreeWidget):
         themed = QColor(color)
         self._drop_indicator_color = (
             themed if themed.isValid() else self.palette().text().color())
-        if self._drop_line_y is not None:
+        if self._drop_line is not None or self._drop_into_item is not None:
             self.viewport().update()
 
     def clear_drop_feedback(self):
-        """Убрать линию вставки и подсказку после завершения drag."""
-        had_line = self._drop_line_y is not None
-        self._drop_line_y = None
-        if had_line:
+        """Убрать индикатор вставки и подсказку после завершения drag."""
+        had_mark = self._drop_line is not None or self._drop_into_item is not None
+        self._drop_line = None
+        self._drop_into_item = None
+        if had_mark:
             self.viewport().update()
         if self._drop_hint:
             self._drop_hint = ""
             self.drop_hint_changed.emit("")
 
     def _set_drop_feedback(self, plan, hint):
-        line_y = None
-        if plan is not None:
-            _sources, _parent, _group, target, before = plan
-            rect = self.visualItemRect(target)
-            if rect.isValid():
-                line_y = rect.top() if before else rect.bottom() + 1
-                line_y = max(1, min(line_y, self.viewport().height() - 2))
-        if line_y != self._drop_line_y:
-            self._drop_line_y = line_y
+        line, into = self._feedback_marks(plan)
+        if line != self._drop_line or into is not self._drop_into_item:
+            self._drop_line = line
+            self._drop_into_item = into
             self.viewport().update()
         if hint != self._drop_hint:
             self._drop_hint = hint
             self.drop_hint_changed.emit(hint)
+
+    def _feedback_marks(self, plan):
+        """Что рисовать для плана: линию вставки и/или рамку контейнера."""
+        if plan is None:
+            return None, None
+        if isinstance(plan, MovePlan):
+            if plan.anchor is None:
+                return None, plan.parent
+            return self._line_at(plan.anchor, plan.before), None
+        _sources, _parent, _group, target, before = plan
+        return self._line_at(target, before), None
+
+    def _line_at(self, item, before):
+        rect = self.visualItemRect(item)
+        if not rect.isValid():
+            return None
+        y = rect.top() if before else rect.bottom() + 1
+        return rect.left(), max(1, min(y, self.viewport().height() - 2))
 
     def _validated_sources(self):
         sources = self.selectedItems()
@@ -100,24 +144,85 @@ class AccountTree(QTreeWidget):
         return (sources, next(iter(parents)), group,
                 next(iter(favorite_buckets))), ""
 
-    def _reparent_plan(self, point):
-        """Drop листьев на строку ПАПКИ - перенос внутрь, минуя сервис.
+    def _source_kind(self, sources):
+        """Вид перетаскиваемого набора: листья, сервисы, папки или None (смесь)."""
+        types = {self._item_type(item) for item in sources}
+        if types and types <= LEAF_TYPES:
+            return _LEAF_KIND
+        return next(iter(types)) if len(types) == 1 else None
 
-        Возвращает ((sources, folder_item), hint) либо (None, reason). Источники
-        - любые выделенные листья (аккаунт/карта/кошелёк/сервер, в т.ч. разных
-        типов и родителей). None-план без причины ("") - цель не папка и
-        вызывающий пробует обычное переупорядочивание."""
+    def _row_zone(self, point):
+        """Строка под курсором и зона внутри неё."""
         target = self.itemAt(point)
-        if target is None or self._item_type(target) != FOLDER:
-            return None, ""
+        if target is None:
+            return None, _ZONE_END
+        rect = self.visualItemRect(target)
+        offset = (point.y() - rect.top()) / max(1, rect.height())
+        if self._item_type(target) not in (FOLDER, SERVICE):
+            return target, _ZONE_BEFORE if offset < 0.5 else _ZONE_AFTER
+        if offset < _CONTAINER_EDGE:
+            return target, _ZONE_BEFORE
+        # Под раскрытым контейнером идут его дети: «после него» там не вставить.
+        expanded = target.isExpanded() and target.childCount() > 0
+        if offset > 1 - _CONTAINER_EDGE and not expanded:
+            return target, _ZONE_AFTER
+        return target, _ZONE_INTO
+
+    def _can_host(self, kind, parent):
+        """Может ли родитель принять элементы этого вида (папки — только корень)."""
+        if kind == FOLDER:
+            return False
+        if parent is None:
+            return True
+        return kind == _LEAF_KIND or self._item_type(parent) == FOLDER
+
+    def _parent_title(self, parent):
+        return (f"«{self._item_name(parent)}»" if parent is not None
+                else "корень дерева")
+
+    def _destination(self, point):
+        """Куда указывает курсор: (родитель, строка-якорь, перед ней?, зона)."""
+        target, zone = self._row_zone(point)
+        if zone == _ZONE_END:
+            return None, None, False, zone
+        if zone == _ZONE_INTO:
+            return target, None, False, zone
+        return target.parent(), target, zone == _ZONE_BEFORE, zone
+
+    def _resolve_drop(self, point):
+        """План drop под курсором: reorder-кортеж, MovePlan или (None, причина)."""
         sources = self.selectedItems()
-        if not sources or any(self._item_type(i) not in LEAF_TYPES
-                              for i in sources):
-            return None, ""
-        if all(i.parent() is target for i in sources):
-            return None, "Элементы уже лежат в этой папке"
-        hint = f"Переместить в папку «{self._item_name(target)}»"
-        return (sources, target), hint
+        if not sources:
+            return None, "Нет выбранных элементов"
+        kind = self._source_kind(sources)
+        if kind is None:
+            return None, "Папки, сервисы и записи перетаскиваются раздельно"
+        parent, anchor, before, zone = self._destination(point)
+        if anchor in sources or parent in sources:
+            return None, "Выберите другое место для вставки"
+        if all(item.parent() is parent for item in sources):
+            return self._same_parent_drop(point, parent, zone)
+        if not self._can_host(kind, parent):
+            return None, ("Папки лежат только в корне дерева" if kind == FOLDER
+                          else "Сервис нельзя вложить в другой сервис")
+        if not self._reorder_enabled:
+            anchor = None                # место определит текущая сортировка
+        plan = MovePlan(tuple(sources), parent, anchor, before)
+        return plan, f"Переместить в {self._parent_title(parent)}"
+
+    def _same_parent_drop(self, point, parent, zone):
+        if zone == _ZONE_INTO:
+            return None, f"Элементы уже лежат в {self._parent_title(parent)}"
+        if not self._reorder_enabled:
+            return None, "Порядок меняется только в ручной сортировке"
+        if zone == _ZONE_END:
+            return None, "Наведите указатель на строку целевой группы"
+        return self._drop_plan(point)
+
+    @staticmethod
+    def siblings_of(tree, parent):
+        """Все дети родителя (None — корень), включая скрытые фильтром."""
+        return AccountTree._siblings(parent, tree)
 
     def _drop_plan(self, point):
         """Рассчитать вставку по половине полной строки под курсором."""
@@ -194,19 +299,69 @@ class AccountTree(QTreeWidget):
         self.viewport().update()
         return True
 
+    def mousePressEvent(self, event):
+        # Сбой доставки отпускания (меню, модальное окно) оставлял бы view в
+        # DragSelecting: тогда следующее протягивание снова выделяло бы строки.
+        self.setState(QAbstractItemView.State.NoState)
+        self._press_consumed = False
+        self._press_pos = self._plain_press_point(event)
+        super().mousePressEvent(event)
+
+    def _plain_press_point(self, event):
+        """Точка нажатия, с которой начинается перетаскивание, иначе None."""
+        modifiers = Qt.KeyboardModifier.ShiftModifier | Qt.KeyboardModifier.ControlModifier
+        if (event.button() != Qt.MouseButton.LeftButton
+                or event.modifiers() & modifiers):
+            return None
+        point = event.position().toPoint()
+        item = self.itemAt(point)
+        # Левее текста — стрелка ветки и отступ: это не захват строки.
+        if item is None or point.x() < self.visualItemRect(item).left():
+            return None
+        return point
+
+    def mouseMoveEvent(self, event):
+        buttons = event.buttons()
+        if buttons & Qt.MouseButton.RightButton:
+            return                       # ПКМ — только контекстное меню
+        if not buttons & Qt.MouseButton.LeftButton:
+            super().mouseMoveEvent(event)
+            return
+        if self._press_consumed:
+            return
+        if self._press_pos is None:
+            super().mouseMoveEvent(event)
+            return
+        distance = (event.position().toPoint() - self._press_pos).manhattanLength()
+        if distance >= QApplication.startDragDistance():
+            self._press_consumed = True
+            self._begin_drag(self._press_pos)
+
+    def mouseReleaseEvent(self, event):
+        self._press_pos = None
+        self._press_consumed = False
+        super().mouseReleaseEvent(event)
+
+    def _begin_drag(self, point):
+        """Строка ищется заново по точке: дерево могло перестроиться после
+        нажатия, а прежний QTreeWidgetItem к этому моменту уже уничтожен."""
+        item = self.itemAt(point)
+        if item is None:
+            return
+        if not item.isSelected():
+            self.setCurrentItem(item)
+        if not self.dragEnabled():
+            self.drop_rejected.emit(self.toolTip())
+            return
+        self.startDrag(Qt.DropAction.MoveAction)
+
     def startDrag(self, _supported_actions):
         """Запустить Move drag без автоматического удаления строк Qt."""
-        source_data, _reason = self._validated_sources()
-        if source_data is not None:
-            sources = source_data[0]
-        else:
-            # Смесь листьев разных групп/родителей: порядок менять нельзя, но
-            # перенос в папку (reparent) допустим.
-            sources = self.selectedItems()
-            if not sources or any(self._item_type(i) not in LEAF_TYPES
-                                  for i in sources):
-                self.drop_rejected.emit()
-                return
+        sources = self.selectedItems()
+        if not sources or self._source_kind(sources) is None:
+            self.drop_rejected.emit(
+                "Папки, сервисы и записи перетаскиваются раздельно")
+            return
         indexes = [self.indexFromItem(item, 0) for item in sources]
         mime_data = self.model().mimeData(indexes)
         if mime_data is None:
@@ -226,6 +381,7 @@ class AccountTree(QTreeWidget):
         try:
             drag.exec(Qt.DropAction.MoveAction, Qt.DropAction.MoveAction)
         finally:
+            self.stopAutoScroll()
             self.clear_drop_feedback()
 
     def dragEnterEvent(self, event):
@@ -242,15 +398,8 @@ class AccountTree(QTreeWidget):
             self.clear_drop_feedback()
             event.ignore()
             return
-        point = event.position().toPoint()
-        reparent, reparent_hint = self._reparent_plan(point)
-        if reparent is not None:
-            self._set_drop_feedback(None, reparent_hint)
-            event.setDropAction(Qt.DropAction.MoveAction)
-            event.accept()
-            return
-        plan, hint = self._drop_plan(point)
-        self._set_drop_feedback(plan, reparent_hint or hint)
+        plan, hint = self._resolve_drop(event.position().toPoint())
+        self._set_drop_feedback(plan, hint)
         if plan is None:
             event.ignore()
             return
@@ -263,31 +412,33 @@ class AccountTree(QTreeWidget):
 
     def paintEvent(self, event):
         super().paintEvent(event)
-        if self._drop_line_y is None:
+        if self._drop_line is None and self._drop_into_item is None:
             return
         painter = QPainter(self.viewport())
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setPen(QPen(self._drop_indicator_color, 3,
                             Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-        painter.drawLine(3, self._drop_line_y,
-                         max(3, self.viewport().width() - 4), self._drop_line_y)
+        if self._drop_line is not None:
+            x, y = self._drop_line
+            painter.drawLine(x, y, max(x, self.viewport().width() - 4), y)
+        elif self._drop_into_item is not None:
+            rect = self.visualItemRect(self._drop_into_item)
+            if rect.isValid():
+                rect.setRight(self.viewport().width() - 4)
+                painter.drawRect(rect.adjusted(1, 1, -1, -1))
         painter.end()
 
     def dropEvent(self, event):
-        point = event.position().toPoint()
-        reparent, _rhint = self._reparent_plan(point)
-        if reparent is not None:
-            self.clear_drop_feedback()
-            sources, folder_item = reparent
-            event.setDropAction(Qt.DropAction.MoveAction)
-            event.accept()
-            self.reparent_requested.emit(list(sources), folder_item)
-            return
-        plan, _hint = self._drop_plan(point)
+        plan, hint = self._resolve_drop(event.position().toPoint())
         self.clear_drop_feedback()
         if plan is None:
             event.ignore()
-            self.drop_rejected.emit()
+            self.drop_rejected.emit(hint)
+            return
+        if isinstance(plan, MovePlan):
+            event.setDropAction(Qt.DropAction.MoveAction)
+            event.accept()
+            self.move_requested.emit(plan)
             return
         _sources, parent, group, _target, _before = plan
         if not self._apply_reorder(plan):

@@ -13,7 +13,7 @@ from PySide6.QtWidgets import QAbstractItemView, QTreeWidgetItem
 
 from hranilka.core.nodetypes import ACCOUNT, CARD, FOLDER, SERVER, SERVICE
 from hranilka.data.database import Database, SCHEMA_VERSION
-from hranilka.ui.tree import AccountTree, TreeMixin
+from hranilka.ui.tree import MovePlan, AccountTree, TreeMixin
 
 
 # ----- helpers -----
@@ -406,14 +406,14 @@ def test_reparent_plan_allows_leaf_drop_on_folder(qapp):
     leaf.setSelected(True)
     card.setSelected(True)
     qapp.processEvents()
-    plan, hint = tree._reparent_plan(_center(tree, folder))
-    assert plan is not None
-    sources, target = plan
-    assert target is folder and set(sources) == {leaf, card}
+    plan, hint = tree._resolve_drop(_center(tree, folder))
+    assert isinstance(plan, MovePlan)
+    assert plan.parent is folder and plan.anchor is None
+    assert set(plan.sources) == {leaf, card}
     assert "Папка" in hint
 
 
-def test_reparent_plan_rejects_services_and_same_parent(qapp):
+def test_resolve_drop_rejects_same_parent_and_service_in_service(qapp):
     tree = _tree(qapp)
     folder = _item(tree, 1, "Папка", FOLDER)
     inside = _item(folder, 2, "Внутри")
@@ -421,18 +421,14 @@ def test_reparent_plan_rejects_services_and_same_parent(qapp):
     folder.setExpanded(True)
     qapp.processEvents()
     inside.setSelected(True)
-    plan, _ = tree._reparent_plan(_center(tree, folder))
+    plan, _ = tree._resolve_drop(_center(tree, folder))
     assert plan is None                          # уже в этой папке
     inside.setSelected(False)
-    service.setSelected(True)
-    plan, _ = tree._reparent_plan(_center(tree, folder))
-    assert plan is None                          # сервис — не лист
-    leaf = _item(tree, 9, "Лист")
+    other = _item(tree, 4, "Другой сервис", SERVICE)
     qapp.processEvents()
-    service.setSelected(False)
-    leaf.setSelected(True)
-    plan, _ = tree._reparent_plan(_center(tree, service))
-    assert plan is None                          # цель не папка
+    service.setSelected(True)
+    plan, reason = tree._resolve_drop(_center(tree, other))
+    assert plan is None and "другой сервис" in reason
 
 
 def test_drop_event_emits_reparent(qapp):
@@ -443,14 +439,14 @@ def test_drop_event_emits_reparent(qapp):
     qapp.processEvents()
     leaf.setSelected(True)
     got = []
-    tree.reparent_requested.connect(lambda items, tgt: got.append((items, tgt)))
+    tree.move_requested.connect(got.append)
     from PySide6.QtCore import QPointF
     center = _center(tree, folder)
     ev = SimpleNamespace(position=lambda: QPointF(center), accepted=None,
                          setDropAction=lambda a: None,
                          accept=lambda: None, ignore=lambda: None)
     tree.dropEvent(ev)
-    assert got == [([leaf], folder)]
+    assert got == [MovePlan((leaf,), folder, None, False)]
 
 
 class _FakeTreeHost(TreeMixin):

@@ -56,7 +56,7 @@ class TreeMenuMixin:
                 self._add_create_record_menu(menu)
                 menu.addAction("Переименовать", lambda: self.rename_item(item))
                 self._add_move_to_folder_menu(menu, selected)
-                self._add_delete_menu(menu, selected, with_keep=True)
+                self._add_container_delete(menu, selected)
                 menu.addSeparator()
                 menu.addAction("Экспорт…", lambda: self.open_export(node))
                 menu.addAction("Раскрыть всё", lambda: self.set_expanded(item, True))
@@ -64,7 +64,7 @@ class TreeMenuMixin:
             elif t == FOLDER:
                 self._add_create_record_menu(menu)
                 menu.addAction("Переименовать", lambda: self.rename_item(item))
-                self._add_delete_menu(menu, selected, with_keep=True)
+                self._add_container_delete(menu, selected)
                 menu.addSeparator()
                 menu.addAction("Экспорт…", lambda: self.open_export(node))
                 menu.addAction("Раскрыть всё", lambda: self.set_expanded(item, True))
@@ -76,7 +76,7 @@ class TreeMenuMixin:
             menu.addSeparator()
             if types == {SERVICE}:
                 self._add_move_to_folder_menu(menu, selected)
-                self._add_delete_menu(menu, selected, with_keep=True)
+                self._add_container_delete(menu, selected)
             elif types == {ACCOUNT}:
                 self._add_move_to_service_menu(menu, selected)
                 self._add_move_leaf_to_folder_menu(menu, selected)
@@ -98,6 +98,17 @@ class TreeMenuMixin:
                 menu.addAction("Удалить", lambda: self.delete_items(selected))
 
         menu.exec(self.tree.viewport().mapToGlobal(pos))
+
+    def _add_container_delete(self, menu, selected):
+        """Выбор варианта удаления — только когда есть что сохранять. Пустой
+        контейнер удаляется с keep=True: записи, скрытые опциями показа, в
+        дереве не видны, и «полное» удаление забрало бы их незаметно."""
+        if any(item.childCount() for item in selected):
+            self._add_delete_menu(menu, selected, with_keep=True)
+            return
+        menu.addSeparator()
+        menu.addAction("Удалить", lambda: self.delete_items(
+            selected, keep=True, mention_keep=False))
 
     def _add_delete_menu(self, menu, selected, with_keep):
         menu.addSeparator()

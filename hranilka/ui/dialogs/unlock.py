@@ -1,5 +1,6 @@
 """Окно разблокировки мастер-паролем / recovery-кодом (вынесено из
 dialogs.py, этап 4)."""
+import logging
 import threading
 
 from PySide6.QtCore import Qt, QTimer, Signal
@@ -285,12 +286,15 @@ class UnlockDialog(ThemedDialog):
             self.result_data = result
             self.accept()
         elif isinstance(error, cs.WrongPassword):
+            logging.info("Разблокировка: неверный секрет")
             self._err.setText("Неверный пароль или recovery-код.")
             self._field.selectAll()
             self._field.setFocus()
         elif isinstance(error, cs.CorruptVault):
+            logging.error("Разблокировка: контейнер повреждён: %s", error)
             self._err.setText(f"Файл базы повреждён: {error}")
         else:
+            logging.error("Разблокировка: сбой", exc_info=error)
             self._err.setText(f"Ошибка разблокировки: {error}")
 
     def reject(self):

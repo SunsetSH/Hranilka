@@ -106,6 +106,8 @@ class AppearanceMixin:
             title_bar.set_chrome(self.config)
         set_crt(self, crt)
         self._applied_qss = ((font_name, font_size), main_qss, tree_qss)
+        self._sync_tree_buttons()
+        self._update_favorites_btn()
         self._update_tree_toggle_btn()
 
     def _branch_arrow_css(self, text_color, tree_bg, main_bg):

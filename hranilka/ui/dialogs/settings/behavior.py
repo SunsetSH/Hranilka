@@ -2,10 +2,7 @@
 повторный показ обучения.
 Часть SettingsDialog (dialog.py) — методы вынесены дословно (backlog-разрез по страницам)."""
 from PySide6.QtWidgets import (QVBoxLayout, QHBoxLayout, QGroupBox, QFormLayout, QComboBox, QPushButton, QLabel, QCheckBox, QLineEdit, QSizePolicy, QWidget)
-from PySide6.QtCore import Qt
 from PySide6.QtGui import QIntValidator
-from PySide6.QtWidgets import QSlider
-from hranilka.ui import sounds
 from hranilka.ui.welcome import WelcomeDialog
 
 # Минимальная ширина числовых полей настроек (пикс.): чтобы на стилях без
@@ -78,8 +75,6 @@ class SettingsBehaviorMixin:
         bl.addWidget(self.lock_on_session_lock_check)
         lay.addWidget(beh_group)
 
-        lay.addWidget(self._build_sounds_group())
-
         clip_group = QGroupBox("Буфер обмена")
         cf = QFormLayout(clip_group)
         # Не полагаемся на стиль платформы: некоторые стили оставляют поля
@@ -150,65 +145,6 @@ class SettingsBehaviorMixin:
 
         lay.addStretch()
         return w
-
-    # (событие, подпись) — ключи config: sound_on_<событие>
-    _SOUND_EVENTS = [
-        ("error", "Ошибка / предупреждение"),
-        ("unlock", "Разблокировка"),
-        ("lock", "Блокировка"),
-        ("copy", "Копирование в буфер"),
-        ("save", "Успешное сохранение"),
-    ]
-
-    def _build_sounds_group(self):
-        group = QGroupBox("Звуки")
-        gl = QVBoxLayout(group)
-        self.sounds_enabled_check = QCheckBox("Включить звуки")
-        self.sounds_enabled_check.setChecked(self.config.get("sounds_enabled", True))
-        gl.addWidget(self.sounds_enabled_check)
-
-        vol_row = QHBoxLayout()
-        vol_row.addWidget(QLabel("Громкость:"))
-        self.sound_volume_slider = QSlider(Qt.Horizontal)
-        self.sound_volume_slider.setRange(0, 100)
-        self.sound_volume_slider.setValue(int(self.config.get("sound_volume", 40)))
-        vol_row.addWidget(self.sound_volume_slider, 1)
-        self.sound_volume_value = QLabel(str(self.sound_volume_slider.value()))
-        self.sound_volume_value.setMinimumWidth(36)
-        vol_row.addWidget(self.sound_volume_value)
-        self.sound_volume_slider.valueChanged.connect(
-            lambda v: self.sound_volume_value.setText(str(v)))
-        gl.addLayout(vol_row)
-
-        self.sound_event_checks = {}
-        for event, caption in self._SOUND_EVENTS:
-            row = QHBoxLayout()
-            box = QCheckBox(caption)
-            box.setChecked(bool(self.config.get(sounds.config_key(event),
-                                                event == "error")))
-            self.sound_event_checks[event] = box
-            row.addWidget(box, 1)
-            test = QPushButton("Проверить")
-            test.clicked.connect(
-                lambda _=False, ev=event: sounds.play(
-                    self.config, ev, force=True,
-                    volume=self.sound_volume_slider.value()))
-            row.addWidget(test)
-            gl.addLayout(row)
-
-        def _sync(on: bool) -> None:
-            self.sound_volume_slider.setEnabled(on)
-            for b in self.sound_event_checks.values():
-                b.setEnabled(on)
-        self.sounds_enabled_check.toggled.connect(_sync)
-        _sync(self.sounds_enabled_check.isChecked())
-        return group
-
-    def _apply_sound_settings(self) -> None:
-        self.config.set("sounds_enabled", self.sounds_enabled_check.isChecked())
-        self.config.set("sound_volume", self.sound_volume_slider.value())
-        for event, box in self.sound_event_checks.items():
-            self.config.set(sounds.config_key(event), box.isChecked())
 
     def _thumb_preload_index(self, value: str) -> int:
         for i, (key, _) in enumerate(self._THUMB_PRELOAD_OPTIONS):

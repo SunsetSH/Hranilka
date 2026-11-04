@@ -2,7 +2,7 @@
 страниц-миксинов (по модулю на вкладку), кнопки «Применить/Отмена»,
 сбор и применение значений, снимок настроек для определения
 несохранённых изменений при закрытии."""
-from PySide6.QtWidgets import (QHBoxLayout, QGroupBox, QPushButton, QLabel, QListWidgetItem, QFileDialog, QFrame, QColorDialog)
+from PySide6.QtWidgets import (QHBoxLayout, QGroupBox, QPushButton, QLabel, QListWidgetItem, QFileDialog, QFrame, QColorDialog, QScrollArea)
 from PySide6.QtCore import Signal, Qt
 from PySide6.QtGui import QFont
 from hranilka.core.config import RETRO_THEMES
@@ -22,12 +22,34 @@ from hranilka.ui.dialogs.settings.data_page import SettingsDataPageMixin
 from hranilka.ui.dialogs.settings.options import SettingsOptionsMixin
 from hranilka.ui.dialogs.settings.security import SettingsSecurityMixin
 from hranilka.ui.dialogs.settings.shortcuts_page import SettingsShortcutsMixin
+from hranilka.ui.dialogs.settings.sounds_page import SettingsSoundsMixin
+
+
+_MAX_SCREEN_SHARE = 0.85     # предельная доля высоты экрана
+
+
+class _PageScroll(QScrollArea):
+    """Страница настроек с прокруткой: окно просит полную высоту страницы, а на
+    низком экране или при крупном шрифте содержимое прокручивается."""
+
+    def __init__(self, page):
+        super().__init__()
+        self.setWidget(page)
+        self.setWidgetResizable(True)
+        self.setFrameShape(QFrame.NoFrame)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setStyleSheet("QScrollArea { background: transparent; }")
+        self.viewport().setAutoFillBackground(False)
+        page.setAutoFillBackground(False)
+
+    def sizeHint(self):
+        return self.widget().sizeHint()
 
 
 class SettingsDialog(SettingsAppearanceMixin, SettingsSecurityMixin,
                      SettingsBackupPageMixin, SettingsDataPageMixin,
                      SettingsOptionsMixin, SettingsBehaviorMixin,
-                     SettingsShortcutsMixin, ThemedDialog):
+                     SettingsSoundsMixin, SettingsShortcutsMixin, ThemedDialog):
     settings_applied = Signal()      # финальное «Применить» (полная переинициализация)
     appearance_changed = Signal()    # живой предпросмотр шрифта/темы/цвета (только стили)
 
@@ -129,13 +151,17 @@ class SettingsDialog(SettingsAppearanceMixin, SettingsSecurityMixin,
 
     def _setup_ui(self):
         self._tabs = WrappingTabWidget(self)
-        self._tabs.addTab(self._page_appearance(), "Внешний вид")
-        self._tabs.addTab(self._page_security(),   "Безопасность")
-        self._tabs.addTab(self._page_backup(),     "Бэкапы")
-        self._tabs.addTab(self._page_data(),       "Данные")
-        self._tabs.addTab(self._page_options(),    "Опции")
-        self._tabs.addTab(self._page_behavior(),   "Поведение")
-        self._tabs.addTab(self._page_shortcuts(),  "Шорткаты")
+        for page, title in (
+            (self._page_appearance(), "Внешний вид"),
+            (self._page_security(),   "Безопасность"),
+            (self._page_backup(),     "Бэкапы"),
+            (self._page_data(),       "Данные"),
+            (self._page_options(),    "Опции"),
+            (self._page_behavior(),   "Поведение"),
+            (self._page_sounds(),     "Звуки"),
+            (self._page_shortcuts(),  "Шорткаты"),
+        ):
+            self._tabs.addTab(_PageScroll(page), title)
         self.body.addWidget(self._tabs, 1)
 
         sep = QFrame()
@@ -167,9 +193,15 @@ class SettingsDialog(SettingsAppearanceMixin, SettingsSecurityMixin,
     def _fit_width_to_tabs(self):
         """Сузить окно до ширины одного ряда вкладок: ширина панели вкладок +
         поля тела диалога (14+14) + рамка dialogFrame (2+2)."""
-        width = self._tabs.one_row_width() + 14 + 14 + 2 + 2
+        limit = self.screen().availableGeometry().width()
+        width = min(self._tabs.one_row_width() + 14 + 14 + 2 + 2, limit)
         self.setMinimumWidth(width)
-        self.resize(width, max(400, self.height()))
+        self.resize(width, min(max(400, self.sizeHint().height()),
+                               self._max_height()))
+
+    def _max_height(self):
+        """Страницы прокручиваются, поэтому окно не занимает весь экран."""
+        return int(super()._max_height() * _MAX_SCREEN_SHARE)
 
     def _apply_group_fonts(self):
         """Шрифт заголовков групп через стили Qt применяет ненадёжно, поэтому

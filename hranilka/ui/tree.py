@@ -18,7 +18,7 @@ from hranilka.ui import theme, pixel_icons
 from hranilka.core import util
 from hranilka.data.database import StaleSessionError
 from hranilka.data.models import AccountData
-from hranilka.ui.tree_dnd import AccountTree  # noqa: F401  (реэкспорт)
+from hranilka.ui.tree_dnd import AccountTree, MovePlan  # noqa: F401  (реэкспорт)
 from hranilka.ui.tree_menu import TreeMenuMixin
 
 
@@ -83,6 +83,7 @@ class TreeMixin(TreeMenuMixin):
                 self._apply_item_style(it, self._node(it))
         finally:
             self.tree.setUpdatesEnabled(True)
+        self._update_favorites_btn()
 
     def _apply_item_style(self, item, node):
         """Текст + визуальное выделение для листьев с несохранёнными правками."""
@@ -107,10 +108,14 @@ class TreeMixin(TreeMenuMixin):
     # ----- Сортировка / поиск / DnD -----
 
     def _update_dnd_mode(self):
-        """Включить DnD только для полного дерева в ручной сортировке."""
+        """DnD выключен только поиском: порядок меняется в ручной сортировке, а
+        перенос между родителями работает при любой сортировке."""
         manual = getattr(self, "sort_mode", "manual") == "manual"
         search_active = bool(getattr(self, "search_text", ""))
-        enabled = manual and not search_active
+        enabled = not search_active
+        set_reorder = getattr(self.tree, "set_reorder_enabled", None)
+        if set_reorder is not None:
+            set_reorder(manual)
         self.tree.setDragEnabled(enabled)
         self.tree.setAcceptDrops(enabled)
         self.tree.setDragDropMode(QAbstractItemView.InternalMove if enabled
@@ -123,7 +128,8 @@ class TreeMixin(TreeMenuMixin):
                 "Перетаскивание недоступно во время поиска: очистите строку поиска")
         elif not manual:
             self.tree.setToolTip(
-                "Для перетаскивания выберите ручную сортировку")
+                "Перетаскивание переносит записи между папками и сервисами. "
+                "Порядок меняется только в ручной сортировке")
         else:
             self.tree.setToolTip("")
 
@@ -215,8 +221,8 @@ class TreeMixin(TreeMenuMixin):
         сортировки. Цвет берётся из темы и потому остаётся читаемым во всех
         пользовательских сочетаниях фона/текста.
         """
-        from PySide6.QtCore import QPoint, QSize
-        from PySide6.QtGui import QIcon, QPixmap
+        from PySide6.QtCore import QPoint
+        from PySide6.QtGui import QPixmap
 
         pixmap = QPixmap(24, 24)
         pixmap.fill(Qt.transparent)
@@ -239,11 +245,7 @@ class TreeMixin(TreeMenuMixin):
         painter.drawRect(cx - node // 2, top, node, node)
         painter.end()
 
-        icon = QIcon(pixmap)
-        btn = getattr(self, "tree_toggle_btn", None)
-        if btn is not None:
-            btn.setIconSize(QSize(24, 24))
-        return icon
+        return QIcon(pixmap)
 
     SEARCH_DEBOUNCE_MS = 150
 
@@ -275,16 +277,57 @@ class TreeMixin(TreeMenuMixin):
         if timer is not None:
             timer.stop()              # синхронный вызов отменяет отложенный
         self.search_text = text.strip().lower()
+        self._refresh_filter()
+        self._update_dnd_mode()
+
+    def on_favorites_only_toggled(self, checked):
+        """Кнопка «только избранное»: фильтр поверх поиска, не сохраняется."""
+        self.favorites_only = checked
+        self._update_favorites_btn()
+        self._refresh_filter()
+
+    def _filter_active(self):
+        return bool(getattr(self, "search_text", "")
+                    or getattr(self, "favorites_only", False))
+
+    def _refresh_filter(self):
+        """Применить фильтр, сохранив раскрытие дерева на время его действия."""
+        active = self._filter_active()
         snapshot = getattr(self, "_pre_search_expanded", None)
-        if self.search_text and snapshot is None:
+        if active and snapshot is None:
             # B5: запоминаем раскрытие до первого раскрытия поиском.
             self._pre_search_expanded = self._expanded_keys()
         self._apply_filter()
-        if not self.search_text and snapshot is not None:
+        if not active and snapshot is not None:
             self._pre_search_expanded = None
             self._restore_expanded(snapshot)
-        self._update_dnd_mode()
         self._update_tree_toggle_btn()
+
+    def _update_favorites_btn(self):
+        """Символ избранного в выбранном стиле: пиксельная звезда либо «*»."""
+        btn = getattr(self, "favorites_btn", None)
+        if btn is None:
+            return
+        icon = self._favorite_icon() if self._pixel_icons_on() else QIcon()
+        btn.setIcon(icon)
+        btn.setText("" if self._pixel_icons_on() else "*")
+        btn.setToolTip("Показать все записи" if btn.isChecked()
+                       else "Показать только избранное")
+        btn.setAccessibleName(btn.toolTip())
+
+    def _favorite_icon(self):
+        return pixel_icons.make_icon(
+            pixel_icons.FAVORITE, self.config.get("text_color", "#FFFFFF"),
+            self.config.get("tree_bg_color", "#0000AA"),
+            self.tree.devicePixelRatioF())
+
+    def _sync_tree_buttons(self):
+        """Кнопки у сортировки — квадраты одного размера по высоте комбобокса."""
+        side = self.sort_combo.sizeHint().height()
+        icon = QSize(max(12, side - 12), max(12, side - 12))
+        for btn in (self.sort_dir_btn, self.favorites_btn, self.tree_toggle_btn):
+            btn.setFixedSize(side, side)
+            btn.setIconSize(icon)
 
     def _restore_expanded(self, keys):
         """Вернуть раскрытие папок/сервисов по снимку (type, id)."""
@@ -306,6 +349,7 @@ class TreeMixin(TreeMenuMixin):
 
     def _apply_filter_inner(self):
         text = self.search_text
+        favorites_only = getattr(self, "favorites_only", False)
 
         def visit(item):
             node = self._node(item)
@@ -315,12 +359,14 @@ class TreeMixin(TreeMenuMixin):
                 name_lower = node["name"].lower()
             self_match = ((not text) or (text in name_lower)
                           or (text in last4))
+            if favorites_only and not node.get("is_favorite"):
+                self_match = False       # контейнер виден только ради детей
             child_visible = False
             for i in range(item.childCount()):
                 child_visible = visit(item.child(i)) or child_visible
             visible = self_match or child_visible
             item.setHidden(not visible)
-            if text and child_visible:
+            if (text or favorites_only) and child_visible:
                 item.setExpanded(True)
             return visible
 
@@ -449,7 +495,7 @@ class TreeMixin(TreeMenuMixin):
                 self.tree.setCurrentItem(found)
             # B4: ссылка на уничтоженный при clear() элемент не должна жить.
             self.current_tree_item = found
-            if self.search_text:               # раскрытие совпадений поиска
+            if self._filter_active():          # раскрытие совпадений фильтра
                 self._apply_filter()
         finally:
             blocker.unblock()
@@ -546,13 +592,13 @@ class TreeMixin(TreeMenuMixin):
         for i in range(item.childCount()):
             self.set_expanded(item.child(i), state)
 
-    def delete_items(self, selected, keep=False):
+    def delete_items(self, selected, keep=False, mention_keep=True):
         nodes = [self._node(i) for i in selected]
         if len(nodes) == 1:
             msg = f"Удалить '{nodes[0]['name']}'?"
         else:
             msg = f"Удалить выбранные элементы ({len(nodes)} шт.)?"
-        if keep:
+        if keep and mention_keep:
             msg += "\nСодержимое будет сохранено (перемещено на уровень выше)."
         if not theme.themed_confirm(self.config, self, "Подтверждение", msg):
             return
@@ -731,11 +777,75 @@ class TreeMixin(TreeMenuMixin):
                     it.setExpanded(True)
                     break
 
-    def on_tree_reparent(self, items, target_item):
-        """Drop листьев на папку (сигнал AccountTree.reparent_requested)."""
-        target = self._node(target_item)
-        if target and target["type"] == FOLDER:
-            self._move_leaves_to_folder(items, target["id"])
+    def on_tree_move(self, plan):
+        """Перенос перетаскиванием (сигнал AccountTree.move_requested)."""
+        keys = [(n["type"], n["id"]) for n in map(self._node, plan.sources)]
+        service_id, folder_id = self._container_ids(plan.parent)
+        parent_key = self._item_key(plan.parent)
+        ordered = self._order_after_move(plan) if plan.anchor is not None else []
+        util.fire(self._move_nodes_async(keys, service_id, folder_id, ordered,
+                                         parent_key))
+
+    def _item_key(self, item):
+        node = self._node(item)
+        return (node["type"], node["id"]) if node else None
+
+    def _container_ids(self, parent_item):
+        """(service_id, folder_id) родителя дерева; корень — (None, None)."""
+        key = self._item_key(parent_item)
+        if key is None:
+            return None, None
+        return (key[1], None) if key[0] == SERVICE else (None, key[1])
+
+    def _order_after_move(self, plan):
+        """Итоговый порядок детей нового родителя: перенесённые встают рядом с
+        якорем в своей группе, либо в её конец, если якорь из другой группы."""
+        siblings = AccountTree.siblings_of(self.tree, plan.parent)
+        sources = [i for i in self._tree_order() if i in plan.sources]
+        ordered = []
+        for group in dict.fromkeys(map(AccountTree.item_order_group, siblings + sources)):
+            rest = [i for i in siblings if i not in plan.sources
+                    and AccountTree.item_order_group(i) == group]
+            moved = [i for i in sources if AccountTree.item_order_group(i) == group]
+            at = len(rest)
+            if plan.anchor in rest:
+                at = rest.index(plan.anchor) + (0 if plan.before else 1)
+            ordered += rest[:at] + moved + rest[at:]
+        return [self._item_key(i) for i in ordered]
+
+    def _tree_order(self):
+        """Все элементы дерева сверху вниз."""
+        result = []
+
+        def visit(item):
+            result.append(item)
+            for i in range(item.childCount()):
+                visit(item.child(i))
+
+        for i in range(self.tree.topLevelItemCount()):
+            visit(self.tree.topLevelItem(i))
+        return result
+
+    async def _move_nodes_async(self, keys, service_id, folder_id, ordered,
+                                parent_key):
+        await self._run_then_reload(
+            self.db.move_nodes, (keys, service_id, folder_id, ordered),
+            "Не удалось переместить", status="Перемещено")
+        self._reveal_moved(set(keys), parent_key)
+
+    def _reveal_moved(self, keys, parent_key):
+        """Раскрыть нового родителя и выделить перенесённые элементы."""
+        blocker = QSignalBlocker(self.tree)
+        try:
+            self.tree.clearSelection()
+            for it in self._iter_items():
+                key = self._item_key(it)
+                if key == parent_key:
+                    it.setExpanded(True)
+                if key in keys:
+                    it.setSelected(True)
+        finally:
+            blocker.unblock()
 
     def _move_services(self, selected, folder_id):
         self.move_selected("service", selected, folder_id)

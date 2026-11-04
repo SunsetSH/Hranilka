@@ -119,6 +119,11 @@ def _bbox(kind):
     return max(xs) - min(xs) + 1, max(ys) - min(ys) + 1, len(cells)
 
 
+def test_favorite_star_is_symmetric():
+    art = pixel_icons.ICON_ART[pixel_icons.FAVORITE]
+    assert all(row[:15] == row[:15][::-1] for row in art)
+
+
 def test_fin_and_server_icons_differ_by_silhouette():
     card_w, card_h, card_area = _bbox(CARD)
     wallet_w, wallet_h, wallet_area = _bbox(WALLET)
@@ -126,4 +131,5 @@ def test_fin_and_server_icons_differ_by_silhouette():
     assert card_w > card_h * 1.2           # широкая карта
     assert server_h > server_w             # высокая стойка
     assert wallet_area < wallet_w * wallet_h - 20   # скруглённая монета
+    assert "f" not in "".join(pixel_icons.ICON_ART[WALLET])   # без фона под ₿
     assert card_area == card_w * card_h    # карта — сплошной прямоугольник

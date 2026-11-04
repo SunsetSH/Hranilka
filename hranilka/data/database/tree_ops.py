@@ -7,7 +7,7 @@ from typing import Any, Optional
 from hranilka.core.domain import days_until_password_change, days_until_paid_until
 from hranilka.core.fin_domain import days_until_expiry
 from hranilka.core.fin_types import FIN_TYPES
-from hranilka.core.nodetypes import ACCOUNT, FIN_LEAF_TYPES, SERVER
+from hranilka.core.nodetypes import ACCOUNT, FIN_LEAF_TYPES, SERVER, SERVICE
 from hranilka.data.database.state import DbBase
 
 
@@ -714,15 +714,49 @@ class DbTreeOpsMixin(DbBase):
         self._check_single_parent(service_id, folder_id)
         with self.conn:
             for node_type, node_id in items:
-                if node_type == ACCOUNT:
-                    table = "accounts"
-                elif node_type in FIN_LEAF_TYPES:
-                    table = "fin_items"
-                elif node_type == SERVER:
-                    table = "servers"
+                self._move_leaf_rows(self._leaf_table(node_type), node_id,
+                                     service_id, folder_id)
+        self._mark_dirty()
+
+    @staticmethod
+    def _leaf_table(node_type):
+        """Таблица листа дерева; неизвестный тип - ValueError."""
+        if node_type == ACCOUNT:
+            return "accounts"
+        if node_type in FIN_LEAF_TYPES:
+            return "fin_items"
+        if node_type == SERVER:
+            return "servers"
+        raise ValueError(f"Не лист дерева: {node_type!r}")
+
+    def _write_order_rows(self, ordered):
+        """Нумерует sort_order по списку (node_type, id): свой счётчик у каждой
+        таблицы, потому что порядок хранится внутри группы одного вида."""
+        counters: dict[str, int] = {}
+        for node_type, node_id in ordered:
+            table = ("services" if node_type == SERVICE
+                     else self._leaf_table(node_type))
+            order = counters.get(table, 0)
+            counters[table] = order + 1
+            self.cursor.execute(
+                f"UPDATE {table} SET sort_order = ? WHERE id = ?",
+                (order, node_id))
+
+    def move_nodes(self, items, service_id=None, folder_id=None, ordered=()):
+        """Перенос перетаскиванием: сервисы и листья в нового родителя и порядок
+        в нём - ОДНОЙ транзакцией. items - список (node_type, id); ordered -
+        итоговый порядок детей родителя (пусто - в конец списка)."""
+        self._check_single_parent(service_id, folder_id)
+        with self.conn:
+            for node_type, node_id in items:
+                if node_type != SERVICE:
+                    self._move_leaf_rows(self._leaf_table(node_type), node_id,
+                                         service_id, folder_id)
+                elif service_id is not None:
+                    raise ValueError("Сервис нельзя вложить в другой сервис")
                 else:
-                    raise ValueError(f"Не лист дерева: {node_type!r}")
-                self._move_leaf_rows(table, node_id, service_id, folder_id)
+                    self._move_service_rows(node_id, folder_id)
+            self._write_order_rows(ordered)
         self._mark_dirty()
 
     def set_favorites(self, account_ids, value):

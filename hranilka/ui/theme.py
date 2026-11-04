@@ -196,6 +196,8 @@ def widget_styles(config):
             font-family: '{font_name}'; font-size: {font_size - 2}px; }}
         {_button_css(bevel, text_color, tree_bg, main_bg, font_name, font_size, p)}
         QPushButton[tabButton="true"]:checked {{ background-color: {main_bg};{"" if bevel else f" border: 2px inset {p.border};"} }}
+        QPushButton[treeTool="true"] {{ padding: 0px; }}
+        QPushButton[treeTool="true"]:checked {{ background-color: {main_bg};{"" if bevel else f" border: 2px inset {p.border};"} }}
         QCheckBox, QRadioButton {{ color: {text_color}; font-family: '{font_name}'; font-size: {font_size}px;
             spacing: 8px; background: transparent; }}
         QCheckBox::indicator, QRadioButton::indicator {{ width: 14px; height: 14px;
@@ -379,9 +381,18 @@ class ThemedDialog(QDialog):
         for layout in self.findChildren(QLayout):
             layout.invalidate()
             layout.activate()
-        hint = self.sizeHint()
-        if hint.height() > self.height():
-            self.resize(self.width(), hint.height())
+        screen = self.screen().availableGeometry()
+        target = min(self.sizeHint().height(), self._max_height())
+        if target > self.height():
+            self.resize(self.width(), target)
+        # Окно не должно уходить за нижний край экрана.
+        overflow = self.frameGeometry().bottom() - screen.bottom()
+        if overflow > 0:
+            self.move(self.x(), max(screen.top(), self.y() - overflow))
+
+    def _max_height(self):
+        """Предел высоты при автоподгонке под содержимое."""
+        return self.screen().availableGeometry().height()
 
     def closeEvent(self, e):
         super().closeEvent(e)

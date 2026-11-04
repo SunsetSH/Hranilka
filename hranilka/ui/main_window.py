@@ -22,7 +22,7 @@ from hranilka.ui.account_card import AccountCardMixin
 from hranilka.ui.fin_card import FinCardMixin
 from hranilka.ui.server_card import ServerCardMixin
 from hranilka.ui.tree import AccountTree, TreeMixin
-from hranilka.core import instance_lock
+from hranilka.core import diagnostics, instance_lock
 from hranilka.core.nodetypes import ACCOUNT, FIN_LEAF_TYPES, SERVER
 from hranilka.core.fin_types import FIN_TYPES
 from hranilka.core.paths import BASE_DIR
@@ -70,6 +70,8 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, ServerCardMixin, FinCardMixi
         # путей выхода помимо closeEvent).
         atexit.register(self._instance_lock.release)
 
+        diagnostics.startup_stage("блокировка экземпляра получена")
+
         # Вся работа с файлом-БД (фоновая запись, отложенный flush, монопольный
         # гейт) — в VaultController. Любой отказ запуска ниже освобождает
         # блокировку и поток записи, затем пробрасывает StartupAborted.
@@ -79,7 +81,8 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, ServerCardMixin, FinCardMixi
                 # Пользователь выбрал «Выход» в окне разблокировки.
                 raise StartupAborted(0, "unlock cancelled")
             self._create_tables_or_exit()
-        except BaseException:
+        except BaseException as e:
+            logging.info("Запуск прерван до показа окна: %r", e)
             self.vault.shutdown()
             self._instance_lock.release()
             raise
@@ -91,6 +94,7 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, ServerCardMixin, FinCardMixi
         self.sort_mode = self.config.get("sort_mode", "manual")
         self.sort_desc = self.config.get("sort_desc", False)
         self.search_text = ""
+        self.favorites_only = False          # кнопка «только избранное»
 
         self._current_account_id = None      # id аккаунта в правой панели
         # Открытая фин-запись правой панели: (node_type, id) | None. Аккаунт и
@@ -140,7 +144,9 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, ServerCardMixin, FinCardMixi
         self.setup_ui()
         self.apply_config()
         self._restore_geometry()
+        diagnostics.startup_stage("интерфейс построен")
         self.populate_tree()
+        diagnostics.startup_stage("дерево заполнено")
 
         # Обучение при первом запуске — после старта event loop (окно уже
         # видимо, разблокировка БД завершена выше по __init__).
@@ -556,17 +562,22 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, ServerCardMixin, FinCardMixi
         sort_layout.addWidget(self.sort_combo, 1)
 
         self.sort_dir_btn = QPushButton()
-        self.sort_dir_btn.setFixedWidth(36)
+        self.sort_dir_btn.setProperty("treeTool", "true")
         self.sort_dir_btn.setToolTip("Направление сортировки")
         self.sort_dir_btn.clicked.connect(self.on_sort_dir_toggled)
         self._update_sort_dir_btn()
         sort_layout.addWidget(self.sort_dir_btn)
 
-        # Общее сворачивание/разворачивание дерева. Размер совпадает с кнопкой
-        # направления сортировки; иконка — дерево, без ещё одной двусмысленной
-        # стрелки рядом с сортировкой.
+        self.favorites_btn = QPushButton()
+        self.favorites_btn.setProperty("treeTool", "true")
+        self.favorites_btn.setCheckable(True)
+        self.favorites_btn.toggled.connect(self.on_favorites_only_toggled)
+        sort_layout.addWidget(self.favorites_btn)
+
+        # Общее сворачивание/разворачивание дерева. Иконка — дерево, без ещё
+        # одной двусмысленной стрелки рядом с сортировкой.
         self.tree_toggle_btn = QPushButton()
-        self.tree_toggle_btn.setFixedWidth(36)
+        self.tree_toggle_btn.setProperty("treeTool", "true")
         self.tree_toggle_btn.clicked.connect(self.on_tree_toggle_all)
         sort_layout.addWidget(self.tree_toggle_btn)
         left_layout.addLayout(sort_layout)
@@ -586,19 +597,17 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, ServerCardMixin, FinCardMixi
         self.tree.setAutoScrollMargin(48)
         self._update_dnd_mode()
         self.tree.order_changed.connect(self.on_tree_order_changed)
-        self.tree.reparent_requested.connect(self.on_tree_reparent)
+        self.tree.move_requested.connect(self.on_tree_move)
         self.tree.drop_hint_changed.connect(self.on_tree_drop_hint_changed)
         self.tree.drop_rejected.connect(
-            lambda: self.statusBar().showMessage(
-                "Перетаскивание меняет порядок только внутри одной группы. "
-                "Для переноса используйте ПКМ → «Переместить…»", 4000)
-        )
+            lambda reason: self.statusBar().showMessage(reason, 4000))
         self.tree.currentItemChanged.connect(self.on_item_selected)
         self.tree.itemExpanded.connect(self._update_tree_toggle_btn)
         self.tree.itemCollapsed.connect(self._update_tree_toggle_btn)
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self.show_tree_context_menu)
         self._update_tree_toggle_btn()
+        self._update_favorites_btn()
         left_layout.addWidget(self.tree)
         self.splitter.addWidget(left_panel)
         
