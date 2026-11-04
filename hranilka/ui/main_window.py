@@ -135,6 +135,8 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, ServerCardMixin, FinCardMixi
         self._idle_timer.timeout.connect(self._check_idle)
         self._last_activity = QDateTime.currentDateTime()
         self._unlocking = False   # True во время повторной разблокировки
+        self._locking = False     # True, пока идёт авто-блокировка (защита от входа)
+        self._closing = False     # True, пока closeEvent завершает работу с БД
         # Глобальный учёт активности: любое действие пользователя в любом окне
         # программы (включая настройки и диалоги) сбрасывает счётчик простоя.
         app = QApplication.instance()
@@ -355,6 +357,16 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, ServerCardMixin, FinCardMixi
                 event.ignore()
                 return
 
+        # С этого момента idle-блокировка не должна вмешиваться (вложенный
+        # wait_idle, закрытие БД). Если закрытие отменено — флаг снимаем.
+        self._closing = True
+        try:
+            self._finish_close(event)
+        finally:
+            if not event.isAccepted():
+                self._closing = False
+
+    def _finish_close(self, event):
         # H7-01: сначала дождаться in-flight run_async-мутаторов (барьер executor'а)
         # и запустить flush — иначе последний коммит из фонового потока мог бы
         # случиться уже ПОСЛЕ wait_idle и остаться несохранённым при закрытии.
@@ -383,7 +395,7 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, ServerCardMixin, FinCardMixi
 
         # Авто-бэкап при закрытии (если включён и были изменения)
         if self.config.get("backup_auto_on_close") and self.config.get("backup_folder"):
-            had_changes = bool(unsaved) or self._any_db_changes
+            had_changes = bool(self._unsaved_keys()) or self._any_db_changes
             if had_changes:
                 # Бэкап копирует файл с диска — сначала сбросить отложенные
                 # изменения (актуально для шифрованного режима). Ошибку flush
@@ -406,27 +418,18 @@ class MainWindow(WindowChromeMixin, ShortcutsMixin, ServerCardMixin, FinCardMixi
                     except Exception as e:
                         logging.warning("Авто-бэкап не удался: %s", e)
 
-        # Сохранение геометрии окна
-        if self.config.get("remember_geometry"):
-            self.config.set("_window_geometry",
-                            bytes(self.saveGeometry().toHex()).decode("ascii"))
-            self.config.save()
-
-        # Очистка буфера обмена при выходе (если включено в настройках)
-        if self.config.get("clipboard_clear_on_exit", False):
-            try:
-                # Как _clear_clipboard (chrome): чужое содержимое не стираем —
-                # только если в буфере всё ещё скопированный нами секрет.
-                copied = getattr(self, "_clip_copied_text", None)
-                cb = QApplication.clipboard()
-                if copied is not None and cb.text() == copied:
-                    cb.clear()
-            except Exception as e:
-                logging.warning("Не удалось очистить буфер при выходе: %s", e)
+        # Геометрия окна и очистка буфера (идемпотентно, общий блок с _exit_app)
+        self._finish_ui_state()
 
         # Гасим незавершённый async карточки/галереи ДО закрытия БД: висящие
         # загрузки/предпросмотр не должны обращаться к уже закрытому соединению.
         self._quiesce_card_async()
+        # Database.close() сначала сохраняет (persist) и лишь потом закрывает
+        # соединение/сбрасывает сессию: при сбое сохранения исключение вылетает ДО
+        # закрытия, БД остаётся открытой и целой. Поэтому event.ignore() ниже
+        # оставляет приложение в согласованном состоянии (повторное закрытие
+        # попробует снова); побочные эффекты выше (геометрия, буфер, бэкап,
+        # _quiesce_card_async) идемпотентны.
         try:
             self.db.close()
         except VaultConflictError:

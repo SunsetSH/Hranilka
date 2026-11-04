@@ -93,7 +93,7 @@ a = Analysis(
     # перекрывает иконку, зашитую в exe.
     datas=[(f"assets/icon_{s}.png", "assets")
            for s in (16, 32, 48, 64, 128, 256)],
-    hiddenimports=[],
+    hiddenimports=["certifi"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

@@ -1,6 +1,7 @@
 """Карточка аккаунта: загрузка/сохранение полной карточки и связи между
 аккаунтами. Часть класса Database (database.py) — методы вынесены
 дословно (backlog-разрез CRUD)."""
+import logging
 from typing import Any
 from hranilka.core.domain import canonical_link_pair
 from hranilka.data.database.state import DbBase
@@ -45,8 +46,14 @@ class DbAccountCardMixin(DbBase):
     def _set_links_rows(self, account_id: int, target_ids: list[int]) -> None:
         """Тело set_links без управления транзакцией/пометкой dirty — чтобы запись
         связей можно было выполнить в общей транзакции с save_account (H6-02)."""
+        # Связи с аккаунтами в корзине не трогаем: get_links их скрывает, и
+        # перезапись видимого списка не должна молча рвать их (restore вернёт).
         self.cursor.execute(
-            "DELETE FROM linked_accounts WHERE account_id = ? OR linked_account_id = ?",
+            "DELETE FROM linked_accounts WHERE "
+            "(account_id = ? AND linked_account_id IN "
+            "  (SELECT id FROM accounts WHERE deleted_at IS NULL)) OR "
+            "(linked_account_id = ? AND account_id IN "
+            "  (SELECT id FROM accounts WHERE deleted_at IS NULL))",
             (account_id, account_id),
         )
         seen = set()
@@ -55,6 +62,12 @@ class DbAccountCardMixin(DbBase):
             if t == account_id or t in seen:
                 continue
             seen.add(t)
+            # Устаревший id (аккаунт удалён насовсем) дал бы FK IntegrityError и
+            # откатил всё сохранение карточки - такую связь пропускаем.
+            if self.cursor.execute(
+                    "SELECT 1 FROM accounts WHERE id = ?", (t,)).fetchone() is None:
+                logging.info("Связь пропущена: %s id=%s не существует", "account", t)
+                continue
             # Каноническая форма: account_id < linked_account_id. Так (A,B) и
             # (B,A) — одна и та же строка (закреплено CHECK в схеме, M3-06).
             lo, hi = canonical_link_pair(account_id, t)

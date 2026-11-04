@@ -238,8 +238,15 @@ class ServerCardMixin(CardFlowMixin):
             return
         util.fire(self._add_server_account_link_async())
 
+    def _server_link_ctx_valid(self, gen, session, key):
+        """Карточка после await та же: поколение, сессия и ключ сервера."""
+        return (gen == self._card_gen and session == self.db.current_session()
+                and self._current_server == key)
+
     async def _add_server_account_link_async(self):
         session = self.db.current_session()
+        gen = self._card_gen
+        key = self._current_server
         try:
             accounts = await self.db.run_async(
                 self.db.get_all_accounts, _session=session)
@@ -248,11 +255,13 @@ class ServerCardMixin(CardFlowMixin):
         except Exception as e:                       # noqa: BLE001
             self._show_card_error("Не удалось загрузить список аккаунтов", e)
             return
+        if not self._server_link_ctx_valid(gen, session, key):
+            return
         widget = self.server_tabs.f_linked_accounts
         chosen, ok = theme.themed_multiselect(
             self.config, self, "Связать с аккаунтами", accounts,
             widget.get_data())
-        if ok:
+        if ok and self._server_link_ctx_valid(gen, session, key):
             chosen_set = set(chosen)
             links = [a for a in accounts if a["id"] in chosen_set]
             widget.set_data(links)

@@ -6,9 +6,9 @@ from dataclasses import dataclass
 
 from PySide6.QtWidgets import (QDialog, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                                QLineEdit, QPushButton, QComboBox, QListWidget,
-                               QListWidgetItem, QLayout)
+                               QListWidgetItem, QLayout, QApplication)
 from PySide6.QtGui import QColor
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, QRect
 
 from hranilka.ui import sounds
 from hranilka.ui.msg_icons import msg_icon
@@ -135,7 +135,10 @@ def _colors(config):
 def _bevel_mode(config) -> bool:
     """True, если рамки кнопок/полей рисует RetroStyle (chrome_style != flat):
     тогда в QSS у этих виджетов нет border (иначе QSS рисует рамку сам)."""
-    return config.get("chrome_style", "flat") not in ("flat", None, "")
+    # Через normalize_chrome (как у RetroStyle): неизвестное значение трактуется
+    # как flat и в обоих местах одинаково, иначе рамки пропали бы совсем.
+    from hranilka.ui.retro_style import normalize_chrome   # поздний импорт: цикл
+    return normalize_chrome(config.get("chrome_style", "flat")) != "flat"
 
 
 def _field_css(bevel, text_color, tree_bg, main_bg, font_name, font_size, p) -> str:
@@ -213,7 +216,8 @@ def widget_styles(config):
         QProgressBar {{ background-color: {tree_bg}; color: {text_color};
             border: 2px inset {p.border}; text-align: center; min-height: 16px;
             font-family: '{font_name}'; font-size: {font_size}px; }}
-        QProgressBar::chunk {{ background-color: {text_color}; width: 10px; margin: 1px; }}
+        QProgressBar::chunk {{ background-color: {mix(tree_bg, text_color, 0.3)};
+            width: 10px; margin: 1px; }}
         QStatusBar {{ background-color: {tree_bg}; color: {text_color}; border: 1px solid {p.border};
             font-family: '{font_name}'; font-size: {font_size}px; }}
         QStatusBar QLabel {{ font-family: '{font_name}'; font-size: {font_size}px; }}
@@ -353,6 +357,13 @@ class ThemedDialog(QDialog):
         super().setWindowTitle(title)
         self._header.set_title(title)
 
+    def force_close(self):
+        """Закрыть диалог БЕЗ вопросов пользователю (авто-блокировка по простою).
+        Обычный reject() у подклассов может открывать вложенные подтверждения,
+        которые заблокировали бы блокировку. Подклассы с живым предпросмотром
+        переопределяют метод, чтобы откатить изменения."""
+        self.done(QDialog.DialogCode.Rejected)
+
     def showEvent(self, e):
         super().showEvent(e)
         # Применяем ту же скриншот-защиту, что у главного окна, к диалогу.
@@ -381,7 +392,7 @@ class ThemedDialog(QDialog):
         for layout in self.findChildren(QLayout):
             layout.invalidate()
             layout.activate()
-        screen = self.screen().availableGeometry()
+        screen = self._available_geometry()
         target = min(self.sizeHint().height(), self._max_height())
         if target > self.height():
             self.resize(self.width(), target)
@@ -390,9 +401,20 @@ class ThemedDialog(QDialog):
         if overflow > 0:
             self.move(self.x(), max(screen.top(), self.y() - overflow))
 
+    def _available_geometry(self):
+        """Доступная область экрана. При отсутствии экранов (отключён монитор,
+        блокировка сессии) self.screen() возвращает QObject без геометрии —
+        берём основной экран или безопасный прямоугольник по умолчанию."""
+        screen = self.screen()
+        if not hasattr(screen, "availableGeometry"):
+            screen = QApplication.primaryScreen()
+        if screen is None:
+            return QRect(0, 0, 1280, 720)
+        return screen.availableGeometry()
+
     def _max_height(self):
         """Предел высоты при автоподгонке под содержимое."""
-        return self.screen().availableGeometry().height()
+        return self._available_geometry().height()
 
     def closeEvent(self, e):
         super().closeEvent(e)

@@ -132,8 +132,24 @@ class Config:
             "check_updates": False,
             "_window_geometry": "",        # hex-строка QByteArray (или пусто)
         }
+        # Значения «живого предпросмотра» (окно настроек): пока он активен,
+        # save() пишет на диск зафиксированные значения этих ключей, а не
+        # временные. None — предпросмотра нет.
+        self._preview_committed: dict[str, Any] | None = None
         self.load()
-    
+
+    def begin_preview(self, committed_values: dict[str, Any]) -> None:
+        """Начать предпросмотр: committed_values — действующие (сохранённые)
+        значения ключей, которые UI временно меняет через set(). Любой save()
+        до end_preview() запишет именно их, откуда бы он ни был вызван."""
+        self._preview_committed = dict(committed_values)
+
+    def end_preview(self) -> None:
+        """Завершить предпросмотр (идемпотентно). Значения в памяти не трогает —
+        откат/применение делает вызывающий; после вызова save() пишет всё как
+        есть."""
+        self._preview_committed = None
+
     def load(self) -> None:
         if not CONFIG_FILE.exists():
             # S4: безопасные умолчания только для НОВОГО конфига. Существующий
@@ -181,14 +197,14 @@ class Config:
             lo, hi = _INT_RANGES[key]
             try:
                 return max(lo, min(hi, int(value)))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):   # int(inf)
                 return default
         if isinstance(default, bool):         # до int: bool — подтип int
             return _coerce_bool(value, default)
         if isinstance(default, int):
             try:
                 return max(0, int(value))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 return default
         if isinstance(default, str):
             return value if isinstance(value, str) else default
@@ -201,9 +217,12 @@ class Config:
         # чтобы обрыв на середине не повредил config.json. При сбое временный
         # файл не остаётся на диске.
         tmp = str(CONFIG_FILE) + ".tmp"
+        data = self.config
+        if self._preview_committed is not None:
+            data = {**self.config, **self._preview_committed}
         try:
             with open(tmp, 'w', encoding='utf-8') as f:
-                json.dump(self.config, f, indent=2)
+                json.dump(data, f, indent=2)
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp, CONFIG_FILE)

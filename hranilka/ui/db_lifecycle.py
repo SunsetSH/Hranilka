@@ -348,6 +348,17 @@ class DbLifecycleMixin:
         и возвращает False — вызыватель откатывается к прежнему vault. Так
         восстановленный encrypted-файл больше не публикуется для чтения/записи без
         миграции и проверки версии схемы."""
+        # Окно ввода пароля и сообщения ниже модальны: idle-таймер не должен
+        # закрыть их блокировкой посреди restore (тихий откат восстановления).
+        # Тот же флаг, что у повторной разблокировки в _lock_vault.
+        was_unlocking = self._unlocking
+        self._unlocking = True
+        try:
+            return self._open_and_validate_guarded()
+        finally:
+            self._unlocking = was_unlocking
+
+    def _open_and_validate_guarded(self):
         if not self._open_database(self):
             return False
         try:
@@ -385,12 +396,9 @@ class DbLifecycleMixin:
         #   2) синхронный flush — запускает запись, если БД грязная (в т.ч. когда
         #      сброс был лишь запланирован через QTimer, но ещё не стартовал);
         #   3) wait_idle — дожидаемся завершения самой фоновой записи.
-        if not self.db.wait_executor_idle():
+        # _quiesce_guarded: автоблокировка не должна сработать в его event-loop.
+        if not self.vault._quiesce_guarded():
             return False, ("Фоновые операции с базой не завершились вовремя.\n"
-                           "Повторите попытку через несколько секунд.")
-        self.vault.flush()
-        if not self.vault.wait_idle():
-            return False, ("Фоновое сохранение базы не завершилось вовремя.\n"
                            "Повторите попытку через несколько секунд.")
         # Гасим незавершённый async карточки/галереи ДО закрытия БД (H65-02).
         self._quiesce_card_async()

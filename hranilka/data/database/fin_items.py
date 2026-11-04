@@ -8,11 +8,13 @@
 писатель — рассинхронизация с JSON исключена по построению).
 """
 import json
+import logging
 from datetime import date, datetime
 from typing import Any, Optional
 
 from hranilka.core.fin_types import FIN_TYPES
 from hranilka.data.database.state import DbBase
+from hranilka.data.errors import CorruptedPayloadError
 
 
 class DbFinItemsMixin(DbBase):
@@ -58,8 +60,10 @@ class DbFinItemsMixin(DbBase):
             return None
         try:
             payload = json.loads(row["data"]) if row["data"] else {}
-        except (ValueError, TypeError):
-            payload = {}
+        except (ValueError, TypeError) as e:
+            # Повреждённый JSON - НЕ подменяем пустым словарём (M-03, как в
+            # get_server): иначе сохранение карточки затёрло бы CVV/seed.
+            raise CorruptedPayloadError(item_id) from e
 
         self.cursor.execute(
             "SELECT id, description, LENGTH(image_data) AS blob_size "
@@ -195,6 +199,12 @@ class DbFinItemsMixin(DbBase):
             if aid in seen:                 # дедуп входного списка
                 continue
             seen.add(aid)
+            # Устаревший id (аккаунт удалён насовсем) - пропускаем, иначе FK
+            # IntegrityError откатит всё сохранение карточки.
+            if self.cursor.execute(
+                    "SELECT 1 FROM accounts WHERE id = ?", (aid,)).fetchone() is None:
+                logging.info("Связь пропущена: %s id=%s не существует", "account", aid)
+                continue
             self.cursor.execute(
                 "INSERT OR IGNORE INTO fin_links (item_id, account_id) "
                 "VALUES (?, ?)", (item_id, aid))
@@ -219,6 +229,10 @@ class DbFinItemsMixin(DbBase):
             if iid in seen:                 # дедуп входного списка
                 continue
             seen.add(iid)
+            if self.cursor.execute(
+                    "SELECT 1 FROM fin_items WHERE id = ?", (iid,)).fetchone() is None:
+                logging.info("Связь пропущена: %s id=%s не существует", "fin_item", iid)
+                continue                    # устаревший id - см. выше
             self.cursor.execute(
                 "INSERT OR IGNORE INTO fin_links (item_id, account_id) "
                 "VALUES (?, ?)", (iid, account_id))

@@ -60,6 +60,11 @@ class Database(DbConcurrencyMixin, DbPersistenceMixin, DbSchemaMixin,
         # Короткий лок на снимок/зануление ключа: seal_and_write идёт в потоке
         # писателя БЕЗ _lock, а lock() - в UI-потоке (B13/S8).
         self._key_lock = threading.Lock()
+        # Мьютекс записи контейнера: проверка ревизии + замена файла + обновление
+        # _disk_revision (и снимок ключа/заголовка) - один писатель за раз.
+        # RLock: seal_and_write -> _write_container берут его вложенно.
+        # Порядок: _lock -> _write_lock; под _write_lock _lock НЕ берётся.
+        self._write_lock = threading.RLock()
         # Отпечаток контейнера на диске (шифр. режим): гасит ложные конфликты
         # от смены mtime антивирусом/облаком (см. _check_no_external_change).
         self._disk_fingerprint: bytes | None = None

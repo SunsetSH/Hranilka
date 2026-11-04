@@ -143,7 +143,7 @@ def _is_valid_db(path: Path) -> bool:
         except Exception:
             return False
     try:
-        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        con = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
         try:
             row = con.execute("PRAGMA quick_check").fetchone()
             if not row or row[0] != "ok":
@@ -208,6 +208,7 @@ def restore_backup(backup_path: str, db_path: str) -> None:
     rollback = dst.with_name(dst.name + ".rollback")
     had_dst = dst.exists()
     committed = False
+    rollback_in_play = False        # dst уже подменён: rollback — единственная копия
     try:
         _copy_durable(src, tmp)             # стейджим проверенный кандидат рядом
         if had_dst:
@@ -218,23 +219,31 @@ def restore_backup(backup_path: str, db_path: str) -> None:
             # Откат атомарно (M6-05): прежняя БД — в durable-копии rollback;
             # os.replace в пределах каталога не оставит dst частично записанным,
             # в отличие от прежнего copy2.
+            rollback_in_play = True
             _rollback_or_preserve(rollback, dst, had_dst)
             raise
+        rollback_in_play = True
         # Подтверждаем, что записанный файл открывается. rollback держим до этого
         # момента — если проверка не прошла, откатываемся к прежней БД.
         if not _is_valid_db(dst):
-            _rollback_or_preserve(rollback, dst, had_dst)
+            try:
+                _rollback_or_preserve(rollback, dst, had_dst)
+            finally:
+                if not had_dst:
+                    best_effort_wipe(str(dst))  # прежней БД не было: битый dst убираем
             raise ValueError(
                 "Восстановленный файл не открывается; выполнен откат к прежней базе.")
         committed = True
     finally:
-        # tmp удаляем всегда. rollback — ТОЛЬКО при подтверждённом успехе (M65-03):
-        # если откат сам не удался, _rollback_or_preserve уже сохранил последнюю
-        # целую копию под recovery-именем, а сам rollback здесь не трогаем.
+        # tmp удаляем всегда. rollback — при успехе или если dst не трогали (сбой
+        # копирования: иначе остаётся неполная plaintext-копия). После подмены dst
+        # rollback до успеха не трогаем: это единственная копия прежней БД; если
+        # откат сам не удался, _rollback_or_preserve уже сохранил её под
+        # recovery-именем (M65-03).
         # Обе — полные копии БД (пароли/BLOB), поэтому затираем перед удалением (H-3).
         if tmp.exists():
             best_effort_wipe(str(tmp))
-        if committed and rollback.exists():
+        if (committed or not rollback_in_play) and rollback.exists():
             best_effort_wipe(str(rollback))
 
 

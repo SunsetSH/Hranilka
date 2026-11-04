@@ -239,7 +239,8 @@ def test_lock_screen_encrypted_smoke(window, monkeypatch):
     window.is_editing = False
     window._lock_screen()
     assert called.get("vault") is True
-    assert window._current_account_id is None
+    # Сброс current-состояний делает сам _lock_vault ПОСЛЕ успешного db.lock()
+    # (см. tests/test_lock_flow.py); здесь он замокан и состояние не трогает.
 
     # Есть незавершённые правки -> блокировка откладывается, состояние не трогается.
     called.clear()

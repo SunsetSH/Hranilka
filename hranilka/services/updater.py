@@ -18,6 +18,7 @@ import logging
 import os
 import re
 import shutil
+import ssl
 import struct
 import subprocess
 import sys
@@ -134,10 +135,13 @@ def _require_allowed_url(url: Any) -> None:
 def _ssl_context() -> Any:
     """Системные корневые сертификаты плюс certifi: на чистой Windows нужного
     корня может не быть в хранилище, пока его не запросит браузер."""
-    import ssl
-
-    import certifi
     context = ssl.create_default_context()
+    try:
+        import certifi
+    except ImportError:
+        logger.warning("Обновления: certifi не найден, используется системное "
+                       "хранилище сертификатов")
+        return context
     context.load_verify_locations(cafile=certifi.where())
     return context
 
@@ -172,6 +176,22 @@ def _network_error(error: Exception) -> UpdateError:
     logger.warning("Обновления: ошибка сети: %s", error)
     return UpdateError("Не удалось связаться с GitHub. Проверьте подключение "
                        "к интернету и повторите позже.")
+
+
+def _ssl_error(error: Exception) -> UpdateError:
+    logger.warning("Обновления: ошибка TLS: %s", error)
+    return UpdateError("Не удалось установить защищённое соединение с GitHub "
+                       "(проверка сертификата). Проверьте дату и время на "
+                       "компьютере и повторите позже.")
+
+
+def _transport_error(error: Exception) -> UpdateError:
+    """TLS-сбой (urllib заворачивает SSLError в URLError.reason) отличаем от
+    обычной потери сети."""
+    reason = getattr(error, "reason", None)
+    if isinstance(error, ssl.SSLError) or isinstance(reason, ssl.SSLError):
+        return _ssl_error(error)
+    return _network_error(error)
 
 
 def _asset_by_name(assets: Any) -> dict[str, dict[str, Any]]:
@@ -232,7 +252,7 @@ def fetch_latest() -> Optional[ReleaseInfo]:
                               "Повторите проверку позже.") from e
         raise _network_error(e) from e
     except (URLError, HTTPException, OSError) as e:
-        raise _network_error(e) from e
+        raise _transport_error(e) from e
     except ValueError as e:               # JSONDecodeError, UnicodeDecodeError
         logger.warning("Обновления: некорректный ответ GitHub: %s", e)
         raise UpdateError("GitHub вернул некорректный ответ.") from e
@@ -340,8 +360,10 @@ def download(release: ReleaseInfo, folder: Path,
         if actual != expected:
             raise UpdateError("Контрольная сумма файла не совпала — файл отклонён.")
         os.replace(part, final)
+    except ssl.SSLError as e:
+        raise _ssl_error(e) from e
     except (URLError, HTTPException, TimeoutError, ConnectionError) as e:
-        raise _network_error(e) from e
+        raise _transport_error(e) from e
     except OSError as e:
         logger.error("Обновления: ошибка записи файла: %s", e)
         raise UpdateError(f"Не удалось сохранить обновление: {e.strerror or e}") from e

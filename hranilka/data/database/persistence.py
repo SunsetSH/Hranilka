@@ -6,6 +6,7 @@ flush, включение/выключение шифрования. Часть 
 ВНИМАНИЕ: конвейер отложенного сохранения (см. docs/CODE_MAP.md) пересекает
 границу этого модуля и vault_controller.py — семантику методов не менять."""
 import hashlib
+import logging
 import os
 import sqlite3
 import tempfile
@@ -46,6 +47,7 @@ class DbPersistenceMixin(DbBase):
         self._disk_revision = self._stat_revision()
         self._setup_conn()
         self._bump_session()
+        self._wipe_stale_update_holds()
 
     def open_encrypted(self, db_bytes: bytes, dek: bytes, header: dict) -> None:
         """Открыть расшифрованные байты БД в памяти. Файл остаётся шифрованным;
@@ -62,6 +64,37 @@ class DbPersistenceMixin(DbBase):
         self._disk_fingerprint = self._file_fingerprint()
         self._setup_conn()
         self._bump_session()
+        self._wipe_stale_update_holds()
+
+    def _wipe_stale_update_holds(self) -> None:
+        """Убрать `<db>.pre-update-wipe-*` — жёсткие ссылки на прежний plaintext,
+        оставшиеся после сбоя между os.link и затиранием (_atomic_write_wiping_old).
+        Best-effort. Не трогаем ссылку этого процесса, пока идёт замена (флаг
+        _wipe_hold_active). Если ссылка указывает на тот же inode, что и живой
+        файл БД (сбой ДО замены), её только удаляем: затирание уничтожило бы БД."""
+        directory = os.path.dirname(self.db_path) or "."
+        prefix = os.path.basename(self.db_path) + ".pre-update-wipe-"
+        own = f"{prefix}{os.getpid()}"
+        try:
+            names = os.listdir(directory)
+        except OSError:
+            return
+        for name in names:
+            if not name.startswith(prefix):
+                continue
+            if name == own and getattr(self, "_wipe_hold_active", False):
+                continue
+            path = os.path.join(directory, name)
+            try:
+                if not os.path.isfile(path):
+                    continue
+                if os.path.exists(self.db_path) and os.path.samefile(path, self.db_path):
+                    os.unlink(path)
+                else:
+                    best_effort_wipe(path)
+                logging.info("Удалён остаток обновления: %s", name)
+            except OSError as e:
+                logging.warning("Не удалось убрать остаток %s: %s", name, e)
 
     def _file_fingerprint(self):
         """Отпечаток «поколения» контейнера: SHA-256 первых 512 байт файла
@@ -162,10 +195,15 @@ class DbPersistenceMixin(DbBase):
     def _write_container(self, container, force: bool = False):
         """Атомарно записать готовый контейнер (bytes или части) на диск
         (temp+fsync+replace).
-        Перед заменой сверяет ревизию файла (если не force) и обновляет её после."""
-        if not force:
-            self._check_no_external_change()
-        self._atomic_replace(container)
+        Перед заменой сверяет ревизию файла (если не force) и обновляет её после.
+
+        Проверка ревизии, замена файла и обновление _disk_revision/fingerprint -
+        под _write_lock: иначе два параллельных писателя видят одну и ту же
+        «старую» ревизию и один получает ложный VaultConflictError."""
+        with self._write_lock:
+            if not force:
+                self._check_no_external_change()
+            self._atomic_replace(container)
 
     def serialize_db(self) -> bytes:
         """Сериализовать in-memory БД в байты.
@@ -188,9 +226,15 @@ class DbPersistenceMixin(DbBase):
         самые тяжёлые части сохранения."""
         # Ключ и заголовок снимаются один раз в начале (B13): параллельный
         # lock() не обнулит их посреди шифрования.
-        dek, header = self._key_material()
-        parts = cs.seal_parts(db_bytes, dek, header)
-        self._write_container(parts, force=force)
+        # Снимок ключа/заголовка берём ВНУТРИ _write_lock: писатель, ждавший
+        # лок, иначе записал бы устаревший заголовок поверх нового (смена
+        # пароля/recovery между снимком и записью). Шифрование идёт под
+        # _write_lock, но НЕ под основным _lock - чтения БД не блокируются.
+        # Порядок локов везде один: _lock -> _write_lock (обратного нет).
+        with self._write_lock:
+            dek, header = self._key_material()
+            parts = cs.seal_parts(db_bytes, dek, header)
+            self._write_container(parts, force=force)
 
     def persist(self, force: bool = False):
         """Сбросить текущее состояние БД на диск.
@@ -200,7 +244,7 @@ class DbPersistenceMixin(DbBase):
         VaultConflictError, если файл изменён извне (force=True — перезаписать)."""
         if not self.encrypted or self.conn is None or self._dek is None:
             return
-        self._write_container(self.serialize_container(), force=force)
+        self.seal_and_write(self.serialize_db(), force=force)
 
     def set_header(self, header: dict):
         """Обновить заголовок контейнера (после смены пароля/recovery) и сохранить.
@@ -253,8 +297,16 @@ class DbPersistenceMixin(DbBase):
         контроллером по таймеру и в финальных точках. force — перезаписать,
         даже если файл изменён извне (см. VaultConflictError)."""
         if self._dirty:
-            self.persist(force=force)
+            # Флаг снимаем ДО записи: мутатор, пометивший БД грязной во время
+            # persist, иначе был бы затёрт присваиванием False после записи
+            # (его правки остались бы несохранёнными без повторного flush).
+            # При сбое возвращаем флаг (как VaultController._start_vault_write).
             self._dirty = False
+            try:
+                self.persist(force=force)
+            except BaseException:
+                self._dirty = True
+                raise
 
     def _commit(self):
         """Зафиксировать транзакцию и пометить БД грязной (отложенная запись
@@ -276,7 +328,42 @@ class DbPersistenceMixin(DbBase):
         # Используется при включении/выключении шифрования (интерактивно,
         # состояние файла под контролем) — пишем без проверки конфликта, но
         # ревизию обновляем, чтобы последующие persist() сверялись корректно.
-        self._atomic_replace(data)
+        with self._write_lock:
+            self._atomic_replace(data)
+
+    def _atomic_write_wiping_old(self, data: bytes):
+        """Как _atomic_write, но затирает прежнее содержимое файла (best-effort).
+
+        os.replace отдаёт старые блоки файловой системе нетронутыми - plaintext
+        остаётся на диске в свободных секторах. Поэтому ПЕРЕД заменой берём
+        жёсткую ссылку на старый inode; после успешной замены (контейнер уже
+        durable) затираем нулями именно его блоки и удаляем ссылку. Нет жёстких
+        ссылок (ФС/права) - просто обычная замена. Сбой замены: ссылку убираем
+        простым unlink (файл жив - затирать его нельзя)."""
+        hold = f"{self.db_path}.pre-update-wipe-{os.getpid()}"
+        linked = False
+        self._wipe_hold_active = True
+        try:
+            try:
+                if os.path.exists(hold):
+                    os.unlink(hold)
+                os.link(self.db_path, hold)
+                linked = True
+            except OSError:
+                linked = False
+            try:
+                self._atomic_write(data)
+            except BaseException:
+                if linked:
+                    try:
+                        os.unlink(hold)
+                    except OSError:
+                        pass
+                raise
+            if linked:
+                best_effort_wipe(hold)
+        finally:
+            self._wipe_hold_active = False
 
     def enable_encryption(self, password: str, preset: str) -> str:
         """Зашифровать текущую (обычную) БД. Возвращает recovery-код.
@@ -291,7 +378,7 @@ class DbPersistenceMixin(DbBase):
         pt, dek, header = cs.unlock(container, password)  # валидируем ДО закрытия
         self.conn.close()
         try:
-            self._atomic_write(container)
+            self._atomic_write_wiping_old(container)
         except Exception:
             self.connect()   # старый файл не тронут — возвращаем рабочий режим
             raise
@@ -321,6 +408,9 @@ class DbPersistenceMixin(DbBase):
         """Расшифровать БД обратно в обычный файл и работать без шифрования."""
         db_bytes = self.conn.serialize()
         dek, header = self._dek, self._header
+        # open_encrypted сбрасывает _dirty - запоминаем, чтобы при сбое не
+        # потерять несохранённые правки.
+        was_dirty = self._dirty
         self.conn.close()
         try:
             # Сериализованные байты — это валидный файл SQLite; пишем как есть.
@@ -329,6 +419,9 @@ class DbPersistenceMixin(DbBase):
             # Запись не удалась (на диске остался зашифрованный контейнер) —
             # возвращаем рабочее зашифрованное состояние из байтов в памяти.
             self.open_encrypted(db_bytes, dek, header)
+            self._dirty = was_dirty
+            if was_dirty:
+                self._mark_dirty()   # заново запланировать отложенную запись
             self._zero(dek)
             raise
         self._zero(dek)

@@ -108,15 +108,24 @@ def _remove_stale_snapshots(now: float) -> None:
             continue
 
 
-def cleanup_leftovers() -> None:
+def cleanup_leftovers(argv: Optional[list[str]] = None) -> None:
     """Убрать хвосты прошлых обновлений. Снимок хранится 14 дней: в нём данные
-    на момент обновления, бессрочно копить их незачем."""
+    на момент обновления, бессрочно копить их незачем.
+
+    Метку подтверждения в процессе, запущенном с CONFIRM_ARG, не трогаем: её
+    ждёт и удаляет старый процесс; удали мы её раньше, чем он заметит, он снял
+    бы рабочую новую версию по таймауту. Забытая метка уберётся при обычном
+    следующем запуске (а перед новым обновлением её удаляет и _swap_and_confirm)."""
     if not getattr(sys, "frozen", False):
         return
     exe = updater.running_exe()
-    for name in (exe.name + OLD_SUFFIX, CONFIRM_MARKER,
-                 updater.ASSET_EXE + updater.STAGED_SUFFIX,
-                 updater.ASSET_EXE + updater.PART_SUFFIX):
+    confirming = CONFIRM_ARG in (sys.argv if argv is None else argv)
+    names = [exe.name + OLD_SUFFIX,
+             updater.ASSET_EXE + updater.STAGED_SUFFIX,
+             updater.ASSET_EXE + updater.PART_SUFFIX]
+    if not confirming:
+        names.append(CONFIRM_MARKER)
+    for name in names:
         _remove(exe.with_name(name))
     _remove_stale_snapshots(time.time())
 

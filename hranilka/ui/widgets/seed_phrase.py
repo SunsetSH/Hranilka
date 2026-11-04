@@ -7,6 +7,10 @@ copy_signal (автоочистку буфера подхватывает MainWi
 «ВСТАВИТЬ ФРАЗУ» (парсинг буфера по пробелам/переносам). Слово не из словаря
 BIP-39 помечается маркером [!] — предупреждение, не блокировка.
 
+Пустая ячейка ВНУТРИ фразы хранится маркером «_» (позиции слов не
+сдвигаются); хвостовые пустые ячейки не пишутся, поэтому прежние значения
+(слова через пробел) читаются без изменений.
+
 Контракт совпадает с CopyableField (set_text/get_text/set_editable/copy_signal):
 фабрика FinItemTabs строит виджет единообразно; значение в payload — строка
 (слова через пробел).
@@ -15,14 +19,26 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
                                QLineEdit, QPushButton, QLabel, QComboBox,
                                QApplication)
 from PySide6.QtCore import Signal, QTimer
+from PySide6.QtGui import QValidator
 
 from hranilka.core.bip39_words import BIP39_WORDS
-from hranilka.ui.widgets.common import copy_secret
+from hranilka.ui.widgets.common import (copy_secret, _confirm as _ask_confirm,
+                                        _warn as _show_warn)
 
 # Допустимые размеры фразы (BIP-39), колонок в сетке и таймаут автоскрытия.
 WORD_COUNTS = (12, 15, 18, 21, 24)
 _COLUMNS = 3
 REVEAL_TIMEOUT_MS = 30_000
+EMPTY_MARK = "_"      # маркер пустой ячейки внутри фразы в сохранённой строке
+
+
+class _NoEmptyMarkValidator(QValidator):
+    """Отвергает ввод, равный маркеру пустой ячейки (EMPTY_MARK)."""
+
+    def validate(self, text: str, pos: int):
+        state = (QValidator.State.Invalid if text.strip() == EMPTY_MARK
+                 else QValidator.State.Acceptable)
+        return state, text, pos
 
 
 class SeedPhraseWidget(QWidget):
@@ -34,6 +50,7 @@ class SeedPhraseWidget(QWidget):
         super().__init__(parent)
         self._editable = False
         self._revealed = False
+        self._count = WORD_COUNTS[0]     # текущий размер сетки
         # Ячейки: (QLineEdit слова, QLabel-маркер [!], контейнер ячейки).
         self._cells: list[tuple[QLineEdit, QLabel, QWidget]] = []
 
@@ -89,15 +106,20 @@ class SeedPhraseWidget(QWidget):
     def set_text(self, text: str) -> None:
         """Фраза строкой (слова через пробел/перенос) → ячейки. Размер сетки —
         минимальный допустимый, вмещающий все слова (лишние отбрасываются)."""
-        words = (text or "").split()
+        tokens = (text or "").split()
+        words = ["" if t == EMPTY_MARK else t for t in tokens]
         count = next((n for n in WORD_COUNTS if n >= len(words)),
                      WORD_COUNTS[-1])
         self._set_count_silently(count)
         self._rebuild_grid(count, words)
 
     def get_text(self) -> str:
-        """Фраза одной строкой: непустые слова через пробел."""
-        return " ".join(w for w in self._words() if w)
+        """Фраза одной строкой через пробел. Пустые ячейки между словами
+        пишутся маркером «_» (позиции сохраняются), хвостовые отбрасываются."""
+        words = self._words()
+        while words and not words[-1]:
+            words.pop()
+        return " ".join(w or EMPTY_MARK for w in words)
 
     def set_editable(self, editable: bool) -> None:
         self._editable = editable
@@ -117,21 +139,50 @@ class SeedPhraseWidget(QWidget):
 
     def do_copy(self) -> None:
         """Скопировать фразу одной строкой (канал с автоочисткой буфера)."""
-        text = self.get_text()
-        if text:
-            copy_secret(text)
-            self.copy_signal.emit()
+        words = [w for w in self._words() if w]
+        if not words:
+            return
+        # Только реальные слова (без маркера «_»): иначе фраза не вставится в
+        # кошелёк. Пропуски внутри фразы сдвигают позиции — предупреждаем.
+        has_gaps = any(not w for w in self._words()[:self._last_filled() + 1])
+        copy_secret(" ".join(words))
+        self.copy_signal.emit()
+        if has_gaps:
+            self._notify("Копирование фразы",
+                         "В фразе есть пустые ячейки: скопированы только "
+                         "заполненные слова, порядок позиций нарушен.")
 
     def paste_phrase(self) -> None:
         """Разобрать текст буфера по пробелам/переносам в ячейки (только правка)."""
         text = QApplication.clipboard().text()
-        if text and text.split():
-            self.set_text(text)
+        tokens = text.split() if text else []
+        if not tokens:
+            return
+        if len(tokens) > WORD_COUNTS[-1]:
+            self._notify("Вставка фразы",
+                         f"В буфере {len(tokens)} слов, максимум "
+                         f"{WORD_COUNTS[-1]}. Лишние слова ({len(tokens) - WORD_COUNTS[-1]}) "
+                         "отброшены.")
+        self.set_text(" ".join(tokens[:WORD_COUNTS[-1]]))
 
     # ----- Внутреннее -----
 
+    def _config(self):
+        return getattr(self.window(), "config", None)
+
+    def _notify(self, title: str, text: str) -> None:
+        _show_warn(self._config(), self, title, text)
+
+    def _ask(self, title: str, text: str) -> bool:
+        return _ask_confirm(self._config(), self, title, text)
+
     def _words(self) -> list[str]:
         return [edit.text().strip() for edit, _warn, _cell in self._cells]
+
+    def _last_filled(self) -> int:
+        """Индекс последней непустой ячейки (-1, если все пусты)."""
+        words = self._words()
+        return max((i for i, w in enumerate(words) if w), default=-1)
 
     def _set_count_silently(self, count: int) -> None:
         """Выставить комбо программно, не триггеря повторную перестройку."""
@@ -142,11 +193,19 @@ class SeedPhraseWidget(QWidget):
 
     def _on_count_changed(self, _index: int) -> None:
         """Смена количества слов пользователем: перестроить сетку, сохранив
-        введённые слова (лишние — отбрасываются)."""
-        count = self.count_combo.currentData()
-        self._rebuild_grid(int(count), self._words())
+        введённые слова; удаление непустых слов — только после подтверждения."""
+        count = int(self.count_combo.currentData())
+        lost = [w for w in self._words()[count:] if w]
+        if lost and not self._ask(
+                "Уменьшение числа слов",
+                f"Слова с позиции {count + 1} ({len(lost)} шт.) будут удалены. "
+                "Продолжить?"):
+            self._set_count_silently(self._count)
+            return
+        self._rebuild_grid(count, self._words())
 
     def _rebuild_grid(self, count: int, words: list[str]) -> None:
+        self._count = count
         for _edit, _warn, cell in self._cells:
             self._grid.removeWidget(cell)
             cell.deleteLater()
@@ -166,7 +225,11 @@ class SeedPhraseWidget(QWidget):
         num = QLabel(f"{index + 1}.")
         num.setFixedWidth(24)
         h.addWidget(num)
-        edit = QLineEdit(word)
+        edit = QLineEdit()
+        # Одиночный «_» — служебный маркер пустой ячейки: введённый вручную он
+        # молча превратился бы в пустоту при перезагрузке. Не принимаем.
+        edit.setValidator(_NoEmptyMarkValidator(edit))
+        edit.setText(word)
         edit.setReadOnly(not self._editable)
         h.addWidget(edit, 1)
         warn = QLabel("[!]")

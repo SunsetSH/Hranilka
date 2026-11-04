@@ -17,6 +17,7 @@ class DbBase:
     encrypted: bool
     _dek: Optional[bytearray]
     _key_lock: Any                   # threading.Lock: защита _dek/_header (B13)
+    _write_lock: Any                 # threading.RLock: запись контейнера на диск
     _disk_fingerprint: Optional[bytes]
     _header: Optional[dict]
     _dirty: bool

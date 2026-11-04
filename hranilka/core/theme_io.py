@@ -7,6 +7,7 @@
 import json
 import logging
 import os
+import re
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -23,6 +24,15 @@ MAX_FILE_BYTES = 64 * 1024      # тема — крошечная; больше 
 
 _TREE_ICONS = ("text", "pixel")
 _MAX_FONT_LEN = 100
+# Имя шрифта попадает в CSS экспорта внутри одинарных кавычек: разрешены буквы
+# (в т.ч. кириллица), цифры, пробел и « .-_+(),». Кавычки, «<», «\», «{» и т.п.
+# исключены: они позволили бы выйти из строки CSS.
+_FONT_RE = re.compile(r"[\w .\-+(),]+", re.UNICODE)
+
+
+def is_safe_font_name(v: Any) -> bool:
+    return (isinstance(v, str) and 0 < len(v) <= _MAX_FONT_LEN
+            and _FONT_RE.fullmatch(v) is not None and bool(v.strip()))
 
 # Явная схема: ключ -> тип значения. Только оформление.
 THEME_KEYS: tuple[str, ...] = (
@@ -53,8 +63,7 @@ _MISSING = object()
 
 
 def _valid_font(v: Any) -> Any:
-    if isinstance(v, str) and v.strip() and len(v) <= _MAX_FONT_LEN \
-            and not any(ord(c) < 32 for c in v):
+    if isinstance(v, str) and is_safe_font_name(v.strip()):
         return v.strip()
     return _MISSING
 
@@ -71,7 +80,7 @@ def _valid_int(key: str) -> Callable[[Any], Any]:
             return _MISSING
         try:
             n = int(v)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return _MISSING
         return max(lo, min(hi, n))
     return check

@@ -13,6 +13,7 @@ server_data.extract_paid_until (единственный писатель — р
 JSON исключена по построению).
 """
 import json
+import logging
 from datetime import datetime
 from typing import Any, Optional
 
@@ -199,6 +200,12 @@ class DbServersMixin(DbBase):
             if aid in seen:                 # дедуп входного списка
                 continue
             seen.add(aid)
+            # Устаревший id (аккаунт удалён насовсем) - пропускаем, иначе FK
+            # IntegrityError откатит всё сохранение карточки.
+            if self.cursor.execute(
+                    "SELECT 1 FROM accounts WHERE id = ?", (aid,)).fetchone() is None:
+                logging.info("Связь пропущена: %s id=%s не существует", "account", aid)
+                continue
             self.cursor.execute(
                 "INSERT OR IGNORE INTO server_links (server_id, account_id) "
                 "VALUES (?, ?)", (server_id, aid))
@@ -223,6 +230,10 @@ class DbServersMixin(DbBase):
             if sid in seen:                 # дедуп входного списка
                 continue
             seen.add(sid)
+            if self.cursor.execute(
+                    "SELECT 1 FROM servers WHERE id = ?", (sid,)).fetchone() is None:
+                logging.info("Связь пропущена: %s id=%s не существует", "server", sid)
+                continue                    # устаревший id - см. выше
             self.cursor.execute(
                 "INSERT OR IGNORE INTO server_links (server_id, account_id) "
                 "VALUES (?, ?)", (sid, account_id))

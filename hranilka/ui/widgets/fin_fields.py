@@ -4,6 +4,8 @@
 чтобы фабрика FinItemTabs строила их единообразно. Бизнес-логика (Луна, маска,
 разбор срока) — только вызовы hranilka.core.fin_domain; UI сам ничего не считает.
 """
+import re
+
 from PySide6.QtWidgets import (QWidget, QHBoxLayout, QLineEdit, QPushButton,
                                QLabel)
 from PySide6.QtCore import Signal
@@ -136,6 +138,20 @@ class MaskedCardNumberField(QWidget):
             self.luhn_label.setText("[!] контр. сумма")
 
 
+_ISO_MONTH = re.compile(r"\s*(\d{4})-(\d{1,2})(?:-\d{1,2})?\s*")
+
+
+def normalize_expiry(text):
+    """Срок в любом из поддерживаемых форматов (MM/YY, M/YYYY, YYYY-MM,
+    YYYY-MM-DD) → «MM/YY»; None — не распознан или месяц вне 1..12."""
+    text = (text or "").strip()
+    m = _ISO_MONTH.fullmatch(text)
+    if m:
+        text = f"{int(m.group(2))}/{m.group(1)}"
+    exp = parse_expiry(text)
+    return f"{exp.month:02d}/{exp.year % 100:02d}" if exp else None
+
+
 class ExpiryField(QWidget):
     """Поле срока действия MM/YY: маска ввода, в просмотре — предупреждение,
     если карта истекла/скоро истекает (по days_until_expiry и EXPIRY_WARN_DAYS)."""
@@ -145,6 +161,8 @@ class ExpiryField(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._editable = False
+        self._original = ""        # значение, пришедшее из set_text (как хранится)
+        self._edited = False       # пользователь правил поле руками
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -169,16 +187,36 @@ class ExpiryField(QWidget):
         layout.addWidget(self.copy_btn)
 
         self.input.textChanged.connect(self._update_warn)
+        self.input.textEdited.connect(self._on_user_edit)
 
     # ----- Контракт поля -----
 
     def set_text(self, text):
-        self.input.setText(text or "")
+        self._original = text or ""
+        self._edited = False
+        # Прежние форматы (YYYY-MM, MM/YYYY, M/YY…) приводятся к MM/YY, иначе
+        # маска «00/00» исказила бы их (например «12/2027» → «12/20»).
+        self.input.setText(normalize_expiry(self._original) or "")
         self._update_warn()
 
     def get_text(self):
+        """Не тронутое пользователем поле возвращает исходное значение как есть.
+        После правки — валидный срок в виде MM/YY; полностью очищенное поле —
+        ""; мусор/недописанный/несуществующий месяц НЕ затирает прежнее
+        значение (возвращается исходное)."""
+        if not self._edited:
+            # Прежний формат (YYYY-MM…) приводим к MM/YY: parse_expiry понимает
+            # только MM/YY и MM/YYYY, иначе expires_on стал бы None при
+            # предупреждающем UI. Нераспознанное отдаём как есть.
+            return normalize_expiry(self._original) or self._original
         raw = self.input.text()
-        return raw if any(c.isdigit() for c in raw) else ""
+        if not any(c.isdigit() for c in raw):
+            return ""
+        return normalize_expiry(raw) or self._original
+
+    def _on_user_edit(self, _text):
+        self._edited = True
+        self._update_warn()          # подсказка зависит от _edited
 
     def set_placeholder(self, text):
         self.input.setPlaceholderText(text)
@@ -199,11 +237,15 @@ class ExpiryField(QWidget):
 
     def _update_warn(self):
         # Предупреждение только в просмотре: в правке пользователь ещё печатает.
-        if self._editable:
-            self.warn_label.setText("")
-            self.warn_label.hide()
-            return
         raw = self.input.text()
+        if self._editable:
+            bad = any(c.isdigit() for c in raw) and parse_expiry(raw) is None
+            keep = bool(self._original) and self._edited
+            self.warn_label.setText(
+                ("[!] MM/YY, сохранится прежнее значение" if keep
+                 else "[!] MM/YY") if bad else "")
+            self.warn_label.setVisible(bad)
+            return
         exp = parse_expiry(raw) if any(c.isdigit() for c in raw) else None
         days = days_until_expiry(exp) if exp else None
         if days is None:

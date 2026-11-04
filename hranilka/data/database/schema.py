@@ -85,7 +85,19 @@ class DbSchemaMixin(DbBase):
         # успехе (в конце метода); если миграция прервётся исключением/сбоем —
         # копия останется на диске (путь в логе) для восстановления.
         premigrate = self._begin_premigration_backup(_ver)
+        try:
+            self._apply_schema(_ver, premigrate)
+        except BaseException:
+            # Полу-мигрированный образ не должен уйти на диск отложенным flush
+            # (шифр. режим): снимаем «грязность», на диске остаётся прежний
+            # контейнер (и pre-migrate копия).
+            if self.encrypted:
+                self._dirty = False
+            raise
 
+    def _apply_schema(self, _ver, premigrate):
+        """Создание/нормализация/миграция схемы (тело create_tables после
+        отпечатка и durable-копии)."""
         # Таблица папок
         self.cursor.execute("""
             CREATE TABLE IF NOT EXISTS folders (
@@ -252,28 +264,45 @@ class DbSchemaMixin(DbBase):
             # автоматически появляется в уже существующих базах (миграция не нужна).
             # UNIQUE-индексы заодно дают целостность (M-14): не более одной строки
             # ПД/фразы на аккаунт и отсутствие дублирующихся связей.
-            for stmt in (
-                "CREATE INDEX IF NOT EXISTS idx_services_folder ON services(folder_id)",
-                "CREATE INDEX IF NOT EXISTS idx_accounts_service ON accounts(service_id)",
-                "CREATE INDEX IF NOT EXISTS idx_accounts_deleted ON accounts(deleted_at)",
-                "CREATE UNIQUE INDEX IF NOT EXISTS uq_personal_account ON personal_data(account_id)",
-                "CREATE INDEX IF NOT EXISTS idx_questions_account ON secret_questions(account_id)",
-                "CREATE UNIQUE INDEX IF NOT EXISTS uq_phrases_account ON recovery_phrases(account_id)",
-                "CREATE INDEX IF NOT EXISTS idx_codes_account ON recovery_codes(account_id)",
-                "CREATE INDEX IF NOT EXISTS idx_gallery_account ON gallery(account_id)",
-                "CREATE INDEX IF NOT EXISTS idx_linked_account ON linked_accounts(account_id)",
-                "CREATE INDEX IF NOT EXISTS idx_linked_linked ON linked_accounts(linked_account_id)",
-                "CREATE UNIQUE INDEX IF NOT EXISTS uq_linked_pair ON linked_accounts(account_id, linked_account_id)",
-            ):
+            for stmt in self._BASE_INDEX_SQL:
                 self.cursor.execute(stmt)
         self._mark_dirty()   # `with self.conn` уже зафиксировал; отметим для encrypted flush
 
         # Доработка существующих баз до актуальной схемы
         self._migrate()
+        # Legacy-пересборки в _migrate (accounts / дочерние таблицы) делают
+        # DROP TABLE, а он уничтожает индексы таблицы: возвращаем все индексы
+        # (идемпотентно, IF NOT EXISTS). Без этого idx_accounts_* пропадали навсегда.
+        self._ensure_indexes()
         # Правка схемы завершена успешно — durable-копии этого прогона больше не
         # нужны (удаляем только их, уцелевшие копии прошлых прогонов не трогаем).
         self._finish_premigration_backup(premigrate)
         self._finish_premigration_backup(premigrate_dedup)
+
+    # Индексы по внешним ключам и частым фильтрам + UNIQUE-индексы целостности.
+    _BASE_INDEX_SQL = (
+        "CREATE INDEX IF NOT EXISTS idx_services_folder ON services(folder_id)",
+        "CREATE INDEX IF NOT EXISTS idx_accounts_service ON accounts(service_id)",
+        "CREATE INDEX IF NOT EXISTS idx_accounts_deleted ON accounts(deleted_at)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_personal_account ON personal_data(account_id)",
+        "CREATE INDEX IF NOT EXISTS idx_questions_account ON secret_questions(account_id)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_phrases_account ON recovery_phrases(account_id)",
+        "CREATE INDEX IF NOT EXISTS idx_codes_account ON recovery_codes(account_id)",
+        "CREATE INDEX IF NOT EXISTS idx_gallery_account ON gallery(account_id)",
+        "CREATE INDEX IF NOT EXISTS idx_linked_account ON linked_accounts(account_id)",
+        "CREATE INDEX IF NOT EXISTS idx_linked_linked ON linked_accounts(linked_account_id)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_linked_pair ON linked_accounts(account_id, linked_account_id)",
+    )
+
+    def _ensure_indexes(self):
+        """Идемпотентно (пере)создать ВСЕ индексы схемы одной транзакцией:
+        базовые, финансовые, серверные и idx_<leaf>_folder."""
+        with self.conn:
+            for stmt in (*self._BASE_INDEX_SQL, *self._fin_index_sql(),
+                         *self._server_index_sql()):
+                self.cursor.execute(stmt)
+            self._ensure_leaf_folder_columns(self.cursor)
+        self._mark_dirty()
 
     def _add_missing_columns(self):
         """Добавить в старые базы недостающие колонки из _EXPECTED_COLUMNS
@@ -341,6 +370,8 @@ class DbSchemaMixin(DbBase):
     _INTEGRITY_INDEXES = frozenset({
         "uq_personal_account", "uq_phrases_account", "uq_linked_pair",
         "uq_fin_link", "uq_server_link",
+        # Обычные индексы accounts, теряемые при legacy-пересборке таблицы.
+        "idx_accounts_service", "idx_accounts_deleted",
     })
 
     def _fast_path_fingerprint_ok(self):
@@ -412,34 +443,41 @@ class DbSchemaMixin(DbBase):
         # Имя уникально по метке времени; на случай двух прогонов в одну секунду
         # добавляем счётчик — «xb» не перезапишет уцелевшую копию прошлого прогона.
         path = base
+        created = False    # удаляем только файл, созданный ЭТИМ вызовом
         try:
             # Файл на диске согласован (транзакция ещё не начиналась) — копируем и
             # принудительно сбрасываем на диск (устойчивость к сбою питания).
             # "xb": НИКОГДА не перезаписываем существующий файл (H7-03b).
-            dst = None
-            for suffix in ("", "-1", "-2", "-3", "-4", "-5"):
-                path = base + suffix
-                try:
-                    dst = open(path, "xb")
-                    break
-                except FileExistsError:
-                    continue
-            if dst is None:
-                raise OSError("не удалось подобрать уникальное имя копии")
-            with open(self.db_path, "rb") as src, dst:
-                while True:
-                    chunk = src.read(1024 * 1024)
-                    if not chunk:
+            # Источник открываем ПЕРВЫМ, а оба файла — одним with: при сбое
+            # открытия источника dst не остаётся открытым (иначе на Windows
+            # os.remove ниже не сможет удалить 0-байтный файл копии).
+            with open(self.db_path, "rb") as src:
+                dst = None
+                for suffix in ("", "-1", "-2", "-3", "-4", "-5"):
+                    path = base + suffix
+                    try:
+                        dst = open(path, "xb")
+                        created = True
                         break
-                    dst.write(chunk)
-                dst.flush()
-                os.fsync(dst.fileno())
+                    except FileExistsError:
+                        continue
+                if dst is None:
+                    raise OSError("не удалось подобрать уникальное имя копии")
+                with dst:
+                    while True:
+                        chunk = src.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        dst.write(chunk)
+                    dst.flush()
+                    os.fsync(dst.fileno())
         except OSError as e:
             logging.error("Не удалось создать резервную копию перед %s: %s",
                           reason, e)
-            # Частично записанный файл (если успел появиться) — убрать.
+            # Частично записанный файл (если успел появиться) — убрать. К этому
+            # моменту оба файла уже закрыты with-блоками.
             try:
-                if os.path.exists(path):
+                if created and os.path.exists(path):
                     os.remove(path)
             except OSError:
                 pass

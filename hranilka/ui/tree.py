@@ -26,6 +26,8 @@ class TreeMixin(TreeMenuMixin):
     """Построение/перестроение дерева, сортировка, поиск, контекстное меню и
     операции над папками/сервисами/аккаунтами."""
 
+    _move_in_flight = False      # идёт запись переноса перетаскиванием
+
     # Префиксы-«иконки» для элементов дерева. Контейнеры/аккаунт/сервер — здесь;
     # фин-часть берётся из реестра дескрипторов (единый источник tree_prefix,
     # без дублирования).
@@ -626,20 +628,41 @@ class TreeMixin(TreeMenuMixin):
         self._forget_leaf_cache(nodes, affected)
         self._any_db_changes = True
 
-        self.current_tree_item = None
-        self._current_account_id = None
-        self._current_fin = None
-        # M-01: сервер сбрасываем симметрично аккаунту/фин-записи — иначе
-        # после удаления открытого сервера (или контейнера с ним)
-        # _current_server/current_server_data продолжают указывать на уже
-        # удалённую запись, хотя правая панель уже заменена на заглушку.
-        self._current_server = None
-        self.current_server_data = None
-        self.is_editing = False
-        self._reload_tree()
-        self._show_placeholder()
+        # Открытую карточку сбрасываем, только если удалён её узел (напрямую или
+        # как потомок удалённого контейнера): иначе теряются несохранённые правки.
+        deleted = set(affected) | {(n["type"], n["id"]) for n in nodes}
+        if self._open_card_deleted(deleted):
+            self.current_tree_item = None
+            self._current_account_id = None
+            self._current_fin = None
+            # M-01: сервер сбрасываем симметрично аккаунту/фин-записи — иначе
+            # после удаления открытого сервера (или контейнера с ним)
+            # _current_server/current_server_data продолжают указывать на уже
+            # удалённую запись, хотя правая панель уже заменена на заглушку.
+            self._current_server = None
+            self.current_server_data = None
+            self.is_editing = False
+            self._reload_tree()
+            self._show_placeholder()
+        else:
+            self._reload_tree()
         self._update_bin_button()
         self.statusBar().showMessage("Удалено", 2000)
+
+    def _open_card_deleted(self, deleted):
+        """True, если открытая карточка или выбранный узел входит в `deleted`
+        (множество ключей (type, id))."""
+        if self._current_account_id is not None and (
+                ACCOUNT, self._current_account_id) in deleted:
+            return True
+        if self._current_fin is not None and tuple(self._current_fin) in deleted:
+            return True
+        server = self._current_server
+        if server is not None and (
+                tuple(server) if isinstance(server, (tuple, list))
+                else (SERVER, server)) in deleted:
+            return True
+        return self._item_key(self.current_tree_item) in deleted
 
     def _forget_leaf_cache(self, nodes, affected):
         """Убирает несохранённые правки удалённых листьев из памяти. Выбранные
@@ -779,10 +802,16 @@ class TreeMixin(TreeMenuMixin):
 
     def on_tree_move(self, plan):
         """Перенос перетаскиванием (сигнал AccountTree.move_requested)."""
+        if self._move_in_flight:
+            # Порядок строится по текущему дереву: пока прежний перенос не записан
+            # и дерево не перестроено, новый дал бы неверный порядок.
+            self.statusBar().showMessage("Дождитесь завершения переноса", 2000)
+            return
         keys = [(n["type"], n["id"]) for n in map(self._node, plan.sources)]
         service_id, folder_id = self._container_ids(plan.parent)
         parent_key = self._item_key(plan.parent)
         ordered = self._order_after_move(plan) if plan.anchor is not None else []
+        self._move_in_flight = True
         util.fire(self._move_nodes_async(keys, service_id, folder_id, ordered,
                                          parent_key))
 
@@ -828,10 +857,13 @@ class TreeMixin(TreeMenuMixin):
 
     async def _move_nodes_async(self, keys, service_id, folder_id, ordered,
                                 parent_key):
-        await self._run_then_reload(
-            self.db.move_nodes, (keys, service_id, folder_id, ordered),
-            "Не удалось переместить", status="Перемещено")
-        self._reveal_moved(set(keys), parent_key)
+        try:
+            await self._run_then_reload(
+                self.db.move_nodes, (keys, service_id, folder_id, ordered),
+                "Не удалось переместить", status="Перемещено")
+            self._reveal_moved(set(keys), parent_key)
+        finally:
+            self._move_in_flight = False
 
     def _reveal_moved(self, keys, parent_key):
         """Раскрыть нового родителя и выделить перенесённые элементы."""

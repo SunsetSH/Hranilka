@@ -2,7 +2,7 @@
 страниц-миксинов (по модулю на вкладку), кнопки «Применить/Отмена»,
 сбор и применение значений, снимок настроек для определения
 несохранённых изменений при закрытии."""
-from PySide6.QtWidgets import (QHBoxLayout, QGroupBox, QPushButton, QLabel, QListWidgetItem, QFileDialog, QFrame, QColorDialog, QScrollArea)
+from PySide6.QtWidgets import (QDialog, QHBoxLayout, QGroupBox, QPushButton, QLabel, QListWidgetItem, QFileDialog, QFrame, QColorDialog, QScrollArea)
 from PySide6.QtCore import Signal, Qt
 from PySide6.QtGui import QFont
 from hranilka.core.config import RETRO_THEMES
@@ -83,7 +83,19 @@ class SettingsDialog(SettingsAppearanceMixin, SettingsSecurityMixin,
         self._orig_chrome = (config.get("chrome_style", "flat"),
                              config.get("crt_mode", False))
         self._orig_tree_icons = config.get("tree_icons", "text")
-        self._setup_ui()
+        # Любой config.save() (в т.ч. из дерева/карточек/главного окна) во время
+        # предпросмотра пишет эти зафиксированные значения; снимается в done().
+        self._committed_appearance = {
+            "font": self._orig_font, "font_size": self._orig_font_size,
+            "chrome_style": self._orig_chrome[0],
+            "crt_mode": self._orig_chrome[1],
+            "tree_icons": self._orig_tree_icons, **self._orig_colors}
+        config.begin_preview(self._committed_appearance)
+        try:
+            self._setup_ui()
+        except BaseException:
+            config.end_preview()
+            raise
 
     def set_db_path(self, path: str):
         self._db_path = path
@@ -193,7 +205,7 @@ class SettingsDialog(SettingsAppearanceMixin, SettingsSecurityMixin,
     def _fit_width_to_tabs(self):
         """Сузить окно до ширины одного ряда вкладок: ширина панели вкладок +
         поля тела диалога (14+14) + рамка dialogFrame (2+2)."""
-        limit = self.screen().availableGeometry().width()
+        limit = self._available_geometry().width()
         width = min(self._tabs.one_row_width() + 14 + 14 + 2 + 2, limit)
         self.setMinimumWidth(width)
         self.resize(width, min(max(400, self.sizeHint().height()),
@@ -317,6 +329,27 @@ class SettingsDialog(SettingsAppearanceMixin, SettingsSecurityMixin,
             # action == "discard": продолжаем — закрыть без сохранения
         # Откат цветов/шрифта и живого предпросмотра при отмене / закрытии
         # без сохранения.
+        self._revert_preview()
+        super().reject()
+
+    def done(self, result):
+        """Любое закрытие (accept/reject/force_close/удаление всех данных)
+        снимает предпросмотр конфига — даже если дальше что-то упадёт."""
+        try:
+            self.config.end_preview()
+            self._clear_pasted_secret()      # вставленный секрет не оставляем в буфере
+        finally:
+            super().done(result)
+
+    def force_close(self):
+        """Принудительное закрытие (автоблокировка): без вопросов, живой
+        предпросмотр молча откатывается, несохранённые правки отбрасываются."""
+        self._revert_preview()
+        self.done(QDialog.Rejected)
+
+    def _revert_preview(self):
+        """Вернуть в конфиг значения внешнего вида, действовавшие при открытии
+        окна, и обновить стили (диалог + главное окно)."""
         for key, val in self._orig_colors.items():
             self.config.set(key, val)
         self.config.set("font", self._orig_font)
@@ -327,7 +360,6 @@ class SettingsDialog(SettingsAppearanceMixin, SettingsSecurityMixin,
         self.setStyleSheet(dialog_stylesheet(self.config))
         self._restyle_shortcuts()
         self.appearance_changed.emit()
-        super().reject()
 
     def _apply_theme(self, name: str):
         if name in RETRO_THEMES:
@@ -420,6 +452,9 @@ class SettingsDialog(SettingsAppearanceMixin, SettingsSecurityMixin,
             themed_info(self.config, self, "Ошибка", f"Не удалось восстановить:\n{err}")
             return
         self._restore_done = True
+        # Тот же объект БД переоткрыт, но восстановленный файл мог оказаться
+        # зашифрованным/открытым — обновляем вкладку «Шифрование».
+        self._refresh_encryption_page()
         themed_info(self.config, self, "Восстановление",
                     "База данных восстановлена из бэкапа.")
 
@@ -435,6 +470,7 @@ class SettingsDialog(SettingsAppearanceMixin, SettingsSecurityMixin,
         ):
             return
         self._delete_all_confirmed = True
+        self._revert_preview()      # предпросмотр не должен пережить закрытие
         self.accept()
 
     def _resolve_show_fin(self) -> bool:
@@ -507,7 +543,18 @@ class SettingsDialog(SettingsAppearanceMixin, SettingsSecurityMixin,
             sid: seq for sid, seq in self._sc_working.items()
             if seq != shortcuts.DEFAULTS.get(sid)
         })
-        self.config.save()
+        # Применяем: теперь новые значения — зафиксированные, предпросмотр
+        # снимаем ДО записи, иначе save() записал бы старые.
+        self.config.end_preview()
+        try:
+            self.config.save()
+        except OSError as e:
+            # Диск не принял: окно остаётся открытым, защита предпросмотра
+            # возвращается, иначе следующий save() записал бы непринятые значения.
+            self.config.begin_preview(self._committed_appearance)
+            themed_info(self.config, self, "Ошибка",
+                        f"Не удалось сохранить настройки:\n{e}")
+            return
         self.settings_applied.emit()
         self.accept()
 

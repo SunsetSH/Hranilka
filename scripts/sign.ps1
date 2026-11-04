@@ -2,7 +2,7 @@
     Самоподписание Hranilka.exe.
 
     Запуск (из корня проекта):
-        powershell -ExecutionPolicy Bypass -File scripts\sign.ps1
+        powershell -ExecutionPolicy Bypass -File scripts\sign.ps1 [-AllowNewCert]
 
     ВНИМАНИЕ: самоподписанный сертификат снимает предупреждения Windows/SmartScreen
     ТОЛЬКО на машинах, где ваш сертификат добавлен в доверенные (см. блок «Экспорт»).
@@ -10,11 +10,15 @@
     Для публичного релиза нужен сертификат от центра сертификации (OV/EV).
 #>
 
+param([switch]$AllowNewCert)
+
 $ErrorActionPreference = 'Stop'
 $exe = Join-Path $PSScriptRoot '..\dist\Hranilka.exe'
 if (-not (Test-Path $exe)) { throw "Не найден $exe. Сначала соберите: pyinstaller Hranilka.spec" }
 
-# 1. Берём работоспособный сертификат Hranilka или создаём новый (5 лет).
+# 1. Берём работоспособный сертификат Hranilka. Новый создаётся ТОЛЬКО с
+# -AllowNewCert: другой отпечаток заставляет все установленные копии отклонять
+# обновления (updater.verify_package сверяет сертификат с запущенным exe).
 # Старый сертификат может остаться в хранилище с битой привязкой к ключу
 # (NTE_BAD_KEY_STATE). HasPrivateKey в этом случае ещё True, но подписать им
 # невозможно, поэтому проверяем реальную операцию RSA до выбора.
@@ -40,6 +44,17 @@ $cert = Get-ChildItem Cert:\CurrentUser\My |
     Select-Object -First 1
 
 if (-not $cert) {
+    $known = (Get-ChildItem Cert:\CurrentUser\My |
+        Where-Object { $_.Subject -eq $subject } |
+        ForEach-Object { $_.Thumbprint }) -join ', '
+    if (-not $AllowNewCert) {
+        throw ("Нет работоспособного сертификата Hranilka (в хранилище: " +
+            "$(if ($known) { $known } else { 'нет' })). Новый сертификат " +
+            'сломает автообновление уже установленных копий (другой ' +
+            'отпечаток). Восстановите прежний (.pfx) или запустите с ' +
+            '-AllowNewCert, если это осознанно.')
+    }
+    Write-Host "Старые отпечатки: $known"
     Write-Host 'Нет работоспособного сертификата: создаю замену для подписи кода...'
     # Legacy CSP + KeySpec Signature совместимы и с Windows PowerShell, и с
     # SignTool. Это не заменяет старый сертификат в хранилище: его можно
@@ -53,6 +68,7 @@ if (-not $cert) {
         -Provider 'Microsoft Enhanced RSA and AES Cryptographic Provider' `
         -CertStoreLocation Cert:\CurrentUser\My `
         -NotAfter (Get-Date).AddYears(5)
+    Write-Host "НОВЫЙ отпечаток: $($cert.Thumbprint) (автообновление со старых копий не пройдёт)"
 }
 Write-Host "Сертификат: $($cert.Thumbprint)"
 

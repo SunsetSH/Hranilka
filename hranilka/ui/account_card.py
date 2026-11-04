@@ -206,7 +206,8 @@ class AccountCardMixin(CardFlowMixin):
         БД (lock/restore/close). Новое поколение карточки делает устаревшими висящие
         coroutine загрузки/сохранения: их проверки gen после await прерывают работу,
         а finally не трогает UI уже другой сессии. Галерея отменяет импорт и
-        предпросмотр. Вызывать ДО db.lock()/close()/restore (H65-02)."""
+        предпросмотр. Вызывать ДО close()/restore (H65-02); при блокировке — сразу
+        после успешного db.lock(): неудавшаяся блокировка не должна гасить карточку."""
         self._card_gen += 1
         self._card_busy = False
         try:
@@ -218,6 +219,19 @@ class AccountCardMixin(CardFlowMixin):
             self.server_tabs.f_gallery_widget.cancel_all_tasks()
         except Exception as e:                       # noqa: BLE001 — teardown-хардненинг
             logging.warning("Не удалось отменить задачи галереи: %s", e)
+
+    def _reset_failed_selection(self):
+        """После неудачной загрузки снимаем выделение узла: currentItemChanged
+        не срабатывает на повторный клик по уже текущему узлу, и без сброса
+        повтор открытия невозможен. Сигналы глушим — заглушку уже показали."""
+        self.current_tree_item = None
+        tree = self.tree
+        was_blocked = tree.blockSignals(True)
+        try:
+            tree.setCurrentItem(None)
+            tree.clearSelection()
+        finally:
+            tree.blockSignals(was_blocked)
 
     def _show_card_error(self, title, exc):
         """Показать пользователю ошибку async-операции карточки (L6-03): иначе
@@ -391,6 +405,12 @@ class AccountCardMixin(CardFlowMixin):
             return                               # БД закрыта/сменена (lock/restore) — молча
         except Exception as e:                       # noqa: BLE001 — показать пользователю
             if gen == self._card_gen:
+                # Форма осталась от прежнего аккаунта: сбрасываем ключ, иначе
+                # Save перезапишет новую запись чужими данными.
+                self._current_account_id = None
+                self.is_editing = False
+                self._show_placeholder()
+                self._reset_failed_selection()
                 self._show_card_error("Не удалось загрузить аккаунт", e)
         finally:
             if gen == self._card_gen:
@@ -804,8 +824,14 @@ class AccountCardMixin(CardFlowMixin):
         # результат нужен по месту).
         util.fire(self._add_link_async(node["id"]))
 
+    def _link_ctx_valid(self, gen, session, key):
+        """Карточка после await та же: поколение, сессия и открытый аккаунт."""
+        return (gen == self._card_gen and session == self.db.current_session()
+                and self._current_account_id == key)
+
     async def _add_link_async(self, node_id):
         session = self.db.current_session()
+        gen = self._card_gen
         try:
             accounts = await self.db.run_async(
                 self.db.get_all_accounts, _session=session)
@@ -814,12 +840,14 @@ class AccountCardMixin(CardFlowMixin):
         except Exception as e:                       # noqa: BLE001
             self._show_card_error("Не удалось загрузить список аккаунтов", e)
             return
+        if not self._link_ctx_valid(gen, session, node_id):
+            return
         candidates = [a for a in accounts if a["id"] != node_id]
         chosen, ok = theme.themed_multiselect(
             self.config, self, "Связать аккаунты", candidates,
             self.tabs.f_linked.get_data()
         )
-        if ok:
+        if ok and self._link_ctx_valid(gen, session, node_id):
             chosen_set = set(chosen)
             links = [{"id": a["id"], "name": a["name"]}
                      for a in candidates if a["id"] in chosen_set]
@@ -837,10 +865,11 @@ class AccountCardMixin(CardFlowMixin):
         Чтение списка — в фоновом потоке БД (H-8), диалог — после загрузки."""
         if self._node(self.current_tree_item) is None:
             return
-        util.fire(self._add_fin_link_async())
+        util.fire(self._add_fin_link_async(self._current_account_id))
 
-    async def _add_fin_link_async(self):
+    async def _add_fin_link_async(self, key):
         session = self.db.current_session()
+        gen = self._card_gen
         try:
             items = await self.db.run_async(
                 self.db.list_fin_items, _session=session)
@@ -849,12 +878,14 @@ class AccountCardMixin(CardFlowMixin):
         except Exception as e:                       # noqa: BLE001
             self._show_card_error("Не удалось загрузить список записей", e)
             return
+        if not self._link_ctx_valid(gen, session, key):
+            return
         candidates = [{"id": it["id"], "name": fin_item_display(it)}
                       for it in items]
         chosen, ok = theme.themed_multiselect(
             self.config, self, "Привязать карты и кошельки", candidates,
             self.tabs.f_fin_linked.get_data())
-        if ok:
+        if ok and self._link_ctx_valid(gen, session, key):
             chosen_set = set(chosen)
             links = [it for it in items if it["id"] in chosen_set]
             self.tabs.f_fin_linked.set_data(links)
@@ -873,10 +904,11 @@ class AccountCardMixin(CardFlowMixin):
         Чтение списка — в фоновом потоке БД (H-8), диалог — после загрузки."""
         if self._node(self.current_tree_item) is None:
             return
-        util.fire(self._add_server_link_async())
+        util.fire(self._add_server_link_async(self._current_account_id))
 
-    async def _add_server_link_async(self):
+    async def _add_server_link_async(self, key):
         session = self.db.current_session()
+        gen = self._card_gen
         try:
             servers = await self.db.run_async(
                 self.db.list_servers, _session=session)
@@ -885,12 +917,14 @@ class AccountCardMixin(CardFlowMixin):
         except Exception as e:                       # noqa: BLE001
             self._show_card_error("Не удалось загрузить список серверов", e)
             return
+        if not self._link_ctx_valid(gen, session, key):
+            return
         candidates = [{"id": s["id"], "name": server_item_display(s)}
                       for s in servers]
         chosen, ok = theme.themed_multiselect(
             self.config, self, "Привязать серверы", candidates,
             self.tabs.f_server_linked.get_data())
-        if ok:
+        if ok and self._link_ctx_valid(gen, session, key):
             chosen_set = set(chosen)
             links = [s for s in servers if s["id"] in chosen_set]
             self.tabs.f_server_linked.set_data(links)

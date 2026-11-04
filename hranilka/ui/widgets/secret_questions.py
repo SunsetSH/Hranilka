@@ -49,8 +49,13 @@ class SecretQuestionsWidget(RevealableRowsMixin, QWidget):
     def _answers_hidden(self) -> bool:
         return self._secrets_hidden()
 
-    def add_row(self, q="", a=""):
-        if len(self.rows) >= 5:
+    MAX_ROWS = 5
+
+    def add_row(self, q="", a="", enforce_limit=True):
+        """Лимит MAX_ROWS действует только для ручного добавления; загрузка
+        сохранённых данных (set_data) не усекается — иначе следующее
+        сохранение удалило бы лишние строки."""
+        if enforce_limit and len(self.rows) >= self.MAX_ROWS:
             _warn(self.config, self, "Лимит", "Максимум 5 вопросов!")
             return
 
@@ -59,10 +64,10 @@ class SecretQuestionsWidget(RevealableRowsMixin, QWidget):
         h_layout.setContentsMargins(0, 0, 0, 0)
         h_layout.setSpacing(5)
 
-        q_edit = QLineEdit(str(q))
+        q_edit = QLineEdit("" if q is None else str(q))
         q_edit.setPlaceholderText("Секретный вопрос...")
         q_edit.setReadOnly(not self._editable)
-        a_edit = QLineEdit(str(a))
+        a_edit = QLineEdit("" if a is None else str(a))
         a_edit.setPlaceholderText("Ответ...")
         a_edit.setReadOnly(not self._editable)
         if self._answers_hidden():
@@ -102,7 +107,8 @@ class SecretQuestionsWidget(RevealableRowsMixin, QWidget):
         with updates_suspended(self):
             self._clear_rows()
             for item in data:
-                self.add_row(item.get("q", ""), item.get("a", ""))
+                self.add_row(item.get("q", ""), item.get("a", ""),
+                             enforce_limit=False)
             self._update_empty()
 
     def set_editable(self, editable):

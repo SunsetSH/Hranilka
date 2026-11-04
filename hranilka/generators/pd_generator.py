@@ -72,11 +72,19 @@ def _pick_father_name(rng: RandomLike, birth_year: int) -> str:
     return _pick_name_for_decade(rng, pd_data.RU_MALE_NAMES, father_birth_year)
 
 
+def _years_ago(today: date, years: int) -> date:
+    """Та же дата `years` лет назад; 29 февраля в невисокосном году -> 28 февраля."""
+    try:
+        return today.replace(year=today.year - years)
+    except ValueError:
+        return today.replace(year=today.year - years, day=28)
+
+
 def _random_birth_date(rng: RandomLike, min_age: int = 18, max_age: int = 75) -> date:
     today = date.today()
     age = rng.randint(min_age, max_age)
-    start = today.replace(year=today.year - age - 1)
-    end = today.replace(year=today.year - age)
+    start = _years_ago(today, age + 1)
+    end = _years_ago(today, age)
     delta_days = (end - start).days
     return start + timedelta(days=rng.randint(0, max(delta_days - 1, 0)))
 

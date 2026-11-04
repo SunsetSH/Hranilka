@@ -448,6 +448,8 @@ class GalleryWidget(QWidget):
             return
         data, size, thumb = await loop.run_in_executor(
             None, _prepare_image_bytes, data, self._downscale_enabled())
+        if item.get("cancelled"):
+            return        # пользователь удалил заглушку: загрузка отменена
         if gen != self._data_gen or item not in self.items:
             if self._accept_orphan(data, size, limit_context):
                 self._emit_orphan(account_id, self._orphan_desc(item), data)
@@ -523,6 +525,7 @@ class GalleryWidget(QWidget):
 
     def _remove_item_silent(self, item):
         """Убрать элемент галереи без подтверждения (для отклонённой загрузки)."""
+        item["cancelled"] = True
         for i, it in enumerate(self.items):
             if it is item:
                 self.items.pop(i)
@@ -704,7 +707,8 @@ class GalleryWidget(QWidget):
 
         item = {"bytes": image_bytes, "desc": desc_edit, "del": del_btn,
                 "widget": item_widget, "thumb": thumb_label, "image_id": image_id,
-                "blob_size": blob_size, "thumb_ready": False}
+                "blob_size": blob_size, "thumb_ready": False,
+                "cancelled": False}
         self.items.append(item)
 
         del_btn.clicked.connect(lambda: self.remove_item(item_widget))
@@ -749,6 +753,7 @@ class GalleryWidget(QWidget):
             return
         for i, it in enumerate(self.items):
             if it["widget"] == widget:
+                it["cancelled"] = True   # in-flight загрузка не должна воскреснуть
                 self.items.pop(i)
                 if it["image_id"] is not None:
                     self._blob_cache.discard(it["image_id"])

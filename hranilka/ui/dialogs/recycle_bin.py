@@ -1,12 +1,14 @@
 """Корзина удалённых записей: аккаунты и финансовые записи (вынесена из
 dialogs.py, этап 4; обобщена до листовых типов, Фаза 1 фин-сущностей)."""
+import logging
+
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QHBoxLayout, QLabel, QListWidget,
                                QListWidgetItem, QPushButton)
 
 from hranilka.core.fin_types import FIN_TYPES
 from hranilka.core.nodetypes import ACCOUNT, SERVER
-from hranilka.ui.theme import ThemedDialog, themed_confirm
+from hranilka.ui.theme import ThemedDialog, themed_confirm, themed_info
 
 # Ретро-префиксы типов записей в списке корзины: аккаунт + сервер + все
 # финансовые типы из реестра (node_type → tree_prefix). Новый фин-тип получает
@@ -66,7 +68,13 @@ class RecycleBinDialog(ThemedDialog):
 
     def _refresh(self):
         self._list.clear()
-        rows = self._db.get_deleted_records()
+        try:
+            rows = self._db.get_deleted_records()
+        except Exception as e:                       # noqa: BLE001
+            logging.error("Корзина: не удалось прочитать записи: %s", e, exc_info=e)
+            themed_info(self.config, self, "Ошибка",
+                        f"Не удалось прочитать корзину:\n{e}")
+            rows = []
         for r in rows:
             prefix = self._PREFIX.get(r["type"], "")
             stamp = str(r["deleted_at"] or "")[:19]
@@ -88,19 +96,32 @@ class RecycleBinDialog(ThemedDialog):
         item = self._list.currentItem()
         return item.data(Qt.UserRole) if item else None
 
+    def _run_db(self, title: str, fn, *args) -> bool:
+        """Выполнить операцию БД: при ошибке — сообщение пользователю, changed
+        не выставляется. Список обновляется в любом случае."""
+        try:
+            fn(*args)
+        except Exception as e:                       # noqa: BLE001
+            logging.error("Корзина: %s: %s", title, e, exc_info=e)
+            themed_info(self.config, self, "Ошибка", f"{title}:\n{e}")
+            self._refresh()
+            return False
+        self.changed = True
+        self._refresh()
+        return True
+
     def _restore(self):
         key = self._current_key()
         if key is None:
             return
         node_type, rid = key
         if node_type == ACCOUNT:
-            self._db.restore_account(rid)
+            fn = self._db.restore_account
         elif node_type == SERVER:
-            self._db.restore_server(rid)
+            fn = self._db.restore_server
         else:
-            self._db.restore_fin_item(rid)
-        self.changed = True
-        self._refresh()
+            fn = self._db.restore_fin_item
+        self._run_db("Не удалось восстановить запись", fn, rid)
 
     def _delete_forever(self):
         key = self._current_key()
@@ -111,25 +132,27 @@ class RecycleBinDialog(ThemedDialog):
             return
         node_type, rid = key
         if node_type == ACCOUNT:
-            self._db.delete_account(rid)
+            fn = self._db.delete_account
         elif node_type == SERVER:
-            self._db.delete_server_forever(rid)
+            fn = self._db.delete_server_forever
         else:
             # delete_fin_item_forever — по id, не по node_type: запись может
             # быть типа, уже убранного из реестра (m010/m011-подобная чистка),
             # и delete_items() ошибочно принял бы её за аккаунт (см. баг M7-фин).
-            self._db.delete_fin_item_forever(rid)
-        self.changed = True
-        self._refresh()
+            fn = self._db.delete_fin_item_forever
+        self._run_db("Не удалось удалить запись", fn, rid)
 
     def _empty(self):
-        if self._db.get_deleted_count() == 0:
+        try:
+            if self._db.get_deleted_count() == 0:
+                return
+        except Exception as e:                       # noqa: BLE001
+            logging.error("Корзина: счётчик: %s", e, exc_info=e)
+            themed_info(self.config, self, "Ошибка", f"Не удалось прочитать корзину:\n{e}")
             return
         if not themed_confirm(self.config, self, "Очистка корзины",
                               "Безвозвратно удалить ВСЕ записи из корзины?\n"
                               "Это действие необратимо."):
             return
-        self._db.empty_bin()
-        self.changed = True
-        self._refresh()
+        self._run_db("Не удалось очистить корзину", self._db.empty_bin)
 

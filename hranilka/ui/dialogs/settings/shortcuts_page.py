@@ -3,7 +3,7 @@
 Часть SettingsDialog (dialog.py) — методы вынесены дословно (backlog-разрез по страницам)."""
 from PySide6.QtWidgets import (QVBoxLayout, QHBoxLayout, QGroupBox, QPushButton, QLabel, QWidget, QFrame, QDialog, QScrollArea)
 from PySide6.QtCore import Qt
-from hranilka.ui.theme import themed_confirm
+from hranilka.ui.theme import themed_confirm, themed_info
 from hranilka.ui.dialogs.key_capture import KeyCaptureDialog
 from hranilka.core import shortcuts
 
@@ -125,7 +125,20 @@ class SettingsShortcutsMixin:
             self._sc_update_badge(sid)
 
     def _sc_reset_one(self, sid):
-        self._sc_working[sid] = shortcuts.DEFAULTS.get(sid, "")
+        default = shortcuts.DEFAULTS.get(sid, "")
+        norm = KeyCaptureDialog._norm(default)
+        # Та же проверка конфликта, что в KeyCaptureDialog: дубликат делает
+        # мёртвыми оба действия.
+        if norm:
+            for other_sid, other_seq in self._sc_working.items():
+                if other_sid != sid and KeyCaptureDialog._norm(other_seq) == norm:
+                    themed_info(
+                        self.config, self, "Конфликт сочетаний",
+                        f"Сочетание «{norm}» уже назначено действию "
+                        f"«{shortcuts.LABELS.get(other_sid, other_sid)}». "
+                        "Сначала измените его.")
+                    return
+        self._sc_working[sid] = default
         self._sc_update_badge(sid)
 
     def _sc_reset_all(self):

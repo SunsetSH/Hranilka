@@ -85,7 +85,8 @@ def test_mask_overwrite_and_backspace(qapp):
     QTest.keyClicks(f.date_widget, "12")
     assert f.get_date().date() == date(2026, 12, 4)
 
-    # Backspace очищает последний символ года → дата недописана → None
+    # Backspace очищает последний символ года → дата недописана: прежнее
+    # значение не стирается (раньше get_date() возвращал None)
     f.date_widget.setCursorPosition(10)
     QTest.keyClick(f.date_widget, Qt.Key_Backspace)
-    assert f.get_date() is None
+    assert f.get_date() == datetime(2026, 7, 4, 0, 0)

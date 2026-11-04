@@ -2,7 +2,7 @@
 (вынесены из widgets.py, этап 5)."""
 import datetime as dt
 
-from PySide6.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QLineEdit, QPushButton, QTextEdit, QApplication, QSpinBox)
+from PySide6.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QLineEdit, QPushButton, QTextEdit, QApplication, QSpinBox, QLabel)
 from PySide6.QtCore import Signal
 
 from hranilka.ui.widgets.common import copy_secret, make_copy_button, set_a11y
@@ -103,12 +103,34 @@ class CopyableDateField(QWidget):
         self.date_widget.setReadOnly(True)
         layout.addWidget(self.date_widget)
 
+        self._loaded = None
+        self._editable = False
+        # Подсказка о недописанной дате (как [!] у ExpiryField): иначе
+        # сохранение молча оставило бы прежнее значение. Скрыта, пока не нужна.
+        self.warn_label = QLabel("")
+        self.warn_label.hide()
+        layout.addWidget(self.warn_label)
+
         self.copy_btn = make_copy_button(name="Копировать дату")
         self.copy_btn.clicked.connect(self.do_copy)
         layout.addWidget(self.copy_btn)
+        self.date_widget.textChanged.connect(self._update_warn)
+
+    def _update_warn(self, *_):
+        raw = self.date_widget.text()
+        partial = (self._editable and bool(raw[:10].strip(" ."))
+                   and self._parse_text(raw) is None)
+        if partial:
+            self.warn_label.setText(
+                "[!] дд.мм.гггг, сохранится прежняя дата" if self._loaded
+                else "[!] дд.мм.гггг, дата не сохранится")
+        else:
+            self.warn_label.setText("")
+        self.warn_label.setVisible(partial)
 
     def do_copy(self):
-        value = self.get_date()
+        # Копируем то, что показано (если дата полная); иначе — загруженное.
+        value = self._parse_text(self.date_widget.text()) or self.get_date()
         if value is None:
             return
         QApplication.clipboard().setText(value.strftime(self.format))
@@ -129,15 +151,14 @@ class CopyableDateField(QWidget):
             # None или неизвестный формат — «не задано», а не «сегодня».
             text = ""
         self.date_widget.setText(text)
+        # Загруженное значение: при недописанном/некорректном вводе get_date()
+        # возвращает его, а не None — иначе сохранение молча стёрло бы дату.
+        self._loaded = self._parse_text(self.date_widget.text())
+        self._update_warn()
 
-    def get_date(self):
-        """datetime.datetime или None, если дата не задана/не дописана.
-
-        Для is_datetime незаполненное время считается 00:00 — дата без
-        времени не должна пропадать при сохранении."""
-        raw = self.date_widget.text()          # маска: пусто = "..[ :]"
-        date_part = raw[:10].strip(" .")
-        if not date_part:
+    def _parse_text(self, raw):
+        """Текст маски → datetime или None (пусто/недописано/некорректно)."""
+        if not raw[:10].strip(" ."):
             return None
         try:
             d = dt.datetime.strptime(raw[:10], "%d.%m.%Y").date()
@@ -151,10 +172,28 @@ class CopyableDateField(QWidget):
                 pass                           # время пустое/недописано → 00:00
         return dt.datetime.combine(d, t)
 
+    def get_date(self):
+        """datetime.datetime или None, если дата не задана.
+
+        Полностью очищенное поле — осознанное «не задано» (None). Недописанная
+        или некорректная дата (например 31.02.2025) НЕ стирает значение: поле
+        возвращает ранее загруженное, пока пользователь не введёт верную дату.
+
+        Для is_datetime незаполненное время считается 00:00 — дата без
+        времени не должна пропадать при сохранении."""
+        raw = self.date_widget.text()          # маска: пусто = "..[ :]"
+        if not raw[:10].strip(" ."):
+            return None
+        value = self._parse_text(raw)
+        return value if value is not None else getattr(self, "_loaded", None)
+
     def set_editable(self, editable):
+        self._editable = editable
         self.date_widget.setReadOnly(not editable)
         self.copy_btn.setVisible(not editable)
-        
+        self._update_warn()
+
+
 class CopyableIsoDateField(QWidget):
     """Адаптер CopyableDateField к строковому контракту поля
     (set_text/get_text/set_placeholder/set_editable/copy_signal): значение

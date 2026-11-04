@@ -168,6 +168,7 @@ class CardFlowMixin:
                             setattr(self, spec.key_attr, None)
                             self.is_editing = False
                             self._show_placeholder()
+                            self._reset_failed_selection()
                             self._show_card_error(spec.err_recover, e)
                         return
                     if gen != self._card_gen:
@@ -226,9 +227,16 @@ class CardFlowMixin:
                 setattr(self, spec.key_attr, None)
                 self.is_editing = False
                 self._show_placeholder()
+                self._reset_failed_selection()
                 self._show_card_error(spec.fail_closed_msg, e)
         except Exception as e:                       # noqa: BLE001
             if gen == self._card_gen:
+                # Форма осталась от прежней записи: сбрасываем ключ, иначе
+                # Save перезапишет новую запись чужими данными.
+                setattr(self, spec.key_attr, None)
+                self.is_editing = False
+                self._show_placeholder()
+                self._reset_failed_selection()
                 self._show_card_error(spec.err_load, e)
         finally:
             if gen == self._card_gen:

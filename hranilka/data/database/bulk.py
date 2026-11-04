@@ -2,6 +2,7 @@
 вместо 1+3N). Часть класса Database (database.py) — методы вынесены
 дословно (backlog-разрез CRUD)."""
 import json
+import logging
 from typing import Any
 from hranilka.core.nodetypes import is_fin_node, is_server_node
 from hranilka.data.database.state import DbBase
@@ -302,13 +303,22 @@ class DbBulkOpsMixin(DbBase):
                 f"SELECT id, item_type, name, data FROM fin_items "
                 f"WHERE id IN ({ph})", chunk)
             for r in self.cursor.fetchall():
+                corrupt = False
                 try:
                     payload = json.loads(r["data"]) if r["data"] else {}
                 except (ValueError, TypeError):
+                    # Экспорт только читает: строку в БД не трогаем, поэтому
+                    # не валим весь экспорт, но и не маскируем молча (M-03):
+                    # запись помечается corrupt, диалог экспорта предупредит
+                    # пользователя. Содержимое строки в лог не пишем - только id.
+                    logging.warning(
+                        "Экспорт: payload fin_items id=%s повреждён, "
+                        "выгружен пустым", r["id"])
                     payload = {}
+                    corrupt = True
                 items[r["id"]] = {
                     "item_type": r["item_type"], "name": r["name"],
-                    "payload": payload, "gallery": [],
+                    "payload": payload, "gallery": [], "corrupt": corrupt,
                 }
 
         if not load_gallery:
@@ -359,12 +369,18 @@ class DbBulkOpsMixin(DbBase):
             self.cursor.execute(
                 f"SELECT id, name, data FROM servers WHERE id IN ({ph})", chunk)
             for r in self.cursor.fetchall():
+                corrupt = False
                 try:
                     payload = json.loads(r["data"]) if r["data"] else {}
                 except (ValueError, TypeError):
+                    logging.warning(
+                        "Экспорт: payload servers id=%s повреждён, "
+                        "выгружен пустым", r["id"])
                     payload = {}
+                    corrupt = True
                 items[r["id"]] = {
                     "name": r["name"], "payload": payload, "gallery": [],
+                    "corrupt": corrupt,
                 }
 
         if not load_gallery:

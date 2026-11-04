@@ -1,5 +1,6 @@
 """Аудит 2026-11: дерево, буфер обмена, хоткеи, ресайз, busy-диалог (UI-слой)."""
 import sys
+import threading
 import time
 
 import pytest
@@ -163,8 +164,12 @@ def test_busy_dialog_elapsed_and_give_up_button(window):
 def test_busy_gate_released_after_give_up(window, qapp, monkeypatch):
     from hranilka.ui import vault_controller as vc
 
+    release = threading.Event()
+
     def slow():
-        time.sleep(2.0)
+        # Ждёт сигнала теста, а не таймера: на нагруженном CI фиксированная
+        # задержка могла истечь раньше, чем диалог нажмёт «Не ждать».
+        release.wait(30)
         return "ok"
 
     orig_init = vc._BusyDialog.__init__
@@ -176,6 +181,7 @@ def test_busy_gate_released_after_give_up(window, qapp, monkeypatch):
     monkeypatch.setattr(vc._BusyDialog, "__init__", init)
     ok, _msg = window.vault.run_exclusive_busy(slow, "t")
     assert not ok and window.vault._vault_locked
+    release.set()
     deadline = time.monotonic() + 8
     while window.vault._vault_locked and time.monotonic() < deadline:
         qapp.processEvents()

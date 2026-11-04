@@ -1,8 +1,7 @@
 """Просмотр и экспорт изображений галереи (диалог увеличенного просмотра,
 сохранение в файл, копирование в буфер). Функции не знают о GalleryWidget:
 сообщения пользователю идут через переданный warn(title, text)."""
-from PySide6.QtWidgets import (QLabel, QVBoxLayout, QDialog, QFileDialog,
-                               QApplication)
+from PySide6.QtWidgets import QLabel, QVBoxLayout, QDialog, QFileDialog
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QPixmap, QImage
 
@@ -50,10 +49,21 @@ def export_image_to_file(parent, image_bytes, warn):
     warn("Готово", f"Изображение сохранено:\n{path}")
 
 
+def _copy_image_protected(img) -> None:
+    """Скопировать картинку с той же защитой, что у copy_secret_to_clipboard:
+    общий публичный хелпер chrome.copy_mime_protected (Windows-форматы, маркер
+    авто-очистки, взвод таймера). Импорт ленивый — цикл."""
+    from PySide6.QtCore import QMimeData
+    from hranilka.ui.chrome import copy_mime_protected
+    mime = QMimeData()
+    mime.setImageData(img)
+    copy_mime_protected(mime)
+
+
 def export_image_to_clipboard(image_bytes, warn):
     img = QImage()
     if not img.loadFromData(image_bytes):
         warn("Ошибка", "Не удалось прочитать изображение.")
         return
-    QApplication.clipboard().setImage(img)
+    _copy_image_protected(img)
     warn("Готово", "Изображение скопировано в буфер обмена.")

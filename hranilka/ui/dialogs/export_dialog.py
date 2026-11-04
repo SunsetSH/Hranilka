@@ -11,7 +11,7 @@ M-04 (docs/CODE_REVIEW_VPS_SERVERS_2026-07-15.md): диалог открывае
 import asyncio
 import logging
 
-from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QFileDialog, QGroupBox,
+from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QDialog, QFileDialog, QGroupBox,
                                QHBoxLayout, QLabel, QPushButton, QRadioButton,
                                QVBoxLayout)
 
@@ -61,6 +61,7 @@ class ExportDialog(ThemedDialog):
         # диалога уже не даёт открыть параллельно второй экспорт, а флаг —
         # защита от повторного клика «Экспортировать…» по тому же диалогу.
         self._busy = False
+        self._forced_close = False
 
         lay = self.body
         what = QLabel(f"Что: {title}")
@@ -165,6 +166,28 @@ class ExportDialog(ThemedDialog):
         row.addWidget(self._cancel_btn)
         lay.addLayout(row)
 
+    def reject(self):
+        # Esc / крестик заголовка во время экспорта игнорируются: иначе диалог
+        # закрылся бы, а фон продолжил писать, и можно было бы запустить второй
+        # экспорт параллельно первому.
+        if self._busy:
+            return
+        super().reject()
+
+    def closeEvent(self, e):
+        if self._busy:
+            e.ignore()
+            return
+        super().closeEvent(e)
+
+    def force_close(self):
+        """Закрытие автоблокировкой: сессия БД всё равно станет устаревшей, и
+        фон оборвётся (StaleSessionError). Закрываем безусловно, а поздний
+        _finish игнорируем."""
+        self._forced_close = True
+        self._busy = False
+        self.done(QDialog.Rejected)
+
     def _on_fin_toggled(self, checked):
         # Критичные секреты имеют смысл только при включённых фин-записях.
         self._chk_fin_secrets.setEnabled(checked)
@@ -267,8 +290,17 @@ class ExportDialog(ThemedDialog):
             extra = {}
             if stream_gallery:
                 extra["image_provider"] = self._make_image_provider(session)
-            await asyncio.to_thread(export.write_atomic, func, tree, opts, path, **extra)
-        except StaleSessionError:
+            db = self._db
+
+            def should_abort():
+                # Проверяется прямо перед os.replace: блокировка/смена сессии
+                # или force_close во время форматирования не должны оставить
+                # открытый экспорт на диске.
+                return self._forced_close or db.current_session() != session
+
+            await asyncio.to_thread(export.write_atomic, func, tree, opts, path,
+                                    should_abort=should_abort, **extra)
+        except (StaleSessionError, export.ExportAborted):
             # Сессия БД сменилась (lock/restore/close) во время экспорта —
             # обрываем без записи файла, без пользовательского сообщения (как
             # и другие фоновые операции проекта при устаревшей сессии).
@@ -279,7 +311,7 @@ class ExportDialog(ThemedDialog):
             logging.error("Ошибка экспорта: %s", e, exc_info=e)
             self._finish(error=str(e))
             return
-        self._finish(path=path)
+        self._finish(path=path, corrupted=export.corrupted_names(tree))
 
     def _make_image_provider(self, session):
         """provider(kind, image_id) -> bytes|None для потокового HTML (M-04,
@@ -308,8 +340,11 @@ class ExportDialog(ThemedDialog):
 
         return provider
 
-    def _finish(self, path=None, empty=False, aborted=False, error=None):
+    def _finish(self, path=None, empty=False, aborted=False, error=None,
+                corrupted=()):
         self._busy = False
+        if self._forced_close:
+            return               # диалог закрыт блокировкой: показывать нечего
         self._set_controls_enabled(True)
         self._status.setText("")
         if error is not None:
@@ -321,8 +356,13 @@ class ExportDialog(ThemedDialog):
         if empty:
             themed_info(self.config, self, "Экспорт", "Нечего экспортировать.")
             return
-        themed_info(self.config, self, "Готово",
-                    f"Экспортировано в файл:\n{path}")
+        text = f"Экспортировано в файл:\n{path}"
+        if corrupted:
+            shown = ", ".join(str(n) for n in corrupted[:10])
+            more = f" и ещё {len(corrupted) - 10}" if len(corrupted) > 10 else ""
+            text += (f"\n\nВНИМАНИЕ: данные {len(corrupted)} записей повреждены "
+                     f"и выгружены пустыми: {shown}{more}.")
+        themed_info(self.config, self, "Готово", text)
         self.accept()
 
     def _set_controls_enabled(self, enabled):

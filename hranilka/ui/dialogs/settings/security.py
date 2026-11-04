@@ -2,6 +2,7 @@
 от скриншотов, включение/выключение шифрования, смена мастер-пароля,
 recovery-код (привилегированные операции идут через vault-гейт).
 Часть SettingsDialog (dialog.py) — методы вынесены дословно (backlog-разрез по страницам)."""
+import logging
 from PySide6.QtWidgets import (QVBoxLayout, QHBoxLayout, QGroupBox, QFormLayout, QComboBox, QPushButton, QLabel, QCheckBox, QLineEdit, QFileDialog, QWidget, QDialog, QApplication)
 from PySide6.QtCore import QTimer
 from PySide6.QtGui import QIntValidator
@@ -14,6 +15,7 @@ from hranilka.ui.chrome import copy_secret_to_clipboard
 
 
 class SettingsSecurityMixin:
+    _pasted_secret: str | None = None    # вставлено из буфера, ждёт проверки
     # ─── Вкладка: Безопасность ───────────────────────────────────────────────
 
     def _page_security(self):
@@ -154,9 +156,21 @@ class SettingsSecurityMixin:
         recovery = res
         self.config.set("encryption_enabled", True)
         self.config.set("argon2_preset", preset)
-        self.config.save()
-        self._show_recovery(recovery)
+        # Шифрование уже включено: одноразовый recovery-код показываем в любом
+        # случае, даже если запись конфига не удалась.
+        save_error = None
+        try:
+            self.config.save()
+        except OSError as e:
+            save_error = e
+            logging.error("Не удалось сохранить конфиг после включения шифрования: %s", e)
+        finally:
+            self._show_recovery(recovery)
         self._refresh_encryption_page()
+        if save_error is not None:
+            themed_info(self.config, self, "Предупреждение",
+                        f"Шифрование включено, но настройки не сохранены:\n{save_error}")
+            return
         themed_info(self.config, self, "Готово", "Шифрование включено.")
 
     def _enc_disable(self):
@@ -225,12 +239,23 @@ class SettingsSecurityMixin:
             return
         self._show_recovery(res)
 
+    def _verify_secret_compat(self, secret: str, is_rec: bool) -> bool:
+        """verify_secret с обратной совместимостью: пароль как введён, а при
+        отказе — один раз обрезанный по краям (старые пароли сохранялись без
+        пробелов). Вызывается в фоновом потоке."""
+        if self._db.verify_secret(secret, is_rec):
+            return True
+        stripped = secret.strip()
+        if is_rec or not stripped or stripped == secret:
+            return False
+        return self._db.verify_secret(stripped, False)
+
     def _verify_secret_heavy(self, secret: str, is_rec: bool) -> bool:
         """Проверка мастер-пароля/recovery-кода — это Argon2id (тяжёлый CPU),
         поэтому через heavy-runner (H-09). Ошибку/несовпадение показывает сам;
         возвращает True только при подтверждённом секрете."""
         ok, valid = self._vault_op_heavy(
-            lambda: self._db.verify_secret(secret, is_rec),
+            lambda: self._verify_secret_compat(secret, is_rec),
             "Проверка пароля: вычисление ключа (Argon2id)…")
         if not ok:
             themed_info(self.config, self, "Ошибка", f"Проверка не удалась:\n{valid}")
@@ -238,6 +263,7 @@ class SettingsSecurityMixin:
         if not valid:
             themed_info(self.config, self, "Ошибка", "Неверный пароль или recovery-код.")
             return False
+        self._clear_pasted_secret()
         return True
 
     def _ask_credential(self, title: str, prompt: str, with_recovery: bool):
@@ -247,6 +273,7 @@ class SettingsSecurityMixin:
 
         Возвращает None при отмене; иначе (secret, is_recovery) при
         with_recovery=True либо просто строку при with_recovery=False."""
+        self._pasted_secret = None
         d = ThemedDialog(self.config, self)
         d.setWindowTitle(title)
         d.setMinimumWidth(400 if with_recovery else 380)
@@ -270,7 +297,7 @@ class SettingsSecurityMixin:
             paste_row = QHBoxLayout()
             paste_btn = QPushButton("Вставить из буфера")
             paste_btn.clicked.connect(
-                lambda: edit.setText(QApplication.clipboard().text()))
+                lambda: self._paste_secret(edit, rec_check))
             paste_row.addWidget(paste_btn)
             paste_row.addStretch()
             lay.addLayout(paste_row)
@@ -286,8 +313,26 @@ class SettingsSecurityMixin:
         if d.exec() != QDialog.Accepted:
             return None
         if with_recovery:
-            return edit.text().strip(), rec_check.isChecked()
+            text = edit.text()
+            is_rec = rec_check.isChecked()
+            return (text.strip() if is_rec else text), is_rec
         return edit.text()
+
+    def _paste_secret(self, edit, rec_check) -> None:
+        """Вставить секрет из буфера как есть (пароль не обрезается). Буфер НЕ
+        очищается сразу (опечатка потребовала бы копировать заново, а чужое
+        содержимое буфера терялось бы): текст запоминается и стирается из буфера
+        только после успешной проверки секрета (_clear_pasted_secret)."""
+        text = QApplication.clipboard().text()
+        edit.setText(text.strip() if rec_check.isChecked() else text)
+        self._pasted_secret = text or None
+
+    def _clear_pasted_secret(self) -> None:
+        """Очистить буфер, если в нём всё ещё вставленный секрет."""
+        pasted, self._pasted_secret = self._pasted_secret, None
+        clipboard = QApplication.clipboard()
+        if pasted and clipboard.text() == pasted:
+            clipboard.clear()
 
     def _ask_secret(self, title: str, prompt: str):
         """Ввод мастер-пароля ИЛИ recovery-кода. Возвращает (secret, is_recovery)

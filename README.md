@@ -189,7 +189,7 @@ python -m venv venv
 
 ```powershell
 ./venv/Scripts/python.exe -m pip install -r requirements-dev.txt
-powershell -ExecutionPolicy Bypass -File scriptsuild.ps1
+powershell -ExecutionPolicy Bypass -File scripts\build.ps1
 # готовый файл: dist/Hranilka.exe (+ dist/Hranilka.exe.sha256)
 ```
 
@@ -204,7 +204,7 @@ powershell -ExecutionPolicy Bypass -File scriptsuild.ps1
 **Порядок релиза.**
 1. Поднять `__version__`, дописать запись в `docs/Лог_изменений.md`.
 2. `pytest`, `mypy`, `ruff check .` — зелёные.
-3. `scriptsuild.ps1`: smoke-тест ядра (`scripts/smoke_test.py`: создание
+3. `scripts\build.ps1`: smoke-тест ядра (`scripts/smoke_test.py`: создание
    зашифрованного хранилища, unlock через Argon2, чтение дерева) ->
    PyInstaller (`upx=False`, чтобы не раздражать антивирусы) -> `sign.ps1` ->
    проверка `Get-AuthenticodeSignature` -> SHA256-файл подписанного exe.
@@ -213,7 +213,8 @@ powershell -ExecutionPolicy Bypass -File scriptsuild.ps1
    такими именами релиз не предлагается как обновление.
 
 Автообновление принимает только exe, подписанный тем же сертификатом, что и
-запущенная версия. Смена сертификата означает ручной переход на новый релиз.
+запущенная версия. Смена сертификата означает ручной переход на новый релиз,
+поэтому `sign.ps1` создаёт новый сертификат только с ключом `-AllowNewCert`.
 
 **Подпись.** `scripts/sign.ps1` использует самоподписанный сертификат: он
 убирает предупреждения только на машинах, где сертификат добавлен в доверенные

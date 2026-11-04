@@ -38,6 +38,7 @@ class AppearanceMixin:
     _tree_icons_sig: Optional[tuple] = None        # (text, tree_bg, tree_icons)
     _branch_css_cache: Optional[tuple] = None      # ((text, tree_bg), css)
     _branch_icon_dir_path: Optional[str] = None
+    _branch_icon_gens: Optional[list] = None       # файлы последних отрисовок (старые удаляются)
 
     def request_appearance(self) -> None:
         """Живой предпросмотр: схлопывает серию быстрых изменений в одно
@@ -76,7 +77,6 @@ class AppearanceMixin:
         icons_sig = (text_color, tree_bg, tree_icons)
         if self._appearance_sig == signature:
             return                              # внешний вид не менялся — repolish не нужен
-        self._appearance_sig = signature
 
         retro_style.configure_app(self.config)      # фаски — до QSS (repolish)
         main_qss = theme.main_stylesheet(self.config)
@@ -109,6 +109,9 @@ class AppearanceMixin:
         self._sync_tree_buttons()
         self._update_favorites_btn()
         self._update_tree_toggle_btn()
+        # Сигнатуру фиксируем в конце: исключение посреди применения не должно
+        # навсегда отключать повторное применение тех же настроек.
+        self._appearance_sig = signature
 
     def _branch_arrow_css(self, text_color, tree_bg, main_bg):
         """Стрелки сворачивания/разворачивания, перекрашенные под тему.
@@ -158,6 +161,22 @@ class AppearanceMixin:
             import shutil
             shutil.rmtree(d, ignore_errors=True)
 
+    def _rotate_branch_icon_files(self, written):
+        """Хранит файлы двух последних отрисовок (прежняя ещё может быть в
+        действующем QSS); более старые удаляет — временные файлы не копятся."""
+        gens = self._branch_icon_gens
+        if gens is None:
+            gens = self._branch_icon_gens = []
+        gens.append(written)
+        while len(gens) > 2:
+            old = set(gens.pop(0))
+            keep = {f for g in gens for f in g}
+            for f in old - keep:
+                try:
+                    os.remove(f)
+                except OSError:
+                    pass
+
     def _render_branch_arrow_files(self, text_color, tree_bg):
         """Отрисовать 4 стрелки в файлы (перезаписывая прежние для этих же
         имён) и вернуть QSS-правила с путями к ним."""
@@ -165,6 +184,8 @@ class AppearanceMixin:
         from PySide6.QtCore import QPoint
 
         icon_dir = self._branch_icon_dir()
+
+        written: list = []
 
         def make(direction, color, name):
             pm = QPixmap(16, 16)
@@ -178,15 +199,20 @@ class AppearanceMixin:
             else:                          # ▼
                 p.drawPolygon(QPolygon([QPoint(3, 5), QPoint(13, 5), QPoint(8, 11)]))
             p.end()
-            path = os.path.join(icon_dir, name)
+            # Цвет — в имени файла: кэш пиксмапов QSS ключуется по пути, и при
+            # перезаписи под тем же именем в предпросмотре остаётся старый цвет.
+            hex_part = "".join(ch for ch in color if ch.isalnum())
+            path = os.path.join(icon_dir, f"{name}-{hex_part}.png")
             pm.save(path, "PNG")
+            written.append(path)
             # QSS ожидает прямые слэши даже на Windows.
             return path.replace("\\", "/")
 
-        cn = make("closed", text_color, "cn.png")
-        op = make("open", text_color, "op.png")
-        cs = make("closed", tree_bg, "cs.png")
-        ops = make("open", tree_bg, "ops.png")
+        cn = make("closed", text_color, "cn")
+        op = make("open", text_color, "op")
+        cs = make("closed", tree_bg, "cs")
+        ops = make("open", tree_bg, "ops")
+        self._rotate_branch_icon_files(written)
         return f"""
             QTreeWidget::branch:has-children:closed {{ image: url("{cn}"); }}
             QTreeWidget::branch:has-children:open {{ image: url("{op}"); }}

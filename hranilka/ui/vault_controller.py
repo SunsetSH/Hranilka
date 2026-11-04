@@ -13,8 +13,9 @@ _vault_locked, под которым отложенный flush воркеру �
 import logging
 import threading
 import time
+from typing import Optional
 
-from PySide6.QtCore import (Qt, QMetaObject, QObject, QThread, QEventLoop,
+from PySide6.QtCore import (Qt, QObject, QThread, QEventLoop,
                             QTimer, Signal, Slot)
 from PySide6.QtWidgets import QLabel, QProgressBar, QPushButton, QWidget
 
@@ -35,6 +36,7 @@ class _BusyDialog(theme.ThemedDialog):
         self.setModal(True)
         self.setMinimumWidth(380)
         self.gave_up = False
+        self.work_done = False     # работа завершилась (возможно, до показа окна)
         self._soft_limit = self.SOFT_LIMIT_SECS if soft_limit is None else soft_limit
         self._started = time.monotonic()
         lbl = QLabel(message)
@@ -53,6 +55,19 @@ class _BusyDialog(theme.ThemedDialog):
         self._tick_timer = QTimer(self)
         self._tick_timer.timeout.connect(self._tick)
         self._tick_timer.start(1000)
+
+    def finish(self):
+        """Работа завершена: закрыть диалог. Если exec() ещё не показал окно —
+        закроем сразу после показа (showEvent), иначе accept() «в никуда»
+        оставил бы exec() ждать вечно."""
+        self.work_done = True
+        if self.isVisible():
+            self.accept()
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        if self.work_done:
+            QTimer.singleShot(0, self.accept)
 
     def _tick(self):
         secs = int(time.monotonic() - self._started)
@@ -124,6 +139,10 @@ class VaultController(QObject):
     # QTimer.singleShot, требующий UI-потока. Сигнал с AutoConnection доставляется
     # в поток получателя (UI): эмит из воркера — очередью, из UI-потока — напрямую.
     _dirty_relay = Signal()
+    # Работа run_exclusive_busy завершена (token). Эмитится из рабочего потока;
+    # получатель — долгоживущий QObject в GUI-потоке (не диалог, который к этому
+    # моменту мог быть удалён), поэтому доставка всегда очередью в GUI.
+    _busy_finished = Signal(int)
 
     def __init__(self, db, window, config):
         super().__init__()
@@ -133,15 +152,25 @@ class VaultController(QObject):
 
         self._write_busy = False        # воркер сейчас пишет
         self._write_pending = False     # во время записи появились новые правки
-        self._writer_idle_loop = None   # локальный event-loop ожидания (close/lock)
+        # Локальные event-loop'ы ожидания записи (close/lock). Список: wait_idle
+        # может вложиться (idle-таймер сработал внутри wait_idle closeEvent).
+        self._idle_loops: list[QEventLoop] = []
+        # Открыт модальный вопрос о конфликте файла: второй не открываем.
+        self._conflict_dialog_open = False
+        self._busy_dlg: Optional[_BusyDialog] = None
+        self._busy_token = 0
         self._db_flush_scheduled = False
         # Монопольный доступ к файлу-БД для привилегированных операций: пока флаг
         # взведён, отложенный flush НЕ сабмитит воркеру, лишь копит _write_pending.
         self._vault_locked = False
+        # Идёт _quiesce() перед привилегированной операцией (_vault_locked ещё не
+        # взведён): idle-блокировка в этот момент откладывается (_lock_screen).
+        self._quiescing = False
 
         # БД помечает себя «грязной» → планируем сброс один раз за оборот цикла.
         # Через реле-сигнал, чтобы пометка из фонового потока БД попадала на UI.
         self._dirty_relay.connect(self.schedule_flush)
+        self._busy_finished.connect(self._on_busy_finished)
         self.db._on_dirty = self._dirty_relay.emit
 
         self._writer = _VaultWriter(self.db)
@@ -184,6 +213,11 @@ class VaultController(QObject):
             return
         if not self.db._dirty:
             return
+        if self._conflict_dialog_open:
+            # Пользователь отвечает на вопрос о конфликте — новую запись не
+            # стартуем (она дала бы второй такой же диалог); решение примет ответ.
+            self._write_pending = True
+            return
         if self._write_busy:
             # Воркер занят — запишем свежий снимок сразу после текущей записи.
             self._write_pending = True
@@ -214,14 +248,7 @@ class VaultController(QObject):
             # Запись не удалась — данные снова считаем несохранёнными.
             self.db._dirty = True
             if conflict:
-                if theme.themed_confirm(
-                    self.config, self._window, "Файл изменён извне",
-                    "Файл базы изменён другой программой с момента открытия.\n"
-                    "Перезаписать его своими данными?",
-                ):
-                    self._start_vault_write(force=True)
-                else:
-                    self._status("Сохранение отменено: файл изменён извне.", 5000)
+                self._ask_overwrite_on_conflict()
             else:
                 logging.warning("Не удалось сохранить БД на диск: %s", err)
                 self._status("ОШИБКА СОХРАНЕНИЯ!", 5000)
@@ -231,9 +258,36 @@ class VaultController(QObject):
                     "Изменения остаются в памяти. Освободите место/проверьте "
                     "доступ к файлу и повторите.",
                 )
-        # Разбудить ожидающий close/lock, если воркер освободился.
-        if self._writer_idle_loop is not None and not self._write_busy:
-            self._writer_idle_loop.quit()
+        # Разбудить ожидающие close/lock, если воркер освободился.
+        if not self._write_busy:
+            for loop in list(self._idle_loops):
+                loop.quit()
+
+    def _ask_overwrite_on_conflict(self):
+        """Вопрос «перезаписать файл, изменённый извне?». Модальный: пока он
+        открыт, второй не показываем (_conflict_dialog_open), а запись, которую
+        успел запросить таймер, откладываем (_write_pending)."""
+        if self._conflict_dialog_open:
+            self._write_pending = True
+            return
+        self._conflict_dialog_open = True
+        try:
+            overwrite = theme.themed_confirm(
+                self.config, self._window, "Файл изменён извне",
+                "Файл базы изменён другой программой с момента открытия.\n"
+                "Перезаписать его своими данными?",
+            )
+        finally:
+            self._conflict_dialog_open = False
+        if overwrite:
+            if self._write_busy:
+                # Пока висел вопрос, успела стартовать другая запись: не
+                # накладываемся — после неё запишется свежий снимок.
+                self._write_pending = True
+            else:
+                self._start_vault_write(force=True)
+        else:
+            self._status("Сохранение отменено: файл изменён извне.", 5000)
 
     def wait_idle(self, timeout_ms=15000) -> bool:
         """Дождаться завершения текущей фоновой записи (для close/lock/гейта).
@@ -247,10 +301,18 @@ class VaultController(QObject):
             return True
         t_start = time.perf_counter()
         loop = QEventLoop()
-        self._writer_idle_loop = loop
-        QTimer.singleShot(timeout_ms, loop.quit)   # страховочный таймаут
-        loop.exec()
-        self._writer_idle_loop = None
+        self._idle_loops.append(loop)
+        # Таймаут — собственный таймер на вызов: его отменяем при выходе, иначе
+        # «осиротевший» singleShot прервал бы чужой (вложенный/следующий) loop.
+        timeout = QTimer()
+        timeout.setSingleShot(True)
+        timeout.timeout.connect(loop.quit)
+        timeout.start(timeout_ms)
+        try:
+            loop.exec()
+        finally:
+            timeout.stop()
+            self._idle_loops.remove(loop)
         # _on_vault_written сбрасывает _write_busy перед quit() — по нему и
         # отличаем штатное завершение от срабатывания страховочного таймаута.
         if self._write_busy:
@@ -278,7 +340,7 @@ class VaultController(QObject):
 
         Возвращает (ok: bool, result_or_error): при успехе — то, что вернул fn()
         (например, recovery-код); при ошибке — текст для показа пользователю."""
-        if not self._quiesce():
+        if not self._quiesce_guarded():
             return False, ("Фоновые операции с базой не завершились вовремя.\n"
                            "Повторите операцию через несколько секунд.")
         self._vault_locked = True
@@ -293,6 +355,17 @@ class VaultController(QObject):
         if self._write_pending or self.db._dirty:
             self.schedule_flush()
         return True, result
+
+    def _quiesce_guarded(self) -> bool:
+        """_quiesce() под флагом _quiescing: на ВСЕХ путях (успех, отказ,
+        исключение) флаг снимается. Окно между _quiesce() и взводом
+        _vault_locked закрыто: на время _quiesce() (в нём крутится event-loop)
+        _lock_screen откладывается по _quiescing."""
+        self._quiescing = True
+        try:
+            return self._quiesce()
+        finally:
+            self._quiescing = False
 
     def _quiesce(self) -> bool:
         """Дочистить фоновую активность перед привилегированной операцией.
@@ -332,14 +405,17 @@ class VaultController(QObject):
         публичные методы Database сериализованы RLock'ом, поэтому вызов
         enable_encryption/change_master_password и т.п. из фонового потока
         корректен (см. database.py, авто-обёртка в лок)."""
-        if not self._quiesce():
+        if not self._quiesce_guarded():
             return False, ("Фоновые операции с базой не завершились вовремя.\n"
                            "Повторите операцию через несколько секунд.")
         self._vault_locked = True
         # Родитель — только настоящий QWidget (в тестах окно может быть фейком).
         parent = self._window if isinstance(self._window, QWidget) else None
         dlg = _BusyDialog(self.config, parent, message)
-        out = {}
+        self._busy_token += 1
+        token = self._busy_token
+        self._busy_dlg = dlg
+        out: dict = {}
         done = threading.Event()
 
         def work():
@@ -348,21 +424,20 @@ class VaultController(QObject):
             except Exception as e:                   # noqa: BLE001 — отдаём наверх
                 out["res"] = (False, str(e))
             done.set()
-            # Закрыть диалог из GUI-потока; если exec ещё не начался, queued-событие
-            # будет обработано первым же оборотом его event-loop.
-            if not dlg.gave_up:
-                QMetaObject.invokeMethod(dlg, "accept",
-                                         Qt.ConnectionType.QueuedConnection)
+            # Закрыть диалог из GUI-потока через сигнал долгоживущего контроллера
+            # (не через диалог, который мог быть уже удалён).
+            self._busy_finished.emit(token)
 
         thread = threading.Thread(target=work, daemon=True, name="vault-exclusive")
         keep_locked = False
         try:
             thread.start()
-            dlg.exec()                               # ждём accept от work()
-            if dlg.gave_up and not done.is_set():
-                # Пользователь отказался ждать: операция продолжается в фоне, а
-                # монополия на файл снимается только по её завершению (иначе
-                # фоновая запись пересеклась бы с ней).
+            dlg.exec()                               # ждём finish() от work()
+            if not done.is_set():
+                # Пользователь отказался ждать (либо окно закрыто иначе, чем
+                # завершением): операция продолжается в фоне, а монополия на файл
+                # снимается только по её завершению (иначе фоновая запись
+                # пересеклась бы с ней).
                 keep_locked = True
                 self._release_when_done(done)
             else:
@@ -370,6 +445,7 @@ class VaultController(QObject):
         finally:
             if not keep_locked:
                 self._vault_locked = False
+            self._busy_dlg = None
             dlg._tick_timer.stop()
             dlg.deleteLater()
             # Долгая операция (KDF на большой базе) не должна засчитываться как
@@ -381,7 +457,14 @@ class VaultController(QObject):
                            "завершения и проверьте состояние базы.")
         if self._write_pending or self.db._dirty:
             self.schedule_flush()
-        return out["res"]
+        return out.get("res", (False, "Операция прервана."))
+
+    @Slot(int)
+    def _on_busy_finished(self, token: int):
+        """Завершение рабочего потока run_exclusive_busy (GUI-поток)."""
+        dlg = self._busy_dlg
+        if dlg is not None and token == self._busy_token and not dlg.gave_up:
+            dlg.finish()
 
     def _release_when_done(self, done: threading.Event):
         """Снять _vault_locked, когда зависшая операция наконец завершится."""

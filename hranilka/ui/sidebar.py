@@ -133,8 +133,12 @@ class SidebarMixin:
         задачи серверной галереи (импорт/предпросмотр) — иначе завершившаяся
         уже ПОСЛЕ выключения загрузка могла бы через orphan-handler создать
         новый серверный черновик или изменить общий UI."""
-        self._card_gen += 1
-        self._card_busy = False
+        # Поколение/busy сбрасываем, только если открыта карточка сервера: иначе
+        # идущее сохранение аккаунта пропустит завершение (карточка зависнет
+        # в режиме правки с read-only полями).
+        if self._current_server is not None:
+            self._card_gen += 1
+            self._card_busy = False
         try:
             self.server_tabs.f_gallery_widget.cancel_all_tasks()
         except Exception as e:                       # noqa: BLE001 — teardown-хардненинг
@@ -172,8 +176,10 @@ class SidebarMixin:
         способ гашения незавершённого async — инвалидировать поколение
         карточки, снять busy, отменить висящие задачи галереи КАЖДОЙ фин-
         карточки (по одной на тип реестра, как в _quiesce_card_async)."""
-        self._card_gen += 1
-        self._card_busy = False
+        # См. _hide_servers_everywhere: гасим async только для фин-карточки.
+        if self._current_fin is not None:
+            self._card_gen += 1
+            self._card_busy = False
         try:
             for fin_tabs in self.fin_tabs_by_type.values():
                 fin_tabs.f_gallery_widget.cancel_all_tasks()

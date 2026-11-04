@@ -68,6 +68,22 @@ def pick_backup(config, parent):
     return item.data(Qt.UserRole) if item else None
 
 
+def unlock_with_fallback(container: bytes, secret: str, is_recovery: bool):
+    """cs.unlock с обратной совместимостью по краевым пробелам пароля.
+
+    Пароль берётся как введён (пробелы по краям — его часть). Только при
+    WrongPassword и если strip() даёт другой текст — одна повторная попытка
+    с обрезанным: раньше ввод/вставка обрезались, и такие пароли были
+    сохранены без пробелов. Recovery-код нормализуется самим store."""
+    try:
+        return cs.unlock(container, secret, is_recovery=is_recovery)
+    except cs.WrongPassword:
+        stripped = secret.strip()
+        if is_recovery or stripped == secret or not stripped:
+            raise
+        return cs.unlock(container, stripped, is_recovery=False)
+
+
 class UnlockDialog(ThemedDialog):
     """Окно ввода мастер-пароля при запуске / после автоблокировки.
 
@@ -97,6 +113,7 @@ class UnlockDialog(ThemedDialog):
         self.recovery_action = None   # None | "reset" | "restore"
         self.restore_path = None
         self._busy = False            # фоновая разблокировка в работе
+        self._pasted_secret: str | None = None   # текст, вставленный из буфера
         self._gen = 0                 # поколение попытки (см. reject)
         self._unlock_done.connect(self._on_unlock_done)
 
@@ -185,8 +202,23 @@ class UnlockDialog(ThemedDialog):
             self._ok.setEnabled(True)
 
     def _paste(self):
-        self._field.setText(QApplication.clipboard().text().strip())
+        clipboard = QApplication.clipboard()
+        text = clipboard.text()
+        if not self._rec_check.isChecked():
+            self._field.setText(text)        # пароль как есть, без strip()
+        else:
+            self._field.setText(text.strip())
+        # Буфер не чистим сразу (опечатка = повторное копирование, чужое
+        # содержимое пропало бы): запоминаем и стираем после успешной
+        # разблокировки, если в буфере всё ещё этот текст.
+        self._pasted_secret = text or None
         self._err.setText("")
+
+    def _clear_pasted_secret(self):
+        pasted, self._pasted_secret = self._pasted_secret, None
+        clipboard = QApplication.clipboard()
+        if pasted and clipboard.text() == pasted:
+            clipboard.clear()
 
     def _forgot(self):
         """Меню действий, если утеряны и пароль, и recovery-код. Расшифровать
@@ -253,14 +285,16 @@ class UnlockDialog(ThemedDialog):
     def _attempt(self):
         if self._busy:
             return
-        secret = self._field.text().strip()
+        is_rec = self._rec_check.isChecked()
+        secret = self._field.text()
+        if is_rec:
+            secret = secret.strip()      # recovery-код нормализуется; пароль — как есть
         if not secret:
             return
         # Байты контейнера нужны именно здесь (не при показе диалога): дожидаемся
         # фонового чтения файла (M7-06). При ошибке чтения — сообщение и выход.
         if not self._ensure_container():
             return
-        is_rec = self._rec_check.isChecked()
         # Argon2id + расшифровка контейнера — тяжёлый CPU: в фоновый поток (H-09).
         # Кнопка «Выход» остаётся доступной; поздний результат отсекается по _gen.
         self._set_busy(True)
@@ -268,7 +302,7 @@ class UnlockDialog(ThemedDialog):
 
         def work():
             try:
-                done.emit(gen, cs.unlock(container, secret, is_recovery=is_rec), None)
+                done.emit(gen, unlock_with_fallback(container, secret, is_rec), None)
             except Exception as e:       # noqa: BLE001 — классифицируется в GUI-потоке
                 done.emit(gen, None, e)
 
@@ -290,6 +324,7 @@ class UnlockDialog(ThemedDialog):
         self._set_busy(False)
         if error is None:
             self.result_data = result
+            self._clear_pasted_secret()
             self.accept()
         elif isinstance(error, cs.WrongPassword):
             logging.info("Разблокировка: неверный секрет")
@@ -308,5 +343,6 @@ class UnlockDialog(ThemedDialog):
         # позже, игнорируется по несовпадению поколения.
         logging.info("Окно разблокировки: отмена (идёт расшифровка: %s)", self._busy)
         self._gen += 1
+        self._clear_pasted_secret()          # вставленный пароль не оставляем в буфере
         super().reject()
 

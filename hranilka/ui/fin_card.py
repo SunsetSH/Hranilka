@@ -15,7 +15,7 @@ from PySide6.QtCore import Qt
 from hranilka.core.fin_domain import days_until_expiry, EXPIRY_WARN_DAYS
 from hranilka.core.fin_types import FIN_TYPES
 from hranilka.core.nodetypes import FIN_LEAF_TYPES
-from hranilka.data.database import StaleSessionError
+from hranilka.data.database import CorruptedPayloadError, StaleSessionError
 from hranilka.data.models.fin_item import FinItemData
 from hranilka.ui.account_card import AccountCardMixin
 from hranilka.ui.card_base import CardFlowMixin, LeafCardSpec
@@ -66,6 +66,8 @@ _FIN_SPEC = LeafCardSpec(
     orphan_log_load="Не удалось подгрузить запись для осиротевшей загрузки",
     orphan_deleted="Загрузка отменена: запись удалена",
     orphan_links=_fin_orphan_links,
+    fail_closed_excs=(CorruptedPayloadError,),
+    fail_closed_msg="Данные записи повреждены — запись в БД не изменена",
 )
 
 
@@ -238,8 +240,15 @@ class FinCardMixin(CardFlowMixin):
             return
         util.fire(self._add_fin_account_link_async())
 
+    def _fin_link_ctx_valid(self, gen, session, key):
+        """Карточка после await та же: поколение, сессия и ключ записи."""
+        return (gen == self._card_gen and session == self.db.current_session()
+                and self._current_fin == key)
+
     async def _add_fin_account_link_async(self):
         session = self.db.current_session()
+        gen = self._card_gen
+        key = self._current_fin
         try:
             accounts = await self.db.run_async(
                 self.db.get_all_accounts, _session=session)
@@ -248,11 +257,13 @@ class FinCardMixin(CardFlowMixin):
         except Exception as e:                       # noqa: BLE001
             self._show_card_error("Не удалось загрузить список аккаунтов", e)
             return
+        if not self._fin_link_ctx_valid(gen, session, key):
+            return
         widget = self.fin_tabs.f_linked_accounts
         chosen, ok = theme.themed_multiselect(
             self.config, self, "Связать с аккаунтами", accounts,
             widget.get_data())
-        if ok:
+        if ok and self._fin_link_ctx_valid(gen, session, key):
             chosen_set = set(chosen)
             links = [a for a in accounts if a["id"] in chosen_set]
             widget.set_data(links)

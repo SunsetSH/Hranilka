@@ -22,6 +22,7 @@ from pathlib import Path
 
 from hranilka.core.fin_domain import mask_card_number
 from hranilka.core.fin_types import FIN_TYPES
+from hranilka.core.theme_io import is_safe_font_name
 from hranilka.core.nodetypes import is_fin_node, is_server_node
 from hranilka.core.util import best_effort_wipe
 
@@ -209,6 +210,9 @@ def _account_rows(card, links, opts, skip_empty=True):
 # карты (mask='card'), он выводится маскированным. include_fin_secrets=True —
 # всё полностью. item_type вне реестра (битые данные) не роняет экспорт.
 
+_SEED_EMPTY_MARK = "_"   # = seed_phrase.EMPTY_MARK (UI не импортируем в сервис)
+
+
 def _is_fin(node):
     return is_fin_node(node["type"])
 
@@ -228,6 +232,11 @@ def _fin_field_value(field, payload, opts):
         if field.mask == "card":
             return mask_card_number(raw)
         return None
+    if field.kind == "seed":
+        # Пустые ячейки хранятся маркером «_» (ui/widgets/seed_phrase.py,
+        # EMPTY_MARK); в экспорт — только реальные слова, чтобы фраза
+        # вставлялась в кошелёк.
+        raw = " ".join(t for t in raw.split() if t != _SEED_EMPTY_MARK)
     return raw
 
 
@@ -651,7 +660,13 @@ def _html_chunks(tree, opts, image_provider=None):
     _html_document(tree, opts) напрямую с уже загруженными BLOB)."""
     th = opts.theme
     font = th.get("font", "Consolas")
-    fs = int(th.get("font_size", 14))
+    if not is_safe_font_name(font):         # конфиг мог получить чужое значение
+        font = "Consolas"
+    font = esc(font.strip())
+    try:
+        fs = int(th.get("font_size", 14))
+    except (TypeError, ValueError, OverflowError):
+        fs = 14
     text = th.get("text_color", "#000000")
     main_bg = th.get("main_bg_color", "#F0F0F0")
     tree_bg = th.get("tree_bg_color", "#FFFFFF")
@@ -899,7 +914,29 @@ def export_xlsx(tree, opts, path):
 
 # ─── Атомарная публикация ─────────────────────────────────────────────────────
 
-def write_atomic(func, tree, opts, path, **kwargs):
+def corrupted_names(tree):
+    """Названия fin/server-записей со снятым флагом corrupt (повреждённый JSON
+    payload выгружен пустым, bulk.py). Только названия — секреты не трогаем."""
+    names = []
+
+    def walk(nodes):
+        for n in nodes or []:
+            for key in ("fin", "server"):
+                rec = n.get(key)
+                if rec and rec.get("corrupt"):
+                    names.append(rec.get("name") or n.get("name") or "?")
+            walk(n.get("children"))
+
+    walk(tree)
+    return names
+
+
+class ExportAborted(Exception):
+    """Экспорт отменён (should_abort) до публикации файла: сессия БД сменилась
+    или диалог закрыт блокировкой. Целевой файл не создан."""
+
+
+def write_atomic(func, tree, opts, path, should_abort=None, **kwargs):
     """Форматирует экспорт функцией func (одна из FORMATS) во временный файл
     рядом с целевым и публикует его атомарным переименованием (M-04).
 
@@ -915,7 +952,12 @@ def write_atomic(func, tree, opts, path, **kwargs):
     Временный файл — частично/полностью сформированный экспорт с секретами в
     открытом виде (пароли, коды, содержимое галереи). При обрыве форматтера он
     убирается через best_effort_wipe, а не голым unlink, иначе plaintext мог бы
-    остаться в свободных блоках ФС (M-02, как и pre-migrate/restore-копии БД)."""
+    остаться в свободных блоках ФС (M-02, как и pre-migrate/restore-копии БД).
+
+    should_abort — необязательный callable без аргументов; проверяется
+    непосредственно перед os.replace (после долгого форматирования). Если он
+    вернул True — поднимается ExportAborted, temp-файл стирается, а plaintext-
+    экспорт после блокировки хранилища на диске не появляется."""
     target = Path(path)
     # mkstemp: уникальное имя (pid-имя могло столкнуться при параллельных
     # экспортах); создаём рядом с целью, чтобы os.replace был атомарным.
@@ -925,7 +967,11 @@ def write_atomic(func, tree, opts, path, **kwargs):
     tmp = Path(tmp_name)
     try:
         func(tree, opts, str(tmp), **kwargs)
+        if should_abort is not None and should_abort():
+            raise ExportAborted()
         os.replace(tmp, target)
+    except ExportAborted:
+        raise
     except Exception:
         logging.error("Экспорт в %s не удался", target.name, exc_info=True)
         raise

@@ -9,7 +9,8 @@
      (nullable service_id, битые ссылки на accounts_old). Проверен годами и
      догоняет БД ЛЮБОЙ старой версии до v8 — ретро-шаги не выдумываем.
   3. Нумерованные шаги LEGACY_BASE+1..SCHEMA_VERSION по порядку.
-  4. set_schema_version + commit.
+  4. Шаги п.3 + set_schema_version — одна явная транзакция (BEGIN/COMMIT,
+     откат при сбое). Legacy-перестройки п.2 (PRAGMA foreign_keys) — вне её.
 
 Fast-path по отпечатку схемы и pre-migration durable-копии живут в
 schema.py (create_tables) — вызываются ДО этого конвейера, как и раньше.
@@ -58,8 +59,19 @@ def run(db: "Database") -> None:
     db._repair_accounts_old_refs()
 
     # Нумерованные шаги: строго по порядку от max(current, LEGACY_BASE)+1.
-    for version in range(max(current, LEGACY_BASE) + 1, SCHEMA_VERSION + 1):
-        MIGRATIONS[version](db.conn)
-
-    db.set_schema_version(SCHEMA_VERSION)
+    # Шаги m009+ содержат только DDL/DML без PRAGMA (перестройки с
+    # foreign_keys=OFF живут выше, в legacy-блоке, и идут вне транзакции), а
+    # SQLite DDL транзакционен — поэтому все шаги и запись версии выполняются
+    # ОДНОЙ явной транзакцией: сбой любого шага откатывает всё, версия не
+    # поднимается, повторный запуск начнёт с тех же шагов.
+    conn = db.conn
+    conn.commit()                       # закрыть возможную неявную транзакцию
+    conn.execute("BEGIN")
+    try:
+        for version in range(max(current, LEGACY_BASE) + 1, SCHEMA_VERSION + 1):
+            MIGRATIONS[version](conn)
+        db.set_schema_version(SCHEMA_VERSION)
+    except BaseException:
+        conn.rollback()
+        raise
     db._commit()

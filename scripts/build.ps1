@@ -2,12 +2,12 @@
     Сборка + подпись + проверка + контрольная сумма.
 
     Запуск (из корня проекта):
-        powershell -ExecutionPolicy Bypass -File scripts\build.ps1 [-SkipSmoke]
+        powershell -ExecutionPolicy Bypass -File scripts\build.ps1 [-SkipSmoke] [-AllowNewCert]
 
     Шаги: smoke-тест ядра -> PyInstaller -> sign.ps1 -> проверка подписи ->
     SHA256-файл рядом с exe (dist\Hranilka.exe.sha256).
 #>
-param([switch]$SkipSmoke)
+param([switch]$SkipSmoke, [switch]$AllowNewCert)
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
@@ -29,7 +29,7 @@ if ($LASTEXITCODE -ne 0) { throw "PyInstaller завершился с кодом
 if (-not (Test-Path $exe)) { throw "Не найден $exe после сборки" }
 
 # 2. Подпись.
-& (Join-Path $PSScriptRoot 'sign.ps1')
+& (Join-Path $PSScriptRoot 'sign.ps1') -AllowNewCert:$AllowNewCert
 
 # 3. Проверка подписи. Самоподпись на «чужой» машине даёт UnknownError/
 # NotTrusted — это допустимо; недопустимы отсутствие подписи и порча файла.
