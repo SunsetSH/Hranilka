@@ -140,6 +140,10 @@ class UnlockDialog(ThemedDialog):
         self._ok.clicked.connect(self._attempt)
         exit_btn = QPushButton("Выход")
         exit_btn.clicked.connect(self.reject)
+        # Enter в этом окне — только разблокировка: кнопка с фокусом не должна
+        # перехватывать роль кнопки по умолчанию.
+        for btn in (exit_btn, self._paste_btn, self._forgot_btn):
+            btn.setAutoDefault(False)
         row.addWidget(self._ok)
         row.addWidget(exit_btn)
         lay.addLayout(row)
@@ -272,8 +276,10 @@ class UnlockDialog(ThemedDialog):
 
     def _set_busy(self, busy: bool):
         self._busy = busy
-        for w in (self._field, self._ok, self._rec_check,
-                  self._paste_btn, self._forgot_btn):
+        # Поле не отключаем: фокус ушёл бы на «Выход», и тот же Enter, дойдя до
+        # QDialog, закрыл бы окно во время разблокировки.
+        self._field.setReadOnly(busy)
+        for w in (self._ok, self._rec_check, self._paste_btn, self._forgot_btn):
             w.setEnabled(not busy)
         self._progress.setVisible(busy)
         self._err.setText("Расшифровка…" if busy else "")
@@ -300,6 +306,7 @@ class UnlockDialog(ThemedDialog):
     def reject(self):
         # «Выход» во время фоновой разблокировки: результат, который придёт
         # позже, игнорируется по несовпадению поколения.
+        logging.info("Окно разблокировки: отмена (идёт расшифровка: %s)", self._busy)
         self._gen += 1
         super().reject()
 

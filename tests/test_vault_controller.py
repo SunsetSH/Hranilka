@@ -192,7 +192,7 @@ def test_unlock_dialog_async_success(qapp, pure_config):
     dlg._field.setText("pw-123456789012")
     dlg._attempt()
     # Ввод заблокирован на время фоновой разблокировки; «Выход» доступен.
-    assert dlg._busy and not dlg._ok.isEnabled() and not dlg._field.isEnabled()
+    assert dlg._busy and not dlg._ok.isEnabled() and dlg._field.isReadOnly()
     assert dlg._progress.isVisible() or True   # offscreen: visible до show() не гарантирован
     # Повторный клик во время работы игнорируется (не падает, не дублирует).
     dlg._attempt()
