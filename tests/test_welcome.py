@@ -24,7 +24,7 @@ def test_builds_under_themes(qapp, pure_config):
         pure_config.set("tree_bg_color", colors["tree_bg"])
         pure_config.set("main_bg_color", colors["main_bg"])
         d = WelcomeDialog(pure_config)
-        assert d._stack.count() == 8
+        assert d._stack.count() == 9
         assert d._stack.currentIndex() == 0
         d.deleteLater()
 
@@ -175,3 +175,14 @@ def test_settings_button_exists(qapp, pure_config):
     d = SettingsDialog(pure_config)
     assert d.show_welcome_btn.text() == "Показать обучение"
     d.deleteLater()
+
+
+def test_steps_panel_tracks_current_slide(dlg):
+    labels = dlg._step_labels
+    assert len(labels) == dlg._stack.count()
+    assert labels[0].text().startswith(">")
+    dlg._go(+1)
+    assert labels[0].text().startswith("v") and labels[1].text().startswith(">")
+    assert dlg._skip_btn.text() == "Отмена"
+    dlg._go(-1)
+    assert labels[1].text().startswith(" ")

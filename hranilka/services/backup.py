@@ -3,6 +3,7 @@ import shutil
 import sqlite3
 from pathlib import Path
 from datetime import datetime
+from typing import Callable, Optional
 
 from hranilka.crypto import store as crypto_store
 # Раньше SCHEMA_VERSION импортировался отложенно (разрыв цикла backup↔database);
@@ -42,23 +43,64 @@ def _fsync_dir(folder: Path) -> None:
         os.close(fd)
 
 
-def create_backup(db_path: str, backup_folder: str, keep_count: int = 5) -> Path:
+def _require_folder(backup_folder: str) -> Path:
+    """Папка бэкапов обязана быть непустой и абсолютной (B6): Path("") — это
+    текущий каталог, а относительный путь зависит от cwd процесса."""
+    if not isinstance(backup_folder, str) or not backup_folder.strip():
+        raise ValueError("Не указана папка для бэкапов.")
+    folder = Path(backup_folder.strip())
+    if not folder.is_absolute():
+        raise ValueError("Папка для бэкапов должна быть задана абсолютным путём.")
+    return folder
+
+
+def _snapshot_plain(src: Path, dst: Path) -> None:
+    """Согласованный снимок открытой SQLite-БД через sqlite3.backup() (B7):
+    сырое копирование файла, в который идёт запись, может дать рваный образ."""
+    s_con = sqlite3.connect(f"{src.resolve().as_uri()}?mode=ro", uri=True)
+    try:
+        d_con = sqlite3.connect(str(dst))
+        try:
+            s_con.backup(d_con)
+        finally:
+            d_con.close()
+    finally:
+        s_con.close()
+    with open(dst, "rb+") as f:         # durable: fsync готового файла
+        os.fsync(f.fileno())
+
+
+def create_backup(db_path: str, backup_folder: str, keep_count: int = 5,
+                  *, flush: Optional[Callable[[], None]] = None) -> Path:
     """Копирует БД в папку бэкапов с отметкой времени, ротирует старые.
 
+    flush — необязательный callback, который вызывается ДО копирования и
+    сбрасывает отложенные изменения шифр. режима на диск (например, db.flush).
+    keep_count<=0 — ротация отключена (бэкапы копятся без ограничения).
+
     Имя содержит микросекунды (а не только секунды), поэтому два бэкапа подряд
-    не сталкиваются. Файл сначала пишется во временный и атомарно переименуется,
-    чтобы обрыв копирования не оставил «обрезанный» бэкап. Ротация выполняется
-    только после успешной записи нового файла."""
+    не сталкиваются. Файл сначала пишется во временный, ПРОВЕРЯЕТСЯ
+    (_is_valid_db) и только затем атомарно переименовывается, чтобы обрыв
+    копирования/битая копия не стали бэкапом. Шифрованный контейнер копируется
+    как есть, обычная БД — через sqlite3.backup(). Ротация выполняется только
+    после успешной проверки и переименования нового файла."""
     src = Path(db_path)
+    folder = _require_folder(backup_folder)
+    if flush is not None:
+        flush()
     if not src.exists():
         raise FileNotFoundError(f"База данных не найдена: {db_path}")
-    folder = Path(backup_folder)
     folder.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     dest = folder / f"hranilka_backup_{ts}.db"
     tmp = folder / f".{dest.name}.tmp"
     try:
-        _copy_durable(src, tmp)         # копия + fsync содержимого (L3-01)
+        if crypto_store.is_encrypted_file(str(src)):
+            _copy_durable(src, tmp)     # копия + fsync содержимого (L3-01)
+        else:
+            _snapshot_plain(src, tmp)
+        if not _is_valid_db(tmp):
+            raise ValueError("Созданная копия не прошла проверку; бэкап отменён.")
         os.replace(tmp, dest)
         _fsync_dir(folder)              # устойчивость самого переименования
     finally:
@@ -73,6 +115,8 @@ def create_backup(db_path: str, backup_folder: str, keep_count: int = 5) -> Path
 
 def list_backups(backup_folder: str) -> list:
     """Возвращает список файлов бэкапов (новые сначала)."""
+    if not backup_folder or not backup_folder.strip():
+        return []                       # Path("") == текущий каталог (B6)
     folder = Path(backup_folder)
     if not folder.exists():
         return []

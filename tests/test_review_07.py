@@ -5,7 +5,6 @@
 """
 import concurrent.futures
 
-import pytest
 
 # Патч-точка cs — в модуле unlock (этап 7: реэкспорт cs из пакета убран).
 from hranilka.ui.dialogs import unlock

@@ -14,7 +14,7 @@ class ShortcutsMixin:
 
     # Действия, чьи шорткаты должны срабатывать только когда фокус в дереве —
     # иначе Del/Backspace перехватывался бы у текстовых полей.
-    _SHORTCUT_TREE_CTX = {"delete_selected"}
+    _SHORTCUT_TREE_CTX = {"delete_selected", "rename_item", "edit_selected"}
 
     def _setup_shortcuts(self):
         """Создаёт QShortcut'ы по реестру shortcuts.effective(config).
@@ -52,6 +52,8 @@ class ShortcutsMixin:
             "gen_password":    self._sc_gen_password,
             "gen_personal":    self._sc_gen_personal,
             "delete_selected": self._sc_delete_selected,
+            "rename_item":     self._sc_rename_item,
+            "edit_selected":   self._sc_edit_selected,
             "focus_search":    self._sc_focus_search,
             "toggle_expand":   self._sc_toggle_expand,
             "open_settings":   self.open_settings,
@@ -105,6 +107,18 @@ class ShortcutsMixin:
         selected = self.tree.selectedItems()
         if selected:
             self.delete_items(selected)
+
+    def _sc_rename_item(self):
+        selected = self.tree.selectedItems()
+        if len(selected) == 1:
+            node = self._node(selected[0])
+            if node and node.get("type") in ("folder", "service", "server"):
+                self.rename_item(selected[0])
+
+    def _sc_edit_selected(self):
+        # Enter в дереве: открытая карточка (выбранный лист) → режим правки.
+        if self.tree.selectedItems() and self._any_card_open()                 and not self.is_editing:
+            self.edit_current()
 
     def _sc_focus_search(self):
         self.search_box.setFocus()

@@ -458,8 +458,10 @@ class DbBulkOpsMixin(DbBase):
 
     def _name_maps(self):
         """Карты имён для построения путей без запроса на каждый аккаунт."""
-        self.cursor.execute("SELECT id, account_name, service_id, deleted_at FROM accounts")
-        acc = {r["id"]: (r["account_name"], r["service_id"], r["deleted_at"])
+        self.cursor.execute(
+            "SELECT id, account_name, service_id, deleted_at, folder_id FROM accounts")
+        acc = {r["id"]: (r["account_name"], r["service_id"], r["deleted_at"],
+                         r["folder_id"])
                for r in self.cursor.fetchall()}
         self.cursor.execute("SELECT id, name, folder_id FROM services")
         svc = {r["id"]: (r["name"], r["folder_id"]) for r in self.cursor.fetchall()}
@@ -472,8 +474,10 @@ class DbBulkOpsMixin(DbBase):
         a = acc.get(account_id)
         if not a:
             return ""
-        name, service_id, _deleted = a
+        name, service_id, _deleted, leaf_folder_id = a
         parts = []
+        if leaf_folder_id and leaf_folder_id in fld:   # лист прямо в папке
+            parts.append(fld[leaf_folder_id])
         if service_id and service_id in svc:
             sname, folder_id = svc[service_id]
             if folder_id and folder_id in fld:

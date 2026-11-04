@@ -5,12 +5,14 @@ flush, включение/выключение шифрования. Часть 
 
 ВНИМАНИЕ: конвейер отложенного сохранения (см. docs/CODE_MAP.md) пересекает
 границу этого модуля и vault_controller.py — семантику методов не менять."""
+import hashlib
 import os
 import sqlite3
 import tempfile
 
+from hranilka.core.util import best_effort_wipe
 from hranilka.crypto import store as cs
-from hranilka.data.errors import VaultConflictError
+from hranilka.data.errors import StaleSessionError, VaultConflictError
 from hranilka.data.database.state import DbBase
 
 
@@ -24,6 +26,11 @@ class DbPersistenceMixin(DbBase):
         # свободными: иначе удалённые пароли/BLOB остаются читаемыми в файле БД
         # до следующего VACUUM (Баг 2). В in-memory (шифр.) режиме безвреден.
         self.conn.execute("PRAGMA secure_delete = ON")
+        if not self.encrypted:
+            # Явные значения (а не умолчания сборки SQLite) для файловой БД:
+            # откатный журнал и полный fsync при коммите.
+            self.conn.execute("PRAGMA journal_mode = DELETE")
+            self.conn.execute("PRAGMA synchronous = FULL")
         self.cursor = self.conn.cursor()
 
     def connect(self) -> None:
@@ -32,6 +39,7 @@ class DbPersistenceMixin(DbBase):
         self._dek = None
         self._header = None
         self._dirty = False
+        self._disk_fingerprint = None
         # check_same_thread=False: доступ из UI-потока и из воркера run_async
         # сериализуется RLock'ом (см. __init__), поэтому безопасно.
         self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
@@ -43,15 +51,48 @@ class DbPersistenceMixin(DbBase):
         """Открыть расшифрованные байты БД в памяти. Файл остаётся шифрованным;
         изменения сбрасываются на диск через persist()."""
         self.encrypted = True
-        self._dek = dek
+        # bytearray: ключ можно занулить in-place при lock() (S8).
+        self._dek = bytearray(dek)
         self._header = header
         self._dirty = False
         self.conn = sqlite3.connect(":memory:", check_same_thread=False)
         if db_bytes:
             self.conn.deserialize(db_bytes)  # type: ignore[attr-defined]  # есть в CPython 3.11+
         self._disk_revision = self._stat_revision()
+        self._disk_fingerprint = self._file_fingerprint()
         self._setup_conn()
         self._bump_session()
+
+    def _file_fingerprint(self):
+        """Отпечаток «поколения» контейнера: SHA-256 первых 512 байт файла
+        (заголовок + случайный на каждое сохранение data_nonce + начало
+        шифртекста). Только шифр. режим; None - файла нет/нечитаем/обычный
+        режим. Дёшево, формат контейнера не меняет."""
+        if not self.encrypted:
+            return None
+        try:
+            with open(self.db_path, "rb") as f:
+                return hashlib.sha256(f.read(512)).digest()
+        except OSError:
+            return None
+
+    def _key_material(self):
+        """Снимок (DEK, header) для шифрования - под _key_lock (B13).
+
+        Возвращает НЕизменяемую копию DEK: lock() зануляет исходный bytearray,
+        и шифрование, начатое до lock(), не должно получить обнулённый ключ.
+        Ключа нет (БД уже заблокирована) - StaleSessionError, а не TypeError
+        из глубины шифрования."""
+        with self._key_lock:
+            if self._dek is None or self._header is None:
+                raise StaleSessionError()
+            return bytes(self._dek), self._header
+
+    @staticmethod
+    def _zero(buf) -> None:
+        """Занулить bytearray-ключ in-place (S8); не-bytearray игнорируется."""
+        if isinstance(buf, bytearray):
+            buf[:] = bytes(len(buf))
 
     def _stat_revision(self):
         """«Ревизия» файла на диске (st_mtime_ns, размер) или None, если файла нет."""
@@ -78,9 +119,15 @@ class DbPersistenceMixin(DbBase):
             return
         # Файл существовал. Его удаление или изменение извне — конфликт.
         if current != self._disk_revision:
+            # mtime/размер меняют антивирус/OneDrive без правки содержимого.
+            # В шифр. режиме сверяем отпечаток: тот же контейнер - не конфликт.
+            if (current is not None and self._disk_fingerprint is not None
+                    and self._file_fingerprint() == self._disk_fingerprint):
+                self._disk_revision = current
+                return
             raise VaultConflictError()
 
-    def _atomic_replace(self, data: bytes):
+    def _atomic_replace(self, data):
         """Атомарно заменить файл-БД содержимым data через УНИКАЛЬНЫЙ временный
         файл в том же каталоге (tempfile.mkstemp + fsync + os.replace).
 
@@ -88,12 +135,17 @@ class DbPersistenceMixin(DbBase):
         фиксированном `db_path + ".tmp"` две одновременные записи (фоновый
         воркер + синхронная привилегированная операция) затирали бы временный
         файл друг друга, давая порчу/потерю данных. mkstemp гарантирует, что у
-        каждой записи свой temp. Ревизию диска обновляем после успешной замены."""
+        каждой записи свой temp. Ревизию диска обновляем после успешной замены.
+
+        data - bytes или последовательность частей (пишутся подряд, без склейки
+        в одну копию - P1)."""
+        parts = (data,) if isinstance(data, (bytes, bytearray, memoryview)) else data
         directory = os.path.dirname(self.db_path) or "."
         fd, tmp = tempfile.mkstemp(dir=directory, prefix=".hranilka-", suffix=".tmp")
         try:
             with os.fdopen(fd, "wb") as f:
-                f.write(data)
+                for part in parts:
+                    f.write(part)
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp, self.db_path)
@@ -105,9 +157,11 @@ class DbPersistenceMixin(DbBase):
                 pass
             raise
         self._disk_revision = self._stat_revision()
+        self._disk_fingerprint = self._file_fingerprint()
 
-    def _write_container(self, container: bytes, force: bool = False):
-        """Атомарно записать готовый контейнер на диск (temp+fsync+replace).
+    def _write_container(self, container, force: bool = False):
+        """Атомарно записать готовый контейнер (bytes или части) на диск
+        (temp+fsync+replace).
         Перед заменой сверяет ревизию файла (если не force) и обновляет её после."""
         if not force:
             self._check_no_external_change()
@@ -123,7 +177,8 @@ class DbPersistenceMixin(DbBase):
 
     def serialize_container(self) -> bytes:
         """serialize_db() + шифрование в контейнер (без записи). Синхронный путь."""
-        return cs.seal(self.serialize_db(), self._dek, self._header)
+        dek, header = self._key_material()
+        return cs.seal(self.serialize_db(), dek, header)
 
     def seal_and_write(self, db_bytes: bytes, force: bool = False):
         """Зашифровать ГОТОВЫЕ байты БД и атомарно записать контейнер.
@@ -131,8 +186,11 @@ class DbPersistenceMixin(DbBase):
         Не обращается к соединению SQLite — безопасно вызывать из рабочего
         потока (см. фоновую запись в main.py). Шифрование (AES-GCM) и запись —
         самые тяжёлые части сохранения."""
-        container = cs.seal(db_bytes, self._dek, self._header)
-        self._write_container(container, force=force)
+        # Ключ и заголовок снимаются один раз в начале (B13): параллельный
+        # lock() не обнулит их посреди шифрования.
+        dek, header = self._key_material()
+        parts = cs.seal_parts(db_bytes, dek, header)
+        self._write_container(parts, force=force)
 
     def persist(self, force: bool = False):
         """Сбросить текущее состояние БД на диск.
@@ -175,7 +233,11 @@ class DbPersistenceMixin(DbBase):
             self.conn.close()
         self.conn = None
         self.cursor = None
-        self._dek = None
+        with self._key_lock:
+            # Зануляем ключ in-place (S8); шифрование в полёте работает с
+            # собственной копией (см. _key_material).
+            self._zero(self._dek)
+            self._dek = None
         self._dirty = False
         self._bump_session()
 
@@ -234,7 +296,26 @@ class DbPersistenceMixin(DbBase):
             self.connect()   # старый файл не тронут — возвращаем рабочий режим
             raise
         self.open_encrypted(pt, dek, header)
+        self._wipe_plaintext_leftovers()
         return recovery
+
+    def _wipe_plaintext_leftovers(self):
+        """S7: после включения шифрования затереть plaintext-копии этой БД рядом
+        с файлом: `.pre-migrate*` и `.pre-update*` (не контейнеры) и хвосты
+        SQLite. Best-effort;
+        бэкапы лежат в другой папке и здесь не трогаются."""
+        directory = os.path.dirname(self.db_path) or "."
+        base = os.path.basename(self.db_path)
+        try:
+            names = os.listdir(directory)
+        except OSError:
+            return
+        for name in names:
+            if name in (base + "-journal", base + "-wal", base + "-shm") or \
+                    name.startswith((base + ".pre-migrate", base + ".pre-update")):
+                path = os.path.join(directory, name)
+                if os.path.isfile(path) and not cs.is_encrypted_file(path):
+                    best_effort_wipe(path)
 
     def disable_encryption(self) -> None:
         """Расшифровать БД обратно в обычный файл и работать без шифрования."""
@@ -248,18 +329,43 @@ class DbPersistenceMixin(DbBase):
             # Запись не удалась (на диске остался зашифрованный контейнер) —
             # возвращаем рабочее зашифрованное состояние из байтов в памяти.
             self.open_encrypted(db_bytes, dek, header)
+            self._zero(dek)
             raise
+        self._zero(dek)
         self.connect()
 
-    def change_master_password(self, new_password: str, preset: str | None = None):
-        """Сменить мастер-пароль (перезаворачивание DEK, без перешифровки данных)."""
-        new_header = cs.change_password(None, self._dek, self._header,
-                                        new_password, preset)
-        self.set_header(new_header)
+    def change_master_password(self, new_password: str, preset: str | None = None,
+                               rotate_dek: bool = False):
+        """Сменить мастер-пароль (перезаворачивание DEK, без перешифровки данных).
+
+        rotate_dek=True (S2) - ещё и новый DEK (данные перешифровываются при
+        сохранении) и новый recovery-код: возвращает его (показать один раз).
+        Иначе возвращает None. Ключ и заголовок применяются вместе и
+        откатываются, если запись на диск не удалась."""
+        dek, header = self._key_material()
+        if not rotate_dek:
+            self.set_header(cs.change_password(None, dek, header,
+                                               new_password, preset))
+            return None
+        new_header, new_dek, recovery = cs.change_password(
+            None, dek, header, new_password, preset, rotate_dek=True)
+        old_dek, old_header = self._dek, self._header
+        with self._key_lock:
+            self._dek, self._header = bytearray(new_dek), new_header
+        try:
+            self.persist()
+        except BaseException:
+            with self._key_lock:
+                self._zero(self._dek)
+                self._dek, self._header = old_dek, old_header
+            raise
+        self._zero(old_dek)
+        return recovery
 
     def regenerate_recovery_code(self) -> str:
         """Сгенерировать новый recovery-код. Возвращает код (показать один раз)."""
-        new_header, recovery = cs.regenerate_recovery(self._dek, self._header)
+        dek, header = self._key_material()
+        new_header, recovery = cs.regenerate_recovery(dek, header)
         self.set_header(new_header)
         return recovery
 
@@ -271,17 +377,7 @@ class DbPersistenceMixin(DbBase):
         и паролем, и recovery-кодом."""
         if not self.encrypted or self._header is None:
             return False
-        try:
-            if is_recovery:
-                cs._unwrap(self._header["wrap_rec"],
-                           cs.normalize_recovery_code(secret),
-                           self._header["salt_rec"], self._header["params"])
-            else:
-                cs._unwrap(self._header["wrap_pw"], secret,
-                           self._header["salt_pw"], self._header["params"])
-            return True
-        except cs.WrongPassword:
-            return False
+        return cs.check_secret(self._header, secret, is_recovery)
 
     def verify_password(self, password: str) -> bool:
         """Обратная совместимость: проверка только мастер-пароля."""

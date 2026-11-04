@@ -5,272 +5,24 @@ TreeMixin: построение/перестроение дерева, сорт�
 меню и операции над папками/сервисами/аккаунтами (создание, переименование,
 перемещение, удаление). Состояние разделяется с окном через self — поведение
 идентично прежнему. Подмешивается в MainWindow перед QMainWindow."""
-from PySide6.QtWidgets import (QTreeWidget, QTreeWidgetItem, QMenu,
-                               QAbstractItemView)
-from PySide6.QtCore import Qt, Signal, QItemSelectionModel
-from PySide6.QtGui import QBrush, QColor, QCursor, QDrag, QPainter, QPen
+from PySide6.QtWidgets import QTreeWidgetItem, QAbstractItemView, QMenu
+from PySide6.QtCore import Qt, QSignalBlocker, QSize, QTimer
+from PySide6.QtGui import QBrush, QColor, QIcon, QPainter, QPen
 
 from hranilka.core import domain
 from hranilka.core.nodetypes import (FOLDER, SERVICE, ACCOUNT, SERVER,
                                      LEAF_TYPES, FIN_LEAF_TYPES)
 from hranilka.core.fin_domain import EXPIRY_WARN_DAYS
 from hranilka.core.fin_types import FIN_TYPES
-from hranilka.ui import theme
+from hranilka.ui import theme, pixel_icons
 from hranilka.core import util
 from hranilka.data.database import StaleSessionError
 from hranilka.data.models import AccountData
+from hranilka.ui.tree_dnd import AccountTree  # noqa: F401  (реэкспорт)
+from hranilka.ui.tree_menu import TreeMenuMixin
 
 
-class AccountTree(QTreeWidget):
-    """Дерево с безопасным переупорядочиванием внутри логической группы.
-
-    Вся верхняя половина строки означает вставку перед ней, нижняя — после.
-    Перенос между родителями остаётся в контекстном меню. Карты и кошельки
-    считаются одной группой, потому что хранят общий ``sort_order``.
-    """
-
-    FIN_GROUP = "fin_items"
-
-    # Параметры: элемент-родитель (или None для корня) и логическая группа.
-    order_changed = Signal(object, str)
-    drop_rejected = Signal()
-    drop_hint_changed = Signal(str)
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._drop_line_y = None
-        self._drop_hint = ""
-        self._drop_indicator_color = self.palette().text().color()
-
-    @staticmethod
-    def _item_type(item):
-        if item is None:
-            return None
-        data = item.data(0, Qt.UserRole)
-        return data["type"] if data else None
-
-    @classmethod
-    def item_order_group(cls, item):
-        """Группа с единым ``sort_order`` в БД."""
-        item_type = cls._item_type(item)
-        return cls.FIN_GROUP if item_type in FIN_LEAF_TYPES else item_type
-
-    @staticmethod
-    def _favorite_bucket(item):
-        data = item.data(0, Qt.UserRole) if item is not None else None
-        return bool(data and data.get("is_favorite"))
-
-    @staticmethod
-    def _item_name(item):
-        data = item.data(0, Qt.UserRole) if item is not None else None
-        return str(data.get("name", "")) if data else ""
-
-    def set_drop_indicator_color(self, color):
-        """Подстроить индикатор вставки под текущую тему."""
-        themed = QColor(color)
-        self._drop_indicator_color = (
-            themed if themed.isValid() else self.palette().text().color())
-        if self._drop_line_y is not None:
-            self.viewport().update()
-
-    def clear_drop_feedback(self):
-        """Убрать линию вставки и подсказку после завершения drag."""
-        had_line = self._drop_line_y is not None
-        self._drop_line_y = None
-        if had_line:
-            self.viewport().update()
-        if self._drop_hint:
-            self._drop_hint = ""
-            self.drop_hint_changed.emit("")
-
-    def _set_drop_feedback(self, plan, hint):
-        line_y = None
-        if plan is not None:
-            _sources, _parent, _group, target, before = plan
-            rect = self.visualItemRect(target)
-            if rect.isValid():
-                line_y = rect.top() if before else rect.bottom() + 1
-                line_y = max(1, min(line_y, self.viewport().height() - 2))
-        if line_y != self._drop_line_y:
-            self._drop_line_y = line_y
-            self.viewport().update()
-        if hint != self._drop_hint:
-            self._drop_hint = hint
-            self.drop_hint_changed.emit(hint)
-
-    def _validated_sources(self):
-        sources = self.selectedItems()
-        if not sources:
-            return None, "Нет выбранных элементов"
-        parents = {item.parent() for item in sources}
-        groups = {self.item_order_group(item) for item in sources}
-        favorite_buckets = {self._favorite_bucket(item) for item in sources}
-        if len(parents) != 1 or len(groups) != 1 or len(favorite_buckets) != 1:
-            return None, "Выберите элементы одной группы для перетаскивания"
-        group = next(iter(groups))
-        if group is None:
-            return None, "Этот элемент нельзя переупорядочить"
-        return (sources, next(iter(parents)), group,
-                next(iter(favorite_buckets))), ""
-
-    def _drop_plan(self, point):
-        """Рассчитать вставку по половине полной строки под курсором."""
-        source_data, reason = self._validated_sources()
-        if source_data is None:
-            return None, reason
-        sources, source_parent, group, favorite_bucket = source_data
-
-        target = self.itemAt(point)
-        if target is None:
-            return None, "Наведите указатель на строку целевой группы"
-        if target in sources:
-            return None, "Выберите соседнюю строку как место вставки"
-        if target.parent() is not source_parent or self.item_order_group(target) != group:
-            return None, "Порядок можно менять только внутри одной группы"
-        if self._favorite_bucket(target) != favorite_bucket:
-            return None, "Избранные и обычные элементы упорядочиваются отдельно"
-
-        rect = self.visualItemRect(target)
-        if not rect.isValid():
-            return None, "Наведите указатель на видимую строку"
-        before = point.y() < rect.top() + rect.height() / 2
-        side = "перед" if before else "после"
-        hint = f"Вставить {side} «{self._item_name(target)}»"
-        return (sources, source_parent, group, target, before), hint
-
-    @staticmethod
-    def _siblings(parent, tree):
-        if parent is None:
-            return [tree.topLevelItem(i)
-                    for i in range(tree.topLevelItemCount())]
-        return [parent.child(i) for i in range(parent.childCount())]
-
-    def _apply_reorder(self, plan):
-        """Переставить элементы без стандартного Qt InternalMove.
-
-        Базовая реализация Qt удаляет исходные строки после MoveAction. Здесь
-        drop уже выполнен вручную, поэтому drag также запускается нашим
-        ``startDrag`` и повторного удаления нет.
-        """
-        sources, parent, _group, target, before = plan
-        siblings = self._siblings(parent, self)
-        ordered_sources = [item for item in siblings if item in sources]
-        remaining = [item for item in siblings if item not in sources]
-        if not ordered_sources or target not in remaining:
-            return False
-
-        insert_at = remaining.index(target) + (0 if before else 1)
-        new_order = (remaining[:insert_at] + ordered_sources
-                     + remaining[insert_at:])
-        if new_order == siblings:
-            return False
-
-        current = self.currentItem()
-        was_blocked = self.blockSignals(True)
-        try:
-            for item in ordered_sources:
-                if parent is None:
-                    self.takeTopLevelItem(self.indexOfTopLevelItem(item))
-                else:
-                    parent.takeChild(parent.indexOfChild(item))
-            for offset, item in enumerate(ordered_sources):
-                if parent is None:
-                    self.insertTopLevelItem(insert_at + offset, item)
-                else:
-                    parent.insertChild(insert_at + offset, item)
-            for item in ordered_sources:
-                item.setSelected(True)
-            if current is not None:
-                self.setCurrentItem(
-                    current, 0, QItemSelectionModel.SelectionFlag.NoUpdate)
-        finally:
-            self.blockSignals(was_blocked)
-        self.viewport().update()
-        return True
-
-    def startDrag(self, _supported_actions):
-        """Запустить Move drag без автоматического удаления строк Qt."""
-        source_data, _reason = self._validated_sources()
-        if source_data is None:
-            self.drop_rejected.emit()
-            return
-        sources, _parent, _group, _favorite_bucket = source_data
-        indexes = [self.indexFromItem(item, 0) for item in sources]
-        mime_data = self.model().mimeData(indexes)
-        if mime_data is None:
-            return
-
-        drag = QDrag(self)
-        drag.setMimeData(mime_data)
-        preview_item = self.currentItem()
-        if preview_item not in sources:
-            preview_item = sources[0]
-        rect = self.visualItemRect(preview_item).intersected(
-            self.viewport().rect())
-        if rect.isValid() and not rect.isEmpty():
-            drag.setPixmap(self.viewport().grab(rect))
-            hotspot = self.viewport().mapFromGlobal(QCursor.pos()) - rect.topLeft()
-            drag.setHotSpot(hotspot)
-        try:
-            drag.exec(Qt.DropAction.MoveAction, Qt.DropAction.MoveAction)
-        finally:
-            self.clear_drop_feedback()
-
-    def dragEnterEvent(self, event):
-        if event.source() is self:
-            event.setDropAction(Qt.DropAction.MoveAction)
-            event.accept()
-        else:
-            event.ignore()
-
-    def dragMoveEvent(self, event):
-        # QAbstractItemView сохраняет штатную прокрутку у верхней/нижней границы.
-        super().dragMoveEvent(event)
-        if event.source() is not self:
-            self.clear_drop_feedback()
-            event.ignore()
-            return
-        plan, hint = self._drop_plan(event.position().toPoint())
-        self._set_drop_feedback(plan, hint)
-        if plan is None:
-            event.ignore()
-            return
-        event.setDropAction(Qt.DropAction.MoveAction)
-        event.accept()
-
-    def dragLeaveEvent(self, event):
-        self.clear_drop_feedback()
-        super().dragLeaveEvent(event)
-
-    def paintEvent(self, event):
-        super().paintEvent(event)
-        if self._drop_line_y is None:
-            return
-        painter = QPainter(self.viewport())
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setPen(QPen(self._drop_indicator_color, 3,
-                            Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-        painter.drawLine(3, self._drop_line_y,
-                         max(3, self.viewport().width() - 4), self._drop_line_y)
-        painter.end()
-
-    def dropEvent(self, event):
-        plan, _hint = self._drop_plan(event.position().toPoint())
-        self.clear_drop_feedback()
-        if plan is None:
-            event.ignore()
-            self.drop_rejected.emit()
-            return
-        _sources, parent, group, _target, _before = plan
-        if not self._apply_reorder(plan):
-            event.ignore()
-            return
-        event.setDropAction(Qt.DropAction.MoveAction)
-        event.accept()
-        self.order_changed.emit(parent, group)
-
-
-class TreeMixin:
+class TreeMixin(TreeMenuMixin):
     """Построение/перестроение дерева, сортировка, поиск, контекстное меню и
     операции над папками/сервисами/аккаунтами."""
 
@@ -282,10 +34,12 @@ class TreeMixin:
 
     def _node_display(self, node):
         """Текст элемента дерева с маркерами избранного, просрочки и несохранённых правок."""
-        text = self.PREFIX[node["type"]] + node["name"]
+        pixel = self._pixel_icons_on()
+        text = ("" if pixel else self.PREFIX[node["type"]]) + node["name"]
         if node["type"] in LEAF_TYPES:
             # Избранное и метка несохранённых правок — общие для всех листьев.
-            if node.get("is_favorite"):
+            # В пиксельном режиме избранное показывает иконка-звёздочка.
+            if node.get("is_favorite") and not pixel:
                 text = "* " + text
             if node["type"] == ACCOUNT:
                 days = node.get("pwd_days_left")
@@ -303,9 +57,37 @@ class TreeMixin:
                 text = "● НЕ СОХРАНЕНО ▸ " + text   # есть несохранённые правки
         return text
 
+    def _pixel_icons_on(self):
+        return self.config.get("tree_icons", "text") == "pixel"
+
+    def _node_icon(self, node):
+        """Пиксельная иконка узла (звёздочка для избранного) или пустая."""
+        if not self._pixel_icons_on():
+            return QIcon()
+        kind = (pixel_icons.FAVORITE
+                if node["type"] in LEAF_TYPES and node.get("is_favorite")
+                else node["type"])
+        if kind not in pixel_icons.ICON_ART:
+            return QIcon()
+        text_color = self.config.get("text_color", "#FFFFFF")
+        bg = self.config.get("tree_bg_color", "#0000AA")
+        return pixel_icons.make_icon(kind, text_color, bg,
+                                     self.tree.devicePixelRatioF())
+
+    def refresh_tree_icons(self):
+        """Перерисовать текст и иконки всех узлов (смена режима/цвета темы)."""
+        self.tree.setIconSize(QSize(pixel_icons.SIZE, pixel_icons.SIZE))
+        self.tree.setUpdatesEnabled(False)
+        try:
+            for it in self._iter_items():
+                self._apply_item_style(it, self._node(it))
+        finally:
+            self.tree.setUpdatesEnabled(True)
+
     def _apply_item_style(self, item, node):
         """Текст + визуальное выделение для листьев с несохранёнными правками."""
         item.setText(0, self._node_display(node))
+        item.setIcon(0, self._node_icon(node))
         dirty = (node["type"], node["id"]) in self._dirty_ids
         font = item.font(0)
         font.setBold(dirty)
@@ -434,7 +216,7 @@ class TreeMixin:
         пользовательских сочетаниях фона/текста.
         """
         from PySide6.QtCore import QPoint, QSize
-        from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
+        from PySide6.QtGui import QIcon, QPixmap
 
         pixmap = QPixmap(24, 24)
         pixmap.fill(Qt.transparent)
@@ -463,19 +245,75 @@ class TreeMixin:
             btn.setIconSize(QSize(24, 24))
         return icon
 
+    SEARCH_DEBOUNCE_MS = 150
+
+    def on_search_text_edited(self, text):
+        """Слот для textChanged поля поиска: debounce 150 мс (P3). Синхронный
+        вариант — on_search_changed."""
+        self._pending_search = text
+        timer = getattr(self, "_search_timer", None)
+        if timer is None:
+            timer = QTimer(self.tree)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._flush_search)
+            self._search_timer = timer
+        timer.start(self.SEARCH_DEBOUNCE_MS)
+
+    def _flush_search(self):
+        self.on_search_changed(getattr(self, "_pending_search", ""))
+
+    def _expanded_keys(self):
+        keys = set()
+        for it in self._iter_items():
+            node = self._node(it)
+            if node and it.isExpanded():
+                keys.add((node.get("type"), node.get("id")))
+        return keys
+
     def on_search_changed(self, text):
+        timer = getattr(self, "_search_timer", None)
+        if timer is not None:
+            timer.stop()              # синхронный вызов отменяет отложенный
         self.search_text = text.strip().lower()
+        snapshot = getattr(self, "_pre_search_expanded", None)
+        if self.search_text and snapshot is None:
+            # B5: запоминаем раскрытие до первого раскрытия поиском.
+            self._pre_search_expanded = self._expanded_keys()
         self._apply_filter()
+        if not self.search_text and snapshot is not None:
+            self._pre_search_expanded = None
+            self._restore_expanded(snapshot)
         self._update_dnd_mode()
         self._update_tree_toggle_btn()
 
+    def _restore_expanded(self, keys):
+        """Вернуть раскрытие папок/сервисов по снимку (type, id)."""
+        self.tree.setUpdatesEnabled(False)
+        try:
+            for it in self._iter_items():
+                node = self._node(it)
+                if node and node.get("type") in (FOLDER, SERVICE):
+                    it.setExpanded((node.get("type"), node.get("id")) in keys)
+        finally:
+            self.tree.setUpdatesEnabled(True)
+
     def _apply_filter(self):
+        self.tree.setUpdatesEnabled(False)
+        try:
+            self._apply_filter_inner()
+        finally:
+            self.tree.setUpdatesEnabled(True)
+
+    def _apply_filter_inner(self):
         text = self.search_text
 
         def visit(item):
             node = self._node(item)
             last4 = node.get("card_last4") or ""     # поиск карты по «•1234»
-            self_match = ((not text) or (text in node["name"].lower())
+            name_lower = node.get("name_lower")
+            if name_lower is None:
+                name_lower = node["name"].lower()
+            self_match = ((not text) or (text in name_lower)
                           or (text in last4))
             child_visible = False
             for i in range(item.childCount()):
@@ -495,7 +333,7 @@ class TreeMixin:
         запись выполняется фоновым воркером БД."""
         allowed_groups = {
             None: {FOLDER, SERVICE, ACCOUNT, AccountTree.FIN_GROUP, SERVER},
-            FOLDER: {SERVICE},
+            FOLDER: {SERVICE, ACCOUNT, AccountTree.FIN_GROUP, SERVER},
             SERVICE: {ACCOUNT, AccountTree.FIN_GROUP, SERVER},
         }
         parent_type = (self._node(parent_item)["type"]
@@ -564,6 +402,7 @@ class TreeMixin:
 
     def _add_tree_node(self, parent, node):
         data = {k: v for k, v in node.items() if k != "children"}
+        data["name_lower"] = str(node["name"]).lower()   # для быстрого поиска (P3)
         item = QTreeWidgetItem(parent, [""])
         item.setData(0, Qt.UserRole, data)
         item.setToolTip(0, node["name"])
@@ -587,22 +426,33 @@ class TreeMixin:
 
         Сигналы дерева блокируются, чтобы перестроение не вызывало повторную
         загрузку правой панели и логику стэша несохранённых правок."""
-        expanded = {(self._node(it)["type"], self._node(it)["id"])
-                    for it in self._iter_items() if it.isExpanded()}
+        expanded = set()
+        for it in self._iter_items():          # один проход (P2)
+            if it.isExpanded():
+                node = self._node(it)
+                expanded.add((node["type"], node["id"]))
         sel = self._node(self.tree.currentItem())
         sel_key = (sel["type"], sel["id"]) if sel else None
 
-        self.tree.blockSignals(True)
-        self.populate_tree()
-
-        for it in self._iter_items():
-            node = self._node(it)
-            if node["type"] in (FOLDER, SERVICE):
-                it.setExpanded((node["type"], node["id"]) in expanded)
-            if sel_key and (node["type"], node["id"]) == sel_key:
-                self.tree.setCurrentItem(it)
-                self.current_tree_item = it
-        self.tree.blockSignals(False)
+        blocker = QSignalBlocker(self.tree)   # B3: снимается и при исключении
+        try:
+            self.populate_tree()
+            found = None
+            for it in self._iter_items():      # второй (и последний) проход
+                node = self._node(it)
+                key = (node["type"], node["id"])
+                if node["type"] in (FOLDER, SERVICE):
+                    it.setExpanded(key in expanded)
+                if sel_key and key == sel_key:
+                    found = it
+            if found is not None:
+                self.tree.setCurrentItem(found)
+            # B4: ссылка на уничтоженный при clear() элемент не должна жить.
+            self.current_tree_item = found
+            if self.search_text:               # раскрытие совпадений поиска
+                self._apply_filter()
+        finally:
+            blocker.unblock()
         self._update_tree_toggle_btn()
 
     # ----- Точечное обновление узла (без перестройки всего дерева) -----
@@ -644,6 +494,7 @@ class TreeMixin:
             "password_changed_date": fields["password_changed_date"],
             "password_change_interval_days": fields["password_change_interval_days"],
             "pwd_days_left": new_days,
+            "name_lower": str(new_name).lower(),
         })
         item.setData(0, Qt.UserRole, node)
         item.setToolTip(0, new_name)
@@ -661,175 +512,14 @@ class TreeMixin:
         for it in self._iter_items():
             n = self._node(it)
             if n["type"] == node_type and n["id"] == node_id:
+                # Лист/сервис внутри свёрнутой папки/сервиса: раскрываем
+                # предков, иначе выбранный узел остаётся невидимым.
+                parent = it.parent()
+                while parent is not None:
+                    parent.setExpanded(True)
+                    parent = parent.parent()
                 self.tree.setCurrentItem(it)
                 return
-
-    # ----- Контекстное меню -----
-
-    def show_tree_context_menu(self, pos):
-        item = self.tree.itemAt(pos)
-        if not item:
-            return
-        selected = self.tree.selectedItems()
-        if item not in selected:
-            self.tree.setCurrentItem(item)
-            selected = [item]
-        nodes = [self._node(i) for i in selected]
-        types = {n["type"] for n in nodes}
-        menu = QMenu(self)
-
-        if len(selected) == 1:
-            node = nodes[0]
-            t = node["type"]
-            if t == ACCOUNT:
-                self._add_move_to_service_menu(menu, selected)
-                fav = node.get("is_favorite")
-                menu.addAction("Убрать из избранного" if fav else "В избранное",
-                               lambda: self._set_favorite(selected, not fav))
-                menu.addSeparator()
-                menu.addAction("Экспорт…", lambda: self.open_export(node))
-                menu.addAction("Удалить", lambda: self.delete_items(selected))
-            elif t in FIN_LEAF_TYPES:
-                self._add_move_fin_to_service_menu(menu, selected)
-                fav = node.get("is_favorite")
-                menu.addAction("Убрать из избранного" if fav else "В избранное",
-                               lambda: self._set_fin_favorite(selected, not fav))
-                menu.addSeparator()
-                menu.addAction("Экспорт…", lambda: self.open_export(node))
-                menu.addAction("Удалить", lambda: self.delete_items(selected))
-            elif t == SERVER:
-                # Те же пункты, что у фин-листа, плюс переименование (правка
-                # имени доступна и отсюда, независимо от карточки).
-                self._add_move_server_to_service_menu(menu, selected)
-                fav = node.get("is_favorite")
-                menu.addAction("Убрать из избранного" if fav else "В избранное",
-                               lambda: self._set_server_favorite(selected, not fav))
-                menu.addSeparator()
-                menu.addAction("Экспорт…", lambda: self.open_export(node))
-                menu.addAction("Переименовать", lambda: self.rename_item(item))
-                menu.addAction("Удалить", lambda: self.delete_items(selected))
-            elif t == SERVICE:
-                self._add_create_record_menu(menu)
-                menu.addAction("Переименовать", lambda: self.rename_item(item))
-                self._add_move_to_folder_menu(menu, selected)
-                self._add_delete_menu(menu, selected, with_keep=True)
-                menu.addSeparator()
-                menu.addAction("Экспорт…", lambda: self.open_export(node))
-                menu.addAction("Раскрыть всё", lambda: self.set_expanded(item, True))
-                menu.addAction("Свернуть всё", lambda: self.set_expanded(item, False))
-            elif t == FOLDER:
-                self._add_create_record_menu(menu)
-                menu.addAction("Переименовать", lambda: self.rename_item(item))
-                self._add_delete_menu(menu, selected, with_keep=True)
-                menu.addSeparator()
-                menu.addAction("Экспорт…", lambda: self.open_export(node))
-                menu.addAction("Раскрыть всё", lambda: self.set_expanded(item, True))
-                menu.addAction("Свернуть всё", lambda: self.set_expanded(item, False))
-        else:
-            # Множественный выбор
-            menu.addAction("Экспорт выделенного…",
-                           lambda: self.open_selected_export(nodes))
-            menu.addSeparator()
-            if types == {SERVICE}:
-                self._add_move_to_folder_menu(menu, selected)
-                self._add_delete_menu(menu, selected, with_keep=True)
-            elif types == {ACCOUNT}:
-                self._add_move_to_service_menu(menu, selected)
-                menu.addAction("В избранное", lambda: self._set_favorite(selected, True))
-                menu.addAction("Убрать из избранного", lambda: self._set_favorite(selected, False))
-                menu.addSeparator()
-                menu.addAction("Удалить", lambda: self.delete_items(selected))
-            elif types == {SERVER}:
-                self._add_move_server_to_service_menu(menu, selected)
-                menu.addAction("В избранное", lambda: self._set_server_favorite(selected, True))
-                menu.addAction("Убрать из избранного",
-                               lambda: self._set_server_favorite(selected, False))
-                menu.addSeparator()
-                menu.addAction("Удалить", lambda: self.delete_items(selected))
-            else:
-                menu.addAction("Удалить", lambda: self.delete_items(selected))
-
-        menu.exec(self.tree.viewport().mapToGlobal(pos))
-
-    def _add_delete_menu(self, menu, selected, with_keep):
-        menu.addSeparator()
-        if with_keep:
-            sub = menu.addMenu("Удалить")
-            sub.addAction("С сохранением содержимого",
-                          lambda: self.delete_items(selected, keep=True))
-            sub.addAction("Без сохранения (полностью)",
-                          lambda: self.delete_items(selected, keep=False))
-        else:
-            menu.addAction("Удалить", lambda: self.delete_items(selected))
-
-    def _add_move_to_folder_menu(self, menu, selected):
-        sub = menu.addMenu("Переместить в папку")
-        sub.addAction("Новая папка…", lambda: self._move_services_new_folder(selected))
-        folders = self.db.get_folders()
-        if folders:
-            sub.addSeparator()
-            for f in folders:
-                sub.addAction(f["name"],
-                              lambda checked=False, fid=f["id"]: self._move_services(selected, fid))
-        sub.addSeparator()
-        sub.addAction("Вынести из папки", lambda: self._move_services(selected, None))
-
-    def _add_move_to_service_menu(self, menu, selected):
-        sub = menu.addMenu("Переместить в сервис")
-        sub.addAction("Новый сервис…", lambda: self._move_accounts_new_service(selected))
-        # Текущие сервисы выбранных аккаунтов (по их родителю в дереве): сервис,
-        # в котором уже находятся ВСЕ выбранные, не предлагаем (перенос — no-op).
-        current = set()
-        for it in selected:
-            parent = it.parent()
-            pnode = self._node(parent) if parent else None
-            current.add(pnode["id"] if pnode and pnode["type"] == SERVICE else None)
-        services = [s for s in self.db.get_services() if current != {s["id"]}]
-        if services:
-            sub.addSeparator()
-            for s in services:
-                sub.addAction(s["name"],
-                              lambda checked=False, sid=s["id"]: self._move_accounts(selected, sid))
-        sub.addSeparator()
-        sub.addAction("Сделать свободным (без сервиса)",
-                      lambda: self._move_accounts(selected, None))
-
-    def _add_create_record_menu(self, menu):
-        """Подменю создания записи в выбранном контейнере: аккаунт + типы
-        FIN_TYPES (пункты строятся из реестра) + сервер. Фин-типы предлагаются
-        только при включённой опции «Показывать фин. инструменты», пункт
-        «Сервер» — только при «Показывать серверы». Возвращает подменю."""
-        sub = menu.addMenu("Создать запись")
-        sub.addAction("(i) Аккаунт", self.add_account)
-        if self.config.get("show_fin_instruments", False):
-            for type_id, spec in FIN_TYPES.items():
-                sub.addAction(spec.tree_prefix + spec.title,
-                              lambda checked=False, tid=type_id: self.add_fin_record(tid))
-        if self.config.get("show_servers", False):
-            sub.addAction("[#] Сервер", self.add_server)
-        return sub
-
-    def _add_move_fin_to_service_menu(self, menu, selected):
-        """Перемещение фин-записей между сервисами (по образцу аккаунтного меню,
-        но без создания нового сервиса — фин-записи туда переносят реже)."""
-        sub = menu.addMenu("Переместить в сервис")
-        for s in self.db.get_services():
-            sub.addAction(s["name"],
-                          lambda checked=False, sid=s["id"]: self._move_fin_items(selected, sid))
-        sub.addSeparator()
-        sub.addAction("Сделать свободной (без сервиса)",
-                      lambda: self._move_fin_items(selected, None))
-
-    def _add_move_server_to_service_menu(self, menu, selected):
-        """Перемещение серверов между сервисами (по образцу
-        _add_move_fin_to_service_menu — без создания нового сервиса)."""
-        sub = menu.addMenu("Переместить в сервис")
-        for s in self.db.get_services():
-            sub.addAction(s["name"],
-                          lambda checked=False, sid=s["id"]: self._move_servers(selected, sid))
-        sub.addSeparator()
-        sub.addAction("Сделать свободным (без сервиса)",
-                      lambda: self._move_servers(selected, None))
 
     # ----- Операции меню -----
 
@@ -957,48 +647,57 @@ class TreeMixin:
         if status:
             self.statusBar().showMessage(status, 2000)
 
-    def _set_favorite(self, selected, value):
-        ids = [node["id"] for node in (self._node(i) for i in selected)
-               if node["type"] == ACCOUNT]
+    def _make_menu(self):
+        return QMenu(self)
+
+    # Таблица «вид узла -> типы узлов и методы БД». Методы берутся из self.db в
+    # момент вызова (getattr), одна транзакция БД на пакетную операцию (M7-04).
+    _OP_KINDS = {
+        "account": ((ACCOUNT,), "set_favorites", "move_accounts"),
+        "fin": (tuple(FIN_LEAF_TYPES), "set_fin_favorites", "move_fin_items"),
+        "server": ((SERVER,), "set_server_favorites", "move_servers"),
+        "service": ((SERVICE,), None, "move_services"),
+    }
+
+    def _selected_ids(self, kind, selected):
+        """id выбранных узлов нужного вида (account/fin/server/service)."""
+        types = self._OP_KINDS[kind][0]
+        return [n["id"] for n in (self._node(i) for i in selected)
+                if n["type"] in types]
+
+    def set_favorite_selected(self, kind, selected, value):
+        method = getattr(self.db, self._OP_KINDS[kind][1])
         util.fire(self._run_then_reload(
-            self.db.set_favorites, (ids, value), "Не удалось выполнить операцию"))
+            method, (self._selected_ids(kind, selected), value),
+            "Не удалось выполнить операцию"))
+
+    def move_selected(self, kind, selected, target_id):
+        method = getattr(self.db, self._OP_KINDS[kind][2])
+        util.fire(self._run_then_reload(
+            method, (self._selected_ids(kind, selected), target_id),
+            "Не удалось переместить", status="Перемещено"))
+
+    # Тонкие обёртки со старыми именами (используются меню и внешним кодом).
+    def _set_favorite(self, selected, value):
+        self.set_favorite_selected("account", selected, value)
 
     def _fin_ids(self, selected):
-        """id выбранных фин-записей (карты/кошельки)."""
-        return [n["id"] for n in (self._node(i) for i in selected)
-                if n["type"] in FIN_LEAF_TYPES]
+        return self._selected_ids("fin", selected)
 
     def _set_fin_favorite(self, selected, value):
-        ids = self._fin_ids(selected)
-        # Пакетный метод — ОДНА транзакция БД (M7-04), как у аккаунтов
-        # (_set_favorite/set_favorites): раньше это был цикл с транзакцией на
-        # запись, и сбой середины списка оставлял половину выбора без отката.
-        util.fire(self._run_then_reload(
-            self.db.set_fin_favorites, (ids, value), "Не удалось выполнить операцию"))
+        self.set_favorite_selected("fin", selected, value)
 
     def _move_fin_items(self, selected, service_id):
-        ids = self._fin_ids(selected)
-        util.fire(self._run_then_reload(
-            self.db.move_fin_items, (ids, service_id),
-            "Не удалось переместить", status="Перемещено"))
+        self.move_selected("fin", selected, service_id)
 
     def _server_ids(self, selected):
-        """id выбранных серверов."""
-        return [n["id"] for n in (self._node(i) for i in selected)
-                if n["type"] == SERVER]
+        return self._selected_ids("server", selected)
 
     def _set_server_favorite(self, selected, value):
-        ids = self._server_ids(selected)
-        # Пакетный метод — ОДНА транзакция БД (M7-04), по образцу
-        # _set_fin_favorite/set_fin_favorites.
-        util.fire(self._run_then_reload(
-            self.db.set_server_favorites, (ids, value), "Не удалось выполнить операцию"))
+        self.set_favorite_selected("server", selected, value)
 
     def _move_servers(self, selected, service_id):
-        ids = self._server_ids(selected)
-        util.fire(self._run_then_reload(
-            self.db.move_servers, (ids, service_id),
-            "Не удалось переместить", status="Перемещено"))
+        self.move_selected("server", selected, service_id)
 
     def _find_leaf_item(self, node_type, node_id):
         """Элемент дерева листа (аккаунт/карта/кошелёк) по (типу, id) или None."""
@@ -1008,12 +707,38 @@ class TreeMixin:
                 return it
         return None
 
+    def _leaf_keys(self, selected):
+        """[(type, id)] выбранных листьев (аккаунт/карта/кошелёк/сервер)."""
+        return [(n["type"], n["id"]) for n in (self._node(i) for i in selected)
+                if n and n["type"] in LEAF_TYPES]
+
+    def _move_leaves_to_folder(self, selected, folder_id):
+        """Перенос выбранных листьев прямо в папку (folder_id=None - в корень)
+        ОДНОЙ транзакцией БД. Целевая папка раскрывается после перестроения."""
+        keys = self._leaf_keys(selected)
+        if not keys:
+            return
+        util.fire(self._move_leaves_async(keys, folder_id))
+
+    async def _move_leaves_async(self, keys, folder_id):
+        await self._run_then_reload(
+            self.db.move_leaves, (keys, None, folder_id),
+            "Не удалось переместить", status="Перемещено")
+        if folder_id is not None:
+            for it in self._iter_items():
+                n = self._node(it)
+                if n and n["type"] == FOLDER and n["id"] == folder_id:
+                    it.setExpanded(True)
+                    break
+
+    def on_tree_reparent(self, items, target_item):
+        """Drop листьев на папку (сигнал AccountTree.reparent_requested)."""
+        target = self._node(target_item)
+        if target and target["type"] == FOLDER:
+            self._move_leaves_to_folder(items, target["id"])
+
     def _move_services(self, selected, folder_id):
-        ids = [node["id"] for node in (self._node(i) for i in selected)
-               if node["type"] == SERVICE]
-        util.fire(self._run_then_reload(
-            self.db.move_services, (ids, folder_id),
-            "Не удалось переместить", status="Перемещено"))
+        self.move_selected("service", selected, folder_id)
 
     def _move_services_new_folder(self, selected):
         name, ok = theme.themed_input(self.config, self, "Новая папка", "Название:")
@@ -1026,11 +751,7 @@ class TreeMixin:
                 "Не удалось переместить в папку", status="Перемещено"))
 
     def _move_accounts(self, selected, service_id):
-        ids = [node["id"] for node in (self._node(i) for i in selected)
-               if node["type"] == ACCOUNT]
-        util.fire(self._run_then_reload(
-            self.db.move_accounts, (ids, service_id),
-            "Не удалось переместить", status="Перемещено"))
+        self.move_selected("account", selected, service_id)
 
     def _move_accounts_new_service(self, selected):
         name, ok = theme.themed_input(self.config, self, "Новый сервис", "Название:")
@@ -1080,19 +801,27 @@ class TreeMixin:
         self._reload_tree()
         self._select_node(node_type, new_id)
 
-    def add_account(self):
+    def _new_leaf_parent(self):
+        """Родитель нового листа по текущему выбору: (service_id, folder_id).
+        Сервис - в сервис; папка - прямо в папку; лист - к тому же родителю
+        (сервис/папка/корень); ничего не выбрано - в корень (None, None)."""
         current = self.tree.currentItem()
         node = self._node(current)
         if node and node["type"] == SERVICE:
-            service_id = node["id"]
-        elif node and node["type"] == ACCOUNT:
-            # Аккаунт под сервисом → тот же сервис; свободный аккаунт → корень.
+            return node["id"], None
+        if node and node["type"] == FOLDER:
+            return None, node["id"]
+        if node and node["type"] in LEAF_TYPES:
             parent = current.parent()
             pnode = self._node(parent) if parent else None
-            service_id = pnode["id"] if pnode and pnode["type"] == SERVICE else None
-        else:
-            # Папка или ничего не выбрано → свободный аккаунт (в корне).
-            service_id = None
+            if pnode and pnode["type"] == SERVICE:
+                return pnode["id"], None
+            if pnode and pnode["type"] == FOLDER:
+                return None, pnode["id"]
+        return None, None
+
+    def add_account(self):
+        service_id, folder_id = self._new_leaf_parent()
 
         name, ok = theme.themed_input(self.config, self, "Новый аккаунт", "Название:")
         name = name.strip()
@@ -1101,16 +830,17 @@ class TreeMixin:
             data.name = name
             # add_account + save_account (поля по умолчанию) + выбор узла — в одной
             # coroutine: save зависит от id, а выбор — от завершённой записи (H-8).
-            util.fire(self._add_account_async(service_id, name, data.to_storage()))
+            util.fire(self._add_account_async(
+                service_id, name, data.to_storage(), folder_id))
 
-    async def _add_account_async(self, service_id, name, storage):
+    async def _add_account_async(self, service_id, name, storage, folder_id=None):
         session = self.db.current_session()
         # Создание аккаунта и запись его карточки — ОДНА транзакция БД (M7-04):
         # раньше два коммита оставляли полупустой аккаунт при сбое второго.
         try:
             account_id = await self.db.run_async(
                 self.db.add_account_with_card, service_id, name, storage,
-                _session=session)
+                folder_id, _session=session)
         except StaleSessionError:
             return
         except Exception as e:                       # noqa: BLE001
@@ -1131,30 +861,22 @@ class TreeMixin:
         spec = FIN_TYPES.get(type_id)
         if spec is None:
             return
-        current = self.tree.currentItem()
-        node = self._node(current)
-        if node and node["type"] == SERVICE:
-            service_id = node["id"]
-        elif node and node["type"] in LEAF_TYPES:
-            # Лист под сервисом → тот же сервис; свободный → корень.
-            parent = current.parent()
-            pnode = self._node(parent) if parent else None
-            service_id = pnode["id"] if pnode and pnode["type"] == SERVICE else None
-        else:
-            # Папка или ничего не выбрано → свободная запись (в корне).
-            service_id = None
+        service_id, folder_id = self._new_leaf_parent()
 
         name, ok = theme.themed_input(
             self.config, self, spec.create_title, "Название:")
         name = name.strip()
         if ok and name:
-            util.fire(self._add_fin_record_async(service_id, type_id, name))
+            util.fire(self._add_fin_record_async(
+                service_id, type_id, name, folder_id))
 
-    async def _add_fin_record_async(self, service_id, type_id, name):
+    async def _add_fin_record_async(self, service_id, type_id, name,
+                                    folder_id=None):
         session = self.db.current_session()
         try:
             item_id = await self.db.run_async(
-                self.db.add_fin_item, service_id, type_id, name, _session=session)
+                self.db.add_fin_item, service_id, type_id, name, folder_id,
+                _session=session)
         except StaleSessionError:
             return
         except Exception as e:                       # noqa: BLE001
@@ -1172,30 +894,20 @@ class TreeMixin:
         """Создание VPS-сервера (docs/ТЗ_VPS_Серверы.md §4). Флоу как у
         аккаунта/фин-записи: контейнер (выбранный сервис или корень) → имя →
         пустая запись в БД → выбор узла → карточка сразу в правке."""
-        current = self.tree.currentItem()
-        node = self._node(current)
-        if node and node["type"] == SERVICE:
-            service_id = node["id"]
-        elif node and node["type"] in LEAF_TYPES:
-            # Лист под сервисом → тот же сервис; свободный → корень.
-            parent = current.parent()
-            pnode = self._node(parent) if parent else None
-            service_id = pnode["id"] if pnode and pnode["type"] == SERVICE else None
-        else:
-            # Папка или ничего не выбрано → свободный сервер (в корне).
-            service_id = None
+        service_id, folder_id = self._new_leaf_parent()
 
         name, ok = theme.themed_input(
             self.config, self, "Новый сервер", "Название:")
         name = name.strip()
         if ok and name:
-            util.fire(self._add_server_async(service_id, name))
+            util.fire(self._add_server_async(service_id, name, folder_id))
 
-    async def _add_server_async(self, service_id, name):
+    async def _add_server_async(self, service_id, name, folder_id=None):
         session = self.db.current_session()
         try:
             server_id = await self.db.run_async(
-                self.db.add_server, service_id, name, _session=session)
+                self.db.add_server, service_id, name, folder_id,
+                _session=session)
         except StaleSessionError:
             return
         except Exception as e:                       # noqa: BLE001

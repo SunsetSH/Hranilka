@@ -396,7 +396,7 @@ def test_move_servers_batch(db):
 
 def test_counters(db):
     sid = db.add_service("S")
-    s1 = db.add_server(sid, "A")
+    db.add_server(sid, "A")
     s2 = db.add_server(sid, "B")
     db.move_server_to_bin(s2)
     assert db.count_servers() == 2

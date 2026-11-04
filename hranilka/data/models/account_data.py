@@ -9,6 +9,8 @@ import platform
 from datetime import date, datetime, time
 from typing import Any, Optional
 
+from hranilka.data.models.common import gallery_to_storage
+
 _DT_FORMAT = "%Y-%m-%d %H:%M:%S"
 _DATE_FORMAT = "%Y-%m-%d"
 
@@ -121,9 +123,7 @@ class AccountData:
             # blob_size переносим сквозь кеш правок (M7-03): у ленивых картинок
             # (data=None) он несёт размер BLOB для учёта в лимите общего объёма,
             # иначе после стэша ленивая картинка «весила» бы ноль.
-            "gallery": [{"data": g.get("data"), "desc": g.get("desc", ""),
-                         "image_id": g.get("image_id"),
-                         "blob_size": g.get("blob_size")} for g in self.gallery],
+            "gallery": gallery_to_storage(self.gallery),
         }
 
     @classmethod

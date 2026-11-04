@@ -8,6 +8,9 @@ from hranilka.data.database.state import DbBase
 # раннего сообщения, но проверка здесь окончательная: осиротевший импорт или
 # другой вызов слоя данных не могут обойти ограничение.
 GALLERY_TOTAL_BYTES_LIMIT = 500 * 1024 * 1024
+# Единый источник лимитов на файл и на владельца (раньше только в UI).
+GALLERY_MAX_IMAGE_BYTES = 15 * 1024 * 1024
+GALLERY_MAX_IMAGES_PER_OWNER = 50
 
 
 class DbGalleryOpsMixin(DbBase):
@@ -173,6 +176,22 @@ class DbGalleryOpsMixin(DbBase):
         BLOB. Эта проверка защищает и обычный UI-путь, и осиротевшие загрузки.
         """
         existing_ids = set(existing_sizes)
+        # Лимит числа: считаем только элементы, у которых останется строка
+        # (с данными или с существующим id). Уже сохранённые старые галереи
+        # сверх лимита не ломаются, пока их не увеличивают.
+        final_count = sum(
+            1 for g in items
+            if g.get("data") is not None or g.get("image_id") in existing_ids)
+        if (final_count > GALLERY_MAX_IMAGES_PER_OWNER
+                and final_count > len(existing_ids)):
+            raise ValueError(
+                f"Превышен лимит изображений: {GALLERY_MAX_IMAGES_PER_OWNER} "
+                "на карточку.")
+        for g in items:
+            data = g.get("data")
+            if data is not None and len(data) > GALLERY_MAX_IMAGE_BYTES:
+                mb = GALLERY_MAX_IMAGE_BYTES // (1024 * 1024)
+                raise ValueError(f"Изображение больше {mb} МБ.")
         kept_ids = {g.get("image_id") for g in items
                     if g.get("image_id") in existing_ids}
         replacement_sizes = {}

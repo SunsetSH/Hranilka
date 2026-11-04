@@ -12,9 +12,9 @@ from hranilka.data.errors import FutureSchemaError
 def test_registry_covers_legacy_base_plus_one():
     """Реестр покрывает ровно версии LEGACY_BASE+1..SCHEMA_VERSION.
     Зарегистрированы шаги m009 (fin-таблицы), m010 (чистка bank_account),
-    m011 (чистка ewallet) и m012 (VPS-серверы)."""
+    m011 (чистка ewallet), m012 (VPS-серверы) и m013 (folder_id у листьев)."""
     assert migrations.LEGACY_BASE == 8
-    assert SCHEMA_VERSION == 12
+    assert SCHEMA_VERSION == 13
     assert set(migrations.MIGRATIONS) == set(
         range(migrations.LEGACY_BASE + 1, SCHEMA_VERSION + 1))
 
@@ -174,7 +174,7 @@ def test_v11_db_migrates_to_v12_creates_server_tables(tmp_path, monkeypatch):
 
     try:
         d.create_tables()
-        assert d.get_schema_version() == SCHEMA_VERSION == 12
+        assert d.get_schema_version() == SCHEMA_VERSION == 13
         assert {"servers", "server_links", "server_gallery"} <= d._table_names()
         d.cursor.execute("SELECT account_name, login, password FROM accounts")
         row = d.cursor.fetchone()

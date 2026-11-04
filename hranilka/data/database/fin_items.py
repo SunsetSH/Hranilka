@@ -19,21 +19,24 @@ class DbFinItemsMixin(DbBase):
     # ----- Создание -----
 
     def _add_fin_item_rows(self, service_id: Optional[int], item_type: str,
-                           name: str) -> int:
+                           name: str, folder_id: Optional[int] = None) -> int:
         """Тело add_fin_item без транзакции/dirty (для составных методов).
         created_at — строкой формата SQLite CURRENT_TIMESTAMP (как в accounts)."""
+        self._check_single_parent(service_id, folder_id)
         self.cursor.execute(
-            "INSERT INTO fin_items (service_id, item_type, name, data, created_at) "
-            "VALUES (?, ?, ?, '{}', ?)",
-            (service_id, item_type, name,
+            "INSERT INTO fin_items (service_id, folder_id, item_type, name, data, "
+            "created_at) VALUES (?, ?, ?, ?, '{}', ?)",
+            (service_id, folder_id, item_type, name,
              datetime.now().isoformat(" ", "seconds")))
         return int(self.cursor.lastrowid)
 
     def add_fin_item(self, service_id: Optional[int], item_type: str,
-                     name: str) -> int:
-        """Создаёт пустую финансовую запись, возвращает её id."""
+                     name: str, folder_id: Optional[int] = None) -> int:
+        """Создаёт пустую финансовую запись (в сервисе, папке либо в корне),
+        возвращает её id."""
         with self.conn:
-            new_id = self._add_fin_item_rows(service_id, item_type, name)
+            new_id = self._add_fin_item_rows(service_id, item_type, name,
+                                             folder_id)
         self._mark_dirty()
         return new_id
 
@@ -256,28 +259,28 @@ class DbFinItemsMixin(DbBase):
 
     # ----- Перемещение, избранное, порядок -----
 
-    def _move_fin_item_rows(self, item_id: int,
-                            service_id: Optional[int]) -> None:
-        """Тело move_fin_item без транзакции/dirty (в конец списка сервиса)."""
-        order = self._next_sort_order("fin_items", "service_id", service_id)
-        self.cursor.execute(
-            "UPDATE fin_items SET service_id = ?, sort_order = ? WHERE id = ?",
-            (service_id, order, item_id))
+    def _move_fin_item_rows(self, item_id: int, service_id: Optional[int],
+                            folder_id: Optional[int] = None) -> None:
+        """Тело move_fin_item без транзакции/dirty (в конец списка контейнера)."""
+        self._move_leaf_rows("fin_items", item_id, service_id, folder_id)
 
-    def move_fin_item(self, item_id: int, service_id: Optional[int]) -> None:
-        """Переносит запись в сервис (service_id=None — свободная), в конец списка."""
+    def move_fin_item(self, item_id: int, service_id: Optional[int],
+                      folder_id: Optional[int] = None) -> None:
+        """Переносит запись в сервис либо папку (оба None — свободная, в
+        корень), в конец списка."""
         with self.conn:
-            self._move_fin_item_rows(item_id, service_id)
+            self._move_fin_item_rows(item_id, service_id, folder_id)
         self._mark_dirty()
 
     def move_fin_items(self, item_ids: list[int],
-                       service_id: Optional[int]) -> None:
+                       service_id: Optional[int],
+                       folder_id: Optional[int] = None) -> None:
         """Пакетно переносит записи в сервис в ОДНОЙ транзакции (M7-04, по
         образцу move_accounts): сбой середины списка не оставляет часть
         записей перемещённой, а часть — нет."""
         with self.conn:
             for iid in item_ids:
-                self._move_fin_item_rows(iid, service_id)
+                self._move_fin_item_rows(iid, service_id, folder_id)
         self._mark_dirty()
 
     def _set_fin_favorite_rows(self, item_id: int, value: bool) -> None:

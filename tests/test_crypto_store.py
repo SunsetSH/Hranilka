@@ -124,19 +124,19 @@ def test_tamper_data_section_detected():
 
 
 def test_tamper_wrap_pw_detected():
-    """Инверсия байта в wrap_pw → провал при снятии DEK паролем.
+    """Инверсия байта в wrap_pw -> провал при снятии DEK паролем.
 
-    Recovery-код остаётся рабочим (wrap_rec не тронут)."""
+    Контейнер v2: обёртки входят в AAD секции данных (S1), поэтому подмена
+    ловится и recovery-путём (DEK снимается, но GCM-тег данных не сходится)."""
     container, recovery = _make()
-    # Смещение wrap_pw: MAGIC(6)+VER(1)+preset(1)+t(1)+m(4)+p(1)+salt_pw(16)
-    # +wrap_pw_len(2) → далее wrap_pw (см. формат контейнера в crypto_store).
-    off = len(cs.MAGIC) + 1 + 1 + 1 + 4 + 1 + cs.SALT_LEN + 2
+    # Смещение wrap_pw: MAGIC(6)+VER(1)+flags(1)+preset(1)+t(1)+m(4)+p(1)
+    # +salt_pw(16)+wrap_pw_len(2) -> далее wrap_pw (см. формат в crypto_store).
+    off = len(cs.MAGIC) + 1 + 1 + 1 + 1 + 4 + 1 + cs.SALT_LEN + 2
     tampered = _flip_byte(container, off + 5)   # байт внутри wrap_pw
     with pytest.raises((cs.WrongPassword, cs.CorruptVault)):
         cs.unlock(tampered, _PW)
-    # Recovery-путь не задет подделкой wrap_pw.
-    rec_bytes, _, _ = cs.unlock(tampered, recovery, is_recovery=True)
-    assert rec_bytes == _DATA
+    with pytest.raises(cs.CorruptVault):
+        cs.unlock(tampered, recovery, is_recovery=True)
 
 
 def test_truncated_container_is_corrupt():

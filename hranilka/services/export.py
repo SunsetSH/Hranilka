@@ -12,7 +12,10 @@ type=='account' есть ключи 'card' (как load_account) и 'links'.
 """
 import base64
 import csv
+import logging
 import os
+import re
+import tempfile
 from datetime import datetime
 from html import escape as esc
 from pathlib import Path
@@ -93,16 +96,51 @@ def _s(v):
     return "" if v is None else str(v)
 
 
-def _csv_safe(value):
-    """Нейтрализует formula injection в табличных форматах (CSV/XLSX).
+# Метки скалярных полей-секретов (пароль, фраза восстановления и секретные
+# поля фин-записей). Такие значения НЕЛЬЗЯ искажать: префикс-апостроф портит
+# пароль, начинающийся с = + - @. Составные секции (списки) начинаются с
+# «1. …»/«поле: …» и под формулу не попадают.
+_SECRET_LABELS = frozenset(
+    {"Пароль", "Фраза восстановления"}
+    | {f.label for spec in FIN_TYPES.values() for f in spec.fields if f.secret})
 
-    Excel/openpyxl трактуют значение, начинающееся с = + - @ (или с управляющего
-    символа перед ними), как формулу — вплоть до DDE/WEBSERVICE-вызовов при
-    открытии файла. Префиксуем такие значения апострофом: Excel покажет текст
-    как есть и формулу не выполнит. На HTML/TXT не влияет (там не вызывается)."""
-    if value and value[0] in ("=", "+", "-", "@", "\t", "\r", "\n"):
+_FORMULA_START = ("=", "+", "-", "@", "\t", "\r", "\n")
+
+
+def _csv_safe(value, secret=False):
+    """Нейтрализует formula injection в CSV.
+
+    Excel трактует значение, начинающееся с = + - @ (или с управляющего символа
+    перед ними), как формулу — вплоть до DDE/WEBSERVICE при открытии файла.
+    Такие значения префиксуются апострофом.
+    secret=True — поле-секрет (пароль и т.п.): значение возвращается БЕЗ
+    изменений, чтобы не портить пароль (B1). Остаточный риск: пароль вида
+    «=…» Excel может исполнить как формулу при открытии CSV — пользователь
+    предупреждён, что экспорт открытым текстом. В XLSX префикс не нужен вовсе:
+    все ячейки пишутся строкового типа (_xlsx_put_row)."""
+    if secret:
+        return value
+    if value and value[0] in _FORMULA_START:
         return "'" + value
     return value
+
+
+# Недопустимые в XLSX управляющие символы (openpyxl: IllegalCharacterError).
+_XLSX_ILLEGAL_RE = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def _xlsx_clean(value):
+    """Убирает управляющие символы 0x00-0x1F, кроме TAB/LF/CR (B2)."""
+    return _XLSX_ILLEGAL_RE.sub("", value) if isinstance(value, str) else value
+
+
+def _xlsx_put_row(ws, row):
+    """Добавляет строку в лист: символы очищены, строки — тип 's' (никогда не
+    формула, значение сохраняется как есть, без апострофа — B1/B2)."""
+    ws.append([_xlsx_clean(v) for v in row])
+    for cell in ws[ws.max_row]:
+        if isinstance(cell.value, str):
+            cell.data_type = "s"
 
 
 def _account_rows(card, links, opts, skip_empty=True):
@@ -506,7 +544,8 @@ def export_csv(tree, opts, path):
             values = dict(rows_fn(node))
             w.writerow(
                 [_csv_safe(" / ".join(path_parts)), _csv_safe(_s(node["name"]))]
-                + [_csv_safe(_s(values.get(label, ""))) for label in labels])
+                + [_csv_safe(_s(values.get(label, "")), label in _SECRET_LABELS)
+                   for label in labels])
 
     # utf-8-sig (BOM) — чтобы Excel корректно открыл кириллицу.
     with open(path, "w", encoding="utf-8-sig", newline="") as f:
@@ -535,14 +574,18 @@ def _table_columns(opts):
     return cols, header
 
 
-def _table_row(node, path_parts, cols, opts):
-    """Строка таблицы для одного аккаунта (CSV/XLSX)."""
+def _table_row(node, path_parts, cols, opts, quote=True):
+    """Строка таблицы для одного аккаунта (CSV/XLSX). quote=False — без
+    апострофа-префикса (XLSX: ячейки строкового типа). Секретные колонки
+    (_SECRET_LABELS) никогда не префиксуются."""
     d = dict(_account_rows(node["card"], node.get("links"), opts, skip_empty=False))
     row = [" / ".join(path_parts)] + [d.get(l, "") for l in cols]
     if opts.include_other:
         row.append(str(len(_gallery(node))))
-    # Нейтрализуем формулы в каждой ячейке (CSV и XLSX используют эту строку).
-    return [_csv_safe(_s(c)) for c in row]
+    if not quote:
+        return [_s(c) for c in row]
+    labels = [None] + list(cols) + ([None] if opts.include_other else [])
+    return [_csv_safe(_s(c), lab in _SECRET_LABELS) for c, lab in zip(row, labels)]
 
 
 # ─── HTML ────────────────────────────────────────────────────────────────────
@@ -775,7 +818,8 @@ def export_xlsx(tree, opts, path):
     def walk(node, prefix):
         name = node["name"]
         if node["type"] == "account":
-            account_rows.append(_table_row(node, prefix + [name], account_cols, opts))
+            account_rows.append(
+                _table_row(node, prefix + [name], account_cols, opts, quote=False))
         elif _is_fin(node):
             if opts.include_fin:
                 fin_entries.append((node, prefix + [name]))
@@ -791,9 +835,9 @@ def export_xlsx(tree, opts, path):
     wb = Workbook()
     ws = wb.active
     ws.title = "Хранилка"
-    ws.append(account_header)
+    _xlsx_put_row(ws, account_header)
     for row in account_rows:
-        ws.append(row)
+        _xlsx_put_row(ws, row)
 
     def append_entries_table(entries, rows_fn):
         """Самостоятельная таблица ниже предыдущих на том же листе. У неё свой
@@ -812,13 +856,13 @@ def export_xlsx(tree, opts, path):
         for node, path_parts in entries:
             values = dict(rows_fn(node))
             rows.append(
-                [_csv_safe(" / ".join(path_parts)), _csv_safe(_s(node["name"]))]
-                + [_csv_safe(_s(values.get(label, ""))) for label in labels])
+                [" / ".join(path_parts), _s(node["name"])]
+                + [_s(values.get(label, "")) for label in labels])
         ws.append([])                         # визуальный отступ между таблицами
-        ws.append(header)
+        _xlsx_put_row(ws, header)
         header_row = ws.max_row
         for row in rows:
-            ws.append(row)
+            _xlsx_put_row(ws, row)
         return header, header_row
 
     fin_header, fin_header_row = append_entries_table(
@@ -873,10 +917,18 @@ def write_atomic(func, tree, opts, path, **kwargs):
     убирается через best_effort_wipe, а не голым unlink, иначе plaintext мог бы
     остаться в свободных блоках ФС (M-02, как и pre-migrate/restore-копии БД)."""
     target = Path(path)
-    tmp = target.with_name(target.name + f".tmp{os.getpid()}")
+    # mkstemp: уникальное имя (pid-имя могло столкнуться при параллельных
+    # экспортах); создаём рядом с целью, чтобы os.replace был атомарным.
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(target.parent), prefix=target.name + ".", suffix=".tmp")
+    os.close(fd)
+    tmp = Path(tmp_name)
     try:
         func(tree, opts, str(tmp), **kwargs)
         os.replace(tmp, target)
+    except Exception:
+        logging.error("Экспорт в %s не удался", target.name, exc_info=True)
+        raise
     finally:
         if tmp.exists():
             best_effort_wipe(str(tmp))

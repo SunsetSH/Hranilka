@@ -9,14 +9,60 @@
 import ctypes
 import ctypes.wintypes
 import logging
+import sys
+import time
 
 from PySide6.QtWidgets import QApplication
-from PySide6.QtCore import Qt, QEvent, QDateTime, QByteArray
+from PySide6.QtCore import Qt, QEvent, QDateTime, QByteArray, QMimeData, QTimer, QPoint
 from PySide6.QtGui import QKeySequence
 
-from hranilka.ui import theme
+from hranilka.ui import sounds, theme
 from hranilka.core import shortcuts
 from hranilka.data.database import VaultConflictError
+
+_WIN_MIME = 'application/x-qt-windows-mime;value="{}"'
+_DWORD_1 = QByteArray(b"\x01\x00\x00\x00")
+_DWORD_0 = QByteArray(b"\x00\x00\x00\x00")
+
+# Размер рамки (px) для hit-test ресайза frameless-окна.
+RESIZE_BORDER = 6
+
+
+def copy_secret_to_clipboard(text: str) -> None:
+    """Единая точка копирования секрета в буфер обмена.
+
+    * Windows: помечает данные форматами, исключающими их из истории буфера
+      (Win+V) и облачной синхронизации: ExcludeClipboardContentFromMonitorProcessing=1,
+      CanIncludeInClipboardHistory=0, CanUploadToCloudClipboard=0.
+    * Запоминает скопированный текст и (пере)взводит таймер авто-очистки главного
+      окна (если clipboard_clear_secs > 0) через window._on_field_copied().
+
+    Вызывается откуда угодно (виджеты, диалоги): окно ищется среди
+    topLevelWidgets по наличию _on_field_copied; без окна (тесты) копирование
+    всё равно выполняется."""
+    mime = QMimeData()
+    mime.setText(text)
+    if sys.platform == "win32":
+        mime.setData(_WIN_MIME.format("ExcludeClipboardContentFromMonitorProcessing"), _DWORD_1)
+        mime.setData(_WIN_MIME.format("CanIncludeInClipboardHistory"), _DWORD_0)
+        mime.setData(_WIN_MIME.format("CanUploadToCloudClipboard"), _DWORD_0)
+    QApplication.clipboard().setMimeData(mime)
+    for w in QApplication.topLevelWidgets():
+        handler = getattr(w, "_on_field_copied", None)
+        if callable(handler) and hasattr(w, "_clip_timer"):
+            handler()
+
+
+def hit_test(x: int, y: int, w: int, h: int, border: int = RESIZE_BORDER):
+    """Чистая функция: зона рамки по координатам внутри окна w x h.
+    Возвращает строку из {l,r,t,b,tl,tr,bl,br} или None."""
+    left, right = x < border, x >= w - border
+    top, bottom = y < border, y >= h - border
+    d = ("t" if top else "b" if bottom else "") + ("l" if left else "r" if right else "")
+    return d or None
+
+
+_HT = {"l": 10, "r": 11, "t": 12, "tl": 13, "tr": 14, "b": 15, "bl": 16, "br": 17}
 
 
 class WindowChromeMixin:
@@ -40,7 +86,49 @@ class WindowChromeMixin:
             msg = ctypes.wintypes.MSG.from_address(int(message))
             if msg.message == 0x0021:  # WM_MOUSEACTIVATE
                 return True, 1
+            if msg.message == 0x0084 and not getattr(self, "_is_max", False):
+                # WM_NCHITTEST: ресайз за все грани/углы (в т.ч. верхние).
+                lp = int(msg.lParam)
+                gx = ctypes.c_short(lp & 0xFFFF).value
+                gy = ctypes.c_short((lp >> 16) & 0xFFFF).value
+                dpr = self.devicePixelRatioF() or 1.0
+                pos = self.mapFromGlobal(QPoint(int(gx / dpr), int(gy / dpr)))
+                d = hit_test(pos.x(), pos.y(), self.width(), self.height())
+                if d:
+                    return True, _HT[d]
+            elif msg.message == 0x02B1 and int(msg.wParam) == 7:  # WTS_SESSION_LOCK
+                self._on_session_event()
+            elif msg.message == 0x0218 and int(msg.wParam) == 4:  # PBT_APMSUSPEND
+                self._on_session_event()
         return super().nativeEvent(event_type, message)
+
+    def _on_session_event(self):
+        """Блокировка сессии Windows / уход в сон → авто-блокировка (S10).
+        Выключено по умолчанию (config lock_on_session_lock)."""
+        try:
+            enabled = bool(self.config.get("lock_on_session_lock", False))
+        except Exception:                                   # noqa: BLE001
+            enabled = False
+        if enabled and not self._unlocking:
+            QTimer.singleShot(0, self._lock_screen_on_session)
+
+    def _lock_screen_on_session(self):
+        if getattr(self.vault, "_vault_locked", False) or self._unlocking:
+            return
+        if not self.db.encrypted and not self._any_card_open():
+            return
+        self._lock_screen()
+
+    def register_session_notifications(self):
+        """Подписаться на WM_WTSSESSION_CHANGE (вызывать после show())."""
+        if sys.platform != "win32":
+            return False
+        try:
+            hwnd = int(self.winId())
+            return bool(ctypes.windll.wtsapi32.WTSRegisterSessionNotification(hwnd, 0))
+        except Exception as e:                              # noqa: BLE001
+            logging.warning("WTSRegisterSessionNotification: %s", e)
+            return False
 
     def _restore_geometry(self):
         """Восстановить размер/положение окна (только при старте)."""
@@ -72,6 +160,10 @@ class WindowChromeMixin:
 
     def _on_field_copied(self):
         secs = self.config.get("clipboard_clear_secs", 0)
+        # Запоминаем, что именно скопировали: очищаем буфер только если там всё
+        # ещё наш текст (B8) — чужое содержимое не стираем.
+        self._clip_copied_text = QApplication.clipboard().text()
+        sounds.play(self.config, "copy")
         if secs > 0:
             self.statusBar().showMessage(
                 f"СКОПИРОВАНО!  (буфер очистится через {secs} сек.)", 3000
@@ -81,7 +173,14 @@ class WindowChromeMixin:
             self.statusBar().showMessage("СКОПИРОВАНО!", 2000)
 
     def _clear_clipboard(self):
-        QApplication.clipboard().clear()
+        cb = QApplication.clipboard()
+        copied = getattr(self, "_clip_copied_text", None)
+        self._clip_copied_text = None
+        if copied is not None and cb.text() != copied:
+            self.statusBar().showMessage(
+                "Буфер обмена изменён - не очищен.", 2500)
+            return
+        cb.clear()
         self.statusBar().showMessage("Буфер обмена очищен.", 2000)
 
     # ─── Idle-блокировка ─────────────────────────────────────────────────────
@@ -94,7 +193,11 @@ class WindowChromeMixin:
         # сбрасывает счётчик простоя. Пока идёт повторная разблокировка —
         # активность не учитываем (иначе ввод пароля «продлевал» бы сессию).
         if ev.type() in self._ACTIVITY_EVENTS and not self._unlocking:
-            self._last_activity = QDateTime.currentDateTime()
+            # Троттлинг (P6): QDateTime создаём не чаще раза в секунду.
+            now = time.monotonic()
+            if now - getattr(self, "_act_mono", 0.0) >= 1.0:
+                self._act_mono = now
+                self._last_activity = QDateTime.currentDateTime()
         if ev.type() == QEvent.Type.KeyPress and not self._unlocking:
             if self._maybe_handle_cyrillic_shortcut(ev):
                 return True
@@ -144,6 +247,7 @@ class WindowChromeMixin:
         """Сбросить счётчик простоя (idle-lock). Вызывает VaultController после
         привилегированных операций: их длительность (KDF на большой базе) не
         должна засчитываться как бездействие пользователя."""
+        self._act_mono = time.monotonic()
         self._last_activity = QDateTime.currentDateTime()
 
     def _check_idle(self):
@@ -264,6 +368,8 @@ class WindowChromeMixin:
                 "место/проверьте доступ к файлу и повторите.",
             )
             return
+        sounds.play(self.config, "lock")
+        self.status_panels.set_locked(True)
         # Сюда попадаем только без несохранённых правок (см. _lock_screen, H6-05),
         # поэтому кеш уже пуст — отдельная очистка не нужна. Снимаем лишь карточку
         # из памяти (гигиена секретов).
@@ -276,6 +382,7 @@ class WindowChromeMixin:
         if not ok:
             self.close()
             return
+        self.status_panels.set_locked(False)
         # Валидация/миграция схемы после разблокировки (единый путь с рестартом,
         # H65-05): _open_database открывает только соединение и схему не трогает.
         self._create_tables_or_exit()
@@ -283,6 +390,7 @@ class WindowChromeMixin:
         self._last_activity = QDateTime.currentDateTime()
         self._idle_timer.start(self._idle_timer.interval() or 30000)
         self.statusBar().showMessage("База разблокирована.", 3000)
+        sounds.play(self.config, "unlock")
 
     # ─── Скриншот-защита ─────────────────────────────────────────────────────
 

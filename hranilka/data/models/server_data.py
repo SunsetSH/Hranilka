@@ -15,9 +15,8 @@ price, notes. extra_ips — список строк (толерантное чт
 """
 from typing import Any, Optional
 
-# Текущая версия структуры payload. Повышается только при несовместимой
-# перестройке; конвертация — здесь (from_storage), а не в БД-миграции.
-PAYLOAD_VERSION = 1
+from hranilka.data.models.common import (
+    PAYLOAD_VERSION, gallery_from_storage, gallery_to_storage)  # noqa: F401
 
 # Ключи элементов списковых секций payload (толерантное чтение/запись).
 # port/label убраны из панелей (Уточнения UI 2026-07-15) — старый payload с
@@ -90,9 +89,7 @@ class ServerData:
             "payload": payload,
             # image_id/blob_size переносятся сквозь кеш несохранённых правок
             # (stash), см. AccountData.to_storage — контракт H-6/M7-03.
-            "gallery": [{"data": g.get("data"), "desc": g.get("desc", ""),
-                         "image_id": g.get("image_id"),
-                         "blob_size": g.get("blob_size")} for g in self.gallery],
+            "gallery": gallery_to_storage(self.gallery),
         }
 
     @classmethod
@@ -105,5 +102,5 @@ class ServerData:
         payload.setdefault("v", PAYLOAD_VERSION)
         _normalize_lists(payload)
         d.payload = payload
-        d.gallery = list(storage.get("gallery") or [])
+        d.gallery = gallery_from_storage(storage.get("gallery"))
         return d

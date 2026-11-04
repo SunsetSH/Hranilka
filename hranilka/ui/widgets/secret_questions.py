@@ -3,10 +3,15 @@
 Ответы — секрет: в режиме просмотра маскируются (echo Password), вопросы
 остаются видимыми. Раскрытие — одной кнопкой на всю вкладку (M-02)."""
 from PySide6.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QLineEdit, QPushButton, QLabel)
-from hranilka.ui.widgets.common import _warn, _confirm
+from hranilka.ui.widgets.common import (_warn, _confirm, RevealableRowsMixin,
+                                        make_delete_button, set_a11y,
+                                        updates_suspended)
 
 
-class SecretQuestionsWidget(QWidget):
+class SecretQuestionsWidget(RevealableRowsMixin, QWidget):
+    REVEAL_SHOW = "ПОКАЗАТЬ ОТВЕТЫ"
+    REVEAL_HIDE = "СКРЫТЬ ОТВЕТЫ"
+
     def __init__(self, config=None, parent=None):
         super().__init__(parent)
         self.config = config
@@ -22,6 +27,7 @@ class SecretQuestionsWidget(QWidget):
         self.reveal_btn = QPushButton("ПОКАЗАТЬ ОТВЕТЫ")
         self.reveal_btn.setCheckable(True)
         self.reveal_btn.setToolTip("Показать / скрыть все ответы")
+        set_a11y(self.reveal_btn, "Показать или скрыть ответы")
         self.reveal_btn.toggled.connect(self._on_reveal_toggled)
         top_row = QHBoxLayout()
         top_row.setSpacing(5)
@@ -33,23 +39,15 @@ class SecretQuestionsWidget(QWidget):
         self.layout.addStretch()
         self._update_empty()
 
-    def _update_empty(self):
-        self.empty_label.setVisible(not self.rows)
-        # Кнопка показа осмысленна только в просмотре и при наличии строк.
-        self.reveal_btn.setVisible(bool(self.rows) and not self._editable)
+    def _secret_edits(self):
+        return [a for _q, a, _btn, _w in self.rows]
+
+    @staticmethod
+    def _row_is_empty(row):
+        return not (row[0].text().strip() or row[1].text().strip())
 
     def _answers_hidden(self) -> bool:
-        return not (self._editable or self._revealed)
-
-    def _apply_echo(self):
-        mode = QLineEdit.Password if self._answers_hidden() else QLineEdit.Normal
-        for _q, a, _btn, _w in self.rows:
-            a.setEchoMode(mode)
-
-    def _on_reveal_toggled(self, checked: bool):
-        self._revealed = checked
-        self.reveal_btn.setText("СКРЫТЬ ОТВЕТЫ" if checked else "ПОКАЗАТЬ ОТВЕТЫ")
-        self._apply_echo()
+        return self._secrets_hidden()
 
     def add_row(self, q="", a=""):
         if len(self.rows) >= 5:
@@ -70,8 +68,7 @@ class SecretQuestionsWidget(QWidget):
         if self._answers_hidden():
             a_edit.setEchoMode(QLineEdit.Password)
 
-        del_btn = QPushButton("[X]", row_widget)   # родитель сразу — см. add_item
-        del_btn.setFixedWidth(40)
+        del_btn = make_delete_button(row_widget, "Удалить вопрос")
         del_btn.setVisible(self._editable)
         del_btn.clicked.connect(lambda: self.remove_row(row_widget))
 
@@ -93,8 +90,7 @@ class SecretQuestionsWidget(QWidget):
             if w == row_widget:
                 self.rows.pop(i)
                 break
-        self.layout.removeWidget(row_widget)
-        row_widget.deleteLater()
+        self._remove_row_widget(row_widget)
         self._update_empty()
 
     def get_data(self):
@@ -103,26 +99,11 @@ class SecretQuestionsWidget(QWidget):
                 if q.text().strip() or a.text().strip()]
 
     def set_data(self, data):
-        for _q, _a, _btn, row_widget in self.rows:
-            self.layout.removeWidget(row_widget)
-            row_widget.deleteLater()
-        self.rows.clear()
-        for item in data: self.add_row(item.get("q", ""), item.get("a", ""))
-        self._update_empty()
-
-    def _prune_empty_rows(self):
-        """Полностью пустые строки не сохраняются в БД (см. get_data) — после
-        выхода из правки убираем их и из интерфейса, не дожидаясь перезагрузки."""
-        def _empty(row):
-            return not (row[0].text().strip() or row[1].text().strip())
-        drop = [row for row in self.rows if _empty(row)]
-        if not drop:
-            return
-        self.rows = [row for row in self.rows if not _empty(row)]
-        for _q, _a, _btn, widget in drop:
-            self.layout.removeWidget(widget)
-            widget.deleteLater()
-        self._update_empty()
+        with updates_suspended(self):
+            self._clear_rows()
+            for item in data:
+                self.add_row(item.get("q", ""), item.get("a", ""))
+            self._update_empty()
 
     def set_editable(self, editable):
         self._editable = editable
@@ -131,10 +112,4 @@ class SecretQuestionsWidget(QWidget):
             q.setReadOnly(not editable)
             a.setReadOnly(not editable)
             del_btn.setVisible(editable)
-        if not editable:
-            self._prune_empty_rows()
-        # Выход из правки снова маскирует ответы; вход — показывает для ввода.
-        self._revealed = False
-        self.reveal_btn.setChecked(False)
-        self._apply_echo()
-        self._update_empty()
+        self._finish_set_editable(editable)

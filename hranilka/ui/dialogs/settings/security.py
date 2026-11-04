@@ -9,7 +9,8 @@ from hranilka.ui.theme import themed_confirm
 from hranilka.ui.theme import themed_info
 from hranilka.ui.theme import ThemedDialog
 from hranilka.ui.dialogs.recovery import RecoveryCodeDialog
-from hranilka.core import util
+from hranilka.generators import password_gen
+from hranilka.ui.chrome import copy_secret_to_clipboard
 
 
 class SettingsSecurityMixin:
@@ -300,7 +301,8 @@ class SettingsSecurityMixin:
     @staticmethod
     def _generate_password(length: int = 16) -> str:
         """Случайный пароль (как для аккаунтов: буквы, цифры, спецсимволы)."""
-        return util.generate_password(length)
+        return password_gen.generate_password(
+            password_gen.PasswordOptions(length=length))
 
     def _ask_new_password(self, title: str):
         """Ввод нового пароля с подтверждением. Возвращает строку или None."""
@@ -330,7 +332,7 @@ class SettingsSecurityMixin:
 
         def do_copy():
             if e1.text():
-                QApplication.clipboard().setText(e1.text())
+                copy_secret_to_clipboard(e1.text())
                 err.setText("Пароль скопирован в буфер обмена.")
         gen_btn.clicked.connect(do_generate)
         copy_btn.clicked.connect(do_copy)
@@ -366,7 +368,6 @@ class SettingsSecurityMixin:
     def _show_recovery(self, code: str):
         """Показать recovery-код один раз: копировать / сохранить в файл.
         Закрытие без «Я сохранил код» переспрашивает (L-3)."""
-        from PySide6.QtWidgets import QApplication
         d = RecoveryCodeDialog(self.config, self)
         d.setWindowTitle("Recovery-код")
         d.setMinimumWidth(440)
@@ -380,7 +381,7 @@ class SettingsSecurityMixin:
         lay.addWidget(code_edit)
         row = QHBoxLayout()
         copy_btn = QPushButton("Копировать")
-        copy_btn.clicked.connect(lambda: QApplication.clipboard().setText(code))
+        copy_btn.clicked.connect(lambda: copy_secret_to_clipboard(code))
         save_btn = QPushButton("Сохранить в файл…")
 
         def save_to_file():

@@ -433,7 +433,6 @@ def test_export_dialog_server_secrets_disabled_when_servers_unchecked(window):
 def test_export_all_passes_show_servers(window):
     """export_all/open_export передают show_servers из config (зеркало
     show_fin_instruments)."""
-    from hranilka.ui.dialogs import export_dialog as ed_mod
     window.config.set("show_servers", True)
     window.db.add_server(None, "Сервер")
     captured = {}

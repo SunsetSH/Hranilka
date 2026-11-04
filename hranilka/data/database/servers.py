@@ -24,20 +24,24 @@ from hranilka.data.models.server_data import extract_paid_until
 class DbServersMixin(DbBase):
     # ----- Создание -----
 
-    def _add_server_rows(self, service_id: Optional[int], name: str) -> int:
+    def _add_server_rows(self, service_id: Optional[int], name: str,
+                         folder_id: Optional[int] = None) -> int:
         """Тело add_server без транзакции/dirty (для составных методов).
         created_at — строкой формата SQLite CURRENT_TIMESTAMP (как в accounts/
         fin_items)."""
+        self._check_single_parent(service_id, folder_id)
         self.cursor.execute(
-            "INSERT INTO servers (service_id, name, data, created_at) "
-            "VALUES (?, ?, '{}', ?)",
-            (service_id, name, datetime.now().isoformat(" ", "seconds")))
+            "INSERT INTO servers (service_id, folder_id, name, data, created_at) "
+            "VALUES (?, ?, ?, '{}', ?)",
+            (service_id, folder_id, name, datetime.now().isoformat(" ", "seconds")))
         return int(self.cursor.lastrowid)
 
-    def add_server(self, service_id: Optional[int], name: str) -> int:
-        """Создаёт пустой сервер, возвращает его id."""
+    def add_server(self, service_id: Optional[int], name: str,
+                   folder_id: Optional[int] = None) -> int:
+        """Создаёт пустой сервер (в сервисе, папке либо в корне), возвращает
+        его id."""
         with self.conn:
-            new_id = self._add_server_rows(service_id, name)
+            new_id = self._add_server_rows(service_id, name, folder_id)
         self._mark_dirty()
         return new_id
 
@@ -274,29 +278,28 @@ class DbServersMixin(DbBase):
 
     # ----- Перемещение, избранное, порядок -----
 
-    def _move_server_rows(self, server_id: int,
-                          service_id: Optional[int]) -> None:
-        """Тело move_server без транзакции/dirty (в конец списка сервиса)."""
-        order = self._next_sort_order("servers", "service_id", service_id)
-        self.cursor.execute(
-            "UPDATE servers SET service_id = ?, sort_order = ? WHERE id = ?",
-            (service_id, order, server_id))
+    def _move_server_rows(self, server_id: int, service_id: Optional[int],
+                          folder_id: Optional[int] = None) -> None:
+        """Тело move_server без транзакции/dirty (в конец списка контейнера)."""
+        self._move_leaf_rows("servers", server_id, service_id, folder_id)
 
-    def move_server(self, server_id: int, service_id: Optional[int]) -> None:
-        """Переносит сервер в сервис (service_id=None — свободный), в конец
-        списка."""
+    def move_server(self, server_id: int, service_id: Optional[int],
+                    folder_id: Optional[int] = None) -> None:
+        """Переносит сервер в сервис либо папку (оба None — свободный, в
+        корень), в конец списка."""
         with self.conn:
-            self._move_server_rows(server_id, service_id)
+            self._move_server_rows(server_id, service_id, folder_id)
         self._mark_dirty()
 
     def move_servers(self, server_ids: list[int],
-                     service_id: Optional[int]) -> None:
+                     service_id: Optional[int],
+                     folder_id: Optional[int] = None) -> None:
         """Пакетно переносит серверы в сервис в ОДНОЙ транзакции (по образцу
         move_fin_items): сбой середины списка не оставляет часть серверов
         перемещённой, а часть — нет."""
         with self.conn:
             for sid in server_ids:
-                self._move_server_rows(sid, service_id)
+                self._move_server_rows(sid, service_id, folder_id)
         self._mark_dirty()
 
     def _set_server_favorite_rows(self, server_id: int, value: bool) -> None:

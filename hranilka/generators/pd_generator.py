@@ -4,6 +4,9 @@ generate_person(lang, rng=None) -> dict: first, last, middle, birth_date
 (datetime.date), gender, address.
 gender: "m" | "f".
 """
+# S37: random.Random здесь — ТОЛЬКО для правдоподобных ПД-заполнителей (имя,
+# адрес, дата), это НЕ секреты. Для паролей/ключей использовать secrets
+# (см. password_gen.py); random для секретов запрещён (тест test_audit_gen_random_policy).
 import random
 from datetime import date, timedelta
 from typing import Optional, Sequence

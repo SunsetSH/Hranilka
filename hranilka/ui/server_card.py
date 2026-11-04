@@ -11,7 +11,6 @@ docs/ТЗ_VPS_Серверы.md §2): сервер не финансовый л�
 см. main_window.py): узел SERVER открывает серверную карточку, всё
 остальное отдаётся FinCardMixin.on_item_selected без изменений (тот
 разбирается между fin-записью и аккаунтом сам)."""
-import logging
 
 from PySide6.QtCore import Qt, QDateTime
 
@@ -20,6 +19,7 @@ from hranilka.core.domain import days_until_paid_until
 from hranilka.core.nodetypes import SERVER, ACCOUNT
 from hranilka.data.database import CorruptedPayloadError, StaleSessionError
 from hranilka.data.models.server_data import ServerData
+from hranilka.ui.card_base import CardFlowMixin, LeafCardSpec
 from hranilka.ui.fin_card import FinCardMixin
 from hranilka.ui import theme
 from hranilka.core import util
@@ -29,7 +29,40 @@ from hranilka.core import util
 PAID_WARN_DAYS = 14
 
 
-class ServerCardMixin:
+async def _server_orphan_links(win, key, storage, session):
+    """H-02: get_server() уже вернул account_ids в этом же снимке — второго
+    чтения не нужно, окно гонки (и семантика links=None) исчезает."""
+    return storage.get("account_ids") or []
+
+
+_SERVER_SPEC = LeafCardSpec(
+    tabs_attr="server_tabs", key_attr="_current_server",
+    edit_flag_attr="_server_edit_on_load", edit_flag_value=lambda k: k[1],
+    data_attr="current_server_data", data_cls=ServerData,
+    entity_name="сервера",
+    db_load="get_server", db_link_accounts="get_server_link_accounts",
+    db_links="get_server_links", db_save="save_server_with_links",
+    exclude_kw="exclude_server_id",
+    apply="_apply_server_storage", collect="_collect_server_storage",
+    status="_update_server_status",
+    marker=lambda w, k: w._refresh_server_marker(k[1]),
+    on_saved=lambda w, st: w._resync_server_lists(st.get("payload") or {}),
+    update_item_after_save=lambda w, k, st: w._update_server_item_after_save(
+        k[1], st),
+    err_load="Не удалось загрузить сервер",
+    err_save="Не удалось сохранить сервер",
+    err_recover=("Не удалось восстановить связи черновика сервера — открытие "
+                 "отменено, чтобы не потерять привязки"),
+    orphan_log_load="Не удалось подгрузить сервер для осиротевшей загрузки",
+    orphan_deleted="Загрузка отменена: сервер удалён",
+    after_load=lambda w: w._warn_server_paid_due(),
+    fail_closed_excs=(CorruptedPayloadError,),
+    fail_closed_msg="Данные сервера повреждены — запись в БД не изменена",
+    orphan_links=_server_orphan_links,
+)
+
+
+class ServerCardMixin(CardFlowMixin):
     """Правая панель для VPS-серверов: диспетчер выбора + просмотр/правка."""
 
     # ----- Диспетчеры общих кнопок (третья ветка после fin/аккаунт) -----
@@ -89,9 +122,7 @@ class ServerCardMixin:
 
     def _open_server_card(self, current, node):
         item_id = node["id"]
-        if (self._server_edit_on_load is not None
-                and self._server_edit_on_load != item_id):
-            self._server_edit_on_load = None
+        self._drop_stale_edit_flag("_server_edit_on_load", item_id)
         self._card_gen += 1
         gen = self._card_gen
         self.current_tree_item = current
@@ -104,99 +135,7 @@ class ServerCardMixin:
     # ----- Асинхронная загрузка -----
 
     async def _load_server_into_ui(self, item_id, gen):
-        session = self.db.current_session()
-        key = (SERVER, item_id)
-        try:
-            if key in self._edit_cache:
-                cached = self._edit_cache[key]
-                link_ids = cached.get("links")
-                if link_ids is None:
-                    # H-02: связи неизвестны (черновик пережил сбой чтения).
-                    # НЕ подменяем молча пустым списком — обычное сохранение
-                    # синхронизировало бы server_links с [] и стёрло бы
-                    # реальные привязки. Пытаемся перечитать актуальный снимок
-                    # из БД; вторая неудача — открываем карточку fail-closed
-                    # (по образцу CorruptedPayloadError ниже), черновик в
-                    # _edit_cache не трогаем.
-                    try:
-                        link_ids = await self.db.run_async(
-                            self.db.get_server_links, item_id, _session=session)
-                    except StaleSessionError:
-                        return
-                    except Exception as e:            # noqa: BLE001
-                        if gen == self._card_gen:
-                            self._current_server = None
-                            self.is_editing = False
-                            self._show_placeholder()
-                            self._show_card_error(
-                                "Не удалось восстановить связи черновика "
-                                "сервера — открытие отменено, чтобы не "
-                                "потерять привязки", e)
-                        return
-                    if gen != self._card_gen:
-                        return
-                    cached["links"] = link_ids        # связи стали известны
-                links = await self.db.run_async(
-                    self._resolve_link_names, link_ids, _session=session)
-                other_bytes = await self.db.run_async(
-                    self.db.gallery_total_bytes, exclude_server_id=item_id,
-                    _session=session)
-                if gen != self._card_gen:
-                    return
-                self._apply_server_storage(cached["storage"], links, other_bytes)
-                self.is_editing = True
-                self.server_tabs.set_all_editable(True)
-                self.edit_btn.hide(); self.save_btn.show(); self.cancel_btn.show()
-            else:
-                storage = await self.db.run_async(
-                    self.db.get_server, item_id, _session=session)
-                if gen != self._card_gen:
-                    return
-                if storage is None:
-                    # Сервер исчез между выбором и загрузкой — заглушка.
-                    self._current_server = None
-                    self.is_editing = False
-                    self._show_placeholder()
-                    self._update_server_status()
-                    return
-                links = await self.db.run_async(
-                    self.db.get_server_link_accounts, item_id, _session=session)
-                other_bytes = await self.db.run_async(
-                    self.db.gallery_total_bytes, exclude_server_id=item_id,
-                    _session=session)
-                if gen != self._card_gen:
-                    return
-                self._apply_server_storage(storage, links, other_bytes)
-                self.is_editing = False
-                self.server_tabs.set_all_editable(False)
-                self.edit_btn.show(); self.save_btn.hide(); self.cancel_btn.hide()
-                if self._server_edit_on_load == item_id:
-                    # Только что созданный сервер — сразу в режим правки.
-                    self._server_edit_on_load = None
-                    self.is_editing = True
-                    self.server_tabs.set_all_editable(True)
-                    self.edit_btn.hide(); self.save_btn.show(); self.cancel_btn.show()
-            self._update_server_status()
-            self._warn_server_paid_due()
-        except StaleSessionError:
-            return                               # БД сменена (lock/restore) — молча
-        except CorruptedPayloadError as e:
-            # M-03: JSON payload сервера повреждён — fail-closed. Карточку НЕ
-            # открываем (иначе обычное сохранение стёрло бы потенциально
-            # восстановимую строку в БД пустым payload); строка в БД остаётся
-            # нетронутой. Заглушка + сообщение вместо тихой пустой карточки.
-            if gen == self._card_gen:
-                self._current_server = None
-                self.is_editing = False
-                self._show_placeholder()
-                self._show_card_error(
-                    "Данные сервера повреждены — запись в БД не изменена", e)
-        except Exception as e:                       # noqa: BLE001
-            if gen == self._card_gen:
-                self._show_card_error("Не удалось загрузить сервер", e)
-        finally:
-            if gen == self._card_gen:
-                self._set_card_busy(False)
+        await self._leaf_load_async(_SERVER_SPEC, (SERVER, item_id), gen)
 
     def _apply_server_storage(self, storage, links=None, other_bytes=None):
         """Заполнить ServerTabs из storage (имя, поля, связи с аккаунтами,
@@ -273,122 +212,19 @@ class ServerCardMixin:
     # ----- Правка / сохранение / отмена -----
 
     def server_toggle_edit(self):
-        if self._card_busy:
-            return
-        self.is_editing = True
-        self.server_tabs.set_all_editable(True)
-        self.edit_btn.hide(); self.save_btn.show(); self.cancel_btn.show()
-        self._update_server_status()
+        self._leaf_toggle_edit(_SERVER_SPEC)
 
     def server_save(self):
-        if self._card_busy:
-            return
-        if not self._validate_card_name(self.server_tabs, "сервера"):
-            return
-        self._set_card_busy(True)
-        util.fire(self._server_save_async(self._card_gen))
+        self._leaf_save(_SERVER_SPEC, self._server_save_async)
 
     async def _server_save_async(self, gen):
-        session = self.db.current_session()
-        server = self._current_server
-        if server is None:
-            self._set_card_busy(False)
-            return
-        _node_type, item_id = server
-        active_tab = self.server_tabs.currentIndex()
-        self.server_tabs.set_all_editable(False)
-        gallery = self.server_tabs.f_gallery_widget
-        if gallery.has_pending_uploads():
-            self.statusBar().showMessage("Дождитесь загрузки изображений…", 2000)
-            await gallery.wait_pending_uploads()
-            if gen != self._card_gen or self._current_server != server:
-                return
-        storage = self._collect_server_storage()
-        link_ids = self.server_tabs.f_linked_accounts.get_data()
-        try:
-            gallery_ids = await self.db.run_async(
-                self.db.save_server_with_links, item_id, storage, link_ids,
-                _session=session)
-        except StaleSessionError:
-            if gen == self._card_gen:
-                self._edit_cache[server] = {"storage": storage, "links": link_ids}
-                self._dirty_ids.add(server)
-                self._refresh_server_marker(item_id)
-                self.server_tabs.set_all_editable(True)
-                self.server_tabs.setCurrentIndex(active_tab)
-                self._set_card_busy(False)
-                self.statusBar().showMessage(
-                    "База была переоткрыта — сохранение не выполнено, "
-                    "правки в черновике. Повторите сохранение.", 6000)
-            return
-        except Exception as e:                       # noqa: BLE001
-            if gen == self._card_gen:
-                self._edit_cache[server] = {"storage": storage, "links": link_ids}
-                self._dirty_ids.add(server)
-                self._refresh_server_marker(item_id)
-                self.server_tabs.set_all_editable(True)
-                self.server_tabs.setCurrentIndex(active_tab)
-                self._show_card_error("Не удалось сохранить сервер", e)
-                self._set_card_busy(False)
-            return
-
-        self._any_db_changes = True
-        if gen == self._card_gen:
-            gallery.assign_saved_ids(gallery_ids)
-            self._edit_cache.pop(server, None)
-            self._dirty_ids.discard(server)
-            self.is_editing = False
-            self.server_tabs.set_all_editable(False)
-            self.edit_btn.show(); self.save_btn.hide(); self.cancel_btn.hide()
-            self._resync_server_lists(storage.get("payload") or {})
-            self._set_card_busy(False)
-        self._update_server_item_after_save(item_id, storage)
-        self.statusBar().showMessage("СОХРАНЕНО!", 2000)
+        await self._leaf_save_async(_SERVER_SPEC, gen)
 
     def server_cancel(self):
-        if self._card_busy:
-            return
-        self._set_card_busy(True)
-        util.fire(self._server_cancel_async(self._card_gen))
+        self._leaf_cancel(_SERVER_SPEC, self._server_cancel_async)
 
     async def _server_cancel_async(self, gen):
-        session = self.db.current_session()
-        server = self._current_server
-        if server is None:
-            self._set_card_busy(False)
-            return
-        _node_type, item_id = server
-        self._edit_cache.pop(server, None)
-        self._dirty_ids.discard(server)
-        self.is_editing = False
-        try:
-            storage = await self.db.run_async(
-                self.db.get_server, item_id, _session=session)
-            if gen != self._card_gen:
-                return
-            if storage is None:
-                self._current_server = None
-                self._show_placeholder()
-                self._update_server_status()
-                self._reload_tree()
-                return
-            links = await self.db.run_async(
-                self.db.get_server_link_accounts, item_id, _session=session)
-            if gen != self._card_gen:
-                return
-            self._apply_server_storage(storage, links)
-            self.server_tabs.set_all_editable(False)
-            self.edit_btn.show(); self.save_btn.hide(); self.cancel_btn.hide()
-            self._update_server_status()
-            self._refresh_server_marker(item_id)
-        except StaleSessionError:
-            return
-        except Exception as e:                       # noqa: BLE001
-            if gen == self._card_gen:
-                self._show_card_error("Не удалось отменить правки", e)
-        finally:
-            if gen == self._card_gen:
-                self._set_card_busy(False)
+        await self._leaf_cancel_async(_SERVER_SPEC, gen)
 
     # ----- Связи сервер ↔ аккаунт (снизу вкладки «База») -----
 
@@ -425,70 +261,22 @@ class ServerCardMixin:
     # ----- Осиротевшая загрузка галереи -----
 
     def _on_server_gallery_orphan_upload(self, server_key, desc, data):
-        """Импорт картинки стартовал для сервера server_key, но к завершению
-        карточку сменили (виджет галереи один на все серверы). Не теряем
-        картинку — адресуем её своему серверу (по образцу
-        FinCardMixin._on_fin_gallery_orphan_upload)."""
-        if server_key is None:
-            return
-        if server_key == self._current_server and self.is_editing:
-            self.server_tabs.f_gallery_widget.add_item(data, desc)
-            self._mark_server_orphan_dirty(server_key)
-            return
-        if server_key in self._edit_cache:
-            self._edit_cache[server_key]["storage"].setdefault("gallery", []).append(
-                {"desc": desc, "data": data, "image_id": None, "blob_size": None})
-            self._mark_server_orphan_dirty(server_key)
-            return
-        util.fire(self._server_orphan_into_new_draft(server_key, desc, data))
+        """Импорт картинки стартовал для сервера server_key, но карточку сменили
+        (виджет галереи один на все серверы) — адресуем картинку своему серверу."""
+        self._leaf_orphan_upload(_SERVER_SPEC, server_key, desc, data,
+                                 self._server_orphan_into_new_draft)
 
     async def _server_orphan_into_new_draft(self, server_key, desc, data):
-        _node_type, item_id = server_key
-        session = self.db.current_session()
-        try:
-            storage = await self.db.run_async(
-                self.db.get_server, item_id, _session=session)
-        except StaleSessionError:
-            return
-        except Exception as e:                       # noqa: BLE001
-            logging.error("Не удалось подгрузить сервер для осиротевшей "
-                          "загрузки: %s", e, exc_info=e)
-            return
-        if storage is None:
-            self.statusBar().showMessage("Загрузка отменена: сервер удалён", 4000)
-            return
-        if server_key == self._current_server and self.is_editing:
-            self.server_tabs.f_gallery_widget.add_item(data, desc)
-        elif server_key in self._edit_cache:
-            self._edit_cache[server_key]["storage"].setdefault("gallery", []).append(
-                {"desc": desc, "data": data, "image_id": None, "blob_size": None})
-        else:
-            srv_data = ServerData.from_storage(storage)
-            srv_data.gallery = list(srv_data.gallery) + [
-                {"desc": desc, "data": data, "image_id": None, "blob_size": None}]
-            # H-02: get_server() уже вернул account_ids в этом же снимке —
-            # второе отдельное чтение get_server_links не нужно, окно гонки
-            # между двумя SELECT (и вместе с ним семантика links=None для
-            # этого пути) исчезает по построению.
-            link_ids = storage.get("account_ids") or []
-            self._edit_cache[server_key] = {
-                "storage": srv_data.to_storage(), "links": link_ids}
-        self._mark_server_orphan_dirty(server_key)
+        await self._leaf_orphan_into_new_draft(
+            _SERVER_SPEC, server_key, desc, data)
 
     def _mark_server_orphan_dirty(self, server_key):
-        self._dirty_ids.add(server_key)
-        self._refresh_server_marker(server_key[1])
+        self._leaf_mark_dirty(_SERVER_SPEC, server_key)
 
     # ----- Кеш несохранённых правок -----
 
     def _stash_current_server_edits(self):
-        if self._current_server is None:
-            return
-        storage = self._collect_server_storage()
-        self._edit_cache[self._current_server] = {
-            "storage": storage,
-            "links": self.server_tabs.f_linked_accounts.get_data()}
-        self._dirty_ids.add(self._current_server)
+        self._leaf_stash(_SERVER_SPEC)
 
     # ----- Плашка/статус/дерево -----
 

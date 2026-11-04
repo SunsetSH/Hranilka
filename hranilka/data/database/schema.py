@@ -8,6 +8,7 @@ from datetime import datetime
 from hranilka.data.errors import FutureSchemaError, PreMigrationBackupError
 from hranilka.data.database.state import DbBase
 from hranilka.core.util import best_effort_wipe
+from hranilka.crypto import store as crypto_store
 
 # Версия схемы базы данных. Увеличивается при изменении структуры таблиц,
 # чтобы _migrate() мог обновить существующие документы пользователей.
@@ -27,7 +28,19 @@ from hranilka.core.util import best_effort_wipe
 #      панели управления) — таблицы servers/server_links/server_gallery +
 #      миграция m012 (аддитивная). Сущность полностью независима от
 #      финансовых записей (fin_items) — своя таблица, свои связи, своя галерея.
-SCHEMA_VERSION = 12
+# v13: лист (аккаунт/карта/кошелёк/сервер) может лежать прямо в папке —
+#      колонка folder_id в accounts/fin_items/servers (FK folders ON DELETE
+#      SET NULL; CHECK: заполнен максимум один из service_id/folder_id) +
+#      индексы; миграция m013 (аддитивная, идемпотентная).
+SCHEMA_VERSION = 13
+
+# Таблицы-листья дерева и общее определение колонки folder_id (единый источник
+# для CREATE TABLE новых баз и ALTER TABLE в m013/create_tables). CHECK держит
+# инвариант «максимум один родитель» на уровне БД, в т.ч. для мигрированных баз.
+LEAF_TABLES = ("accounts", "fin_items", "servers")
+LEAF_FOLDER_COLUMN_DDL = (
+    "INTEGER REFERENCES folders(id) ON DELETE SET NULL "
+    "CHECK (service_id IS NULL OR folder_id IS NULL)")
 
 # Обязательные таблицы актуальной схемы. На «быстром пути» create_tables() даже
 # при совпадении версии проверяет их наличие (M6-06): частично повреждённую базу
@@ -206,6 +219,9 @@ class DbSchemaMixin(DbBase):
         # этой колонки CREATE INDEX падал (латентный баг: diff колонок раньше
         # выполнялся только в _migrate(), уже ПОСЛЕ индексов).
         self._add_missing_columns()
+        # v13: folder_id у листьев + индексы — тоже ДО общего блока индексов и
+        # до _migrate (идемпотентно, тот же код, что в m013).
+        self._ensure_leaf_folder_columns(self.cursor)
 
         # Дедуп + (пере)создание индексов — ОДНОЙ транзакцией (M65-05): при сбое
         # посередине (диск/исключение) `with self.conn` откатит и удаление дублей,
@@ -271,6 +287,27 @@ class DbSchemaMixin(DbBase):
                         f"ALTER TABLE {table} ADD COLUMN {name} {definition}"
                     )
 
+    @staticmethod
+    def _ensure_leaf_folder_columns(executor):
+        """v13: добавляет folder_id в accounts/fin_items/servers и индексы
+        idx_<table>_folder (идемпотентно: колонка проверяется через PRAGMA,
+        индекс — IF NOT EXISTS). Таблица, которой ещё нет (база старше её
+        миграции), пропускается — её создаст соответствующий шаг/CREATE.
+        Единый источник для m013 и create_tables. executor — объект с .execute
+        (cursor либо conn)."""
+        for table in LEAF_TABLES:
+            cols = {row[1] for row in
+                    executor.execute(f"PRAGMA table_info({table})").fetchall()}
+            if not cols:
+                continue
+            if "folder_id" not in cols:
+                executor.execute(
+                    f"ALTER TABLE {table} ADD COLUMN folder_id "
+                    f"{LEAF_FOLDER_COLUMN_DDL}")
+            executor.execute(
+                f"CREATE INDEX IF NOT EXISTS idx_{table}_folder "
+                f"ON {table}(folder_id)")
+
     # Ожидаемые колонки таблиц для добавления в старые базы (имя -> SQL-определение).
     # Используется в _add_missing_columns; новые базы создаются полными в create_tables().
     _EXPECTED_COLUMNS = {
@@ -317,6 +354,9 @@ class DbSchemaMixin(DbBase):
         for table, columns in self._EXPECTED_COLUMNS.items():
             if not columns.keys() <= self._get_columns(table):
                 return False
+        for table in LEAF_TABLES:                      # v13: folder_id у листьев
+            if "folder_id" not in self._get_columns(table):
+                return False
         self.cursor.execute(
             "SELECT name FROM sqlite_master WHERE type='index'")
         indexes = {row["name"] for row in self.cursor.fetchall()}
@@ -347,8 +387,11 @@ class DbSchemaMixin(DbBase):
 
         Используется и перед миграцией версии, и перед деструктивным dedup +
         пересборкой UNIQUE-индексов (M7-01). Только plaintext: в шифрованном
-        режиме на диске уже лежит НЕИЗМЕНЁННЫЙ контейнер прежней версии — он и
-        есть снимок «до правки» (persist происходит уже после).
+        режиме на диске до первой записи лежит НЕИЗМЕНЁННЫЙ контейнер прежней
+        версии, но первый же persist после миграции перезапишет его — поэтому
+        контейнер (шифртекст) тоже копируется под тем же именем и ОСТАЁТСЯ на
+        диске (см. _finish_premigration_backup): откат на версию «до миграции»
+        возможен и после сохранения.
 
         Имя копии УНИКАЛЬНО (`<db>.pre-migrate-v{ver}-{YYYYMMDD-HHMMSS}`): копию
         от прошлого прерванного прогона мы НЕ перезаписываем (иначе рабочий файл
@@ -357,9 +400,9 @@ class DbSchemaMixin(DbBase):
 
         При сбое копирования поднимает PreMigrationBackupError — правка схемы
         НЕ должна продолжаться без резервной копии (H7-03a)."""
-        if self.encrypted:
-            return None
         if not os.path.exists(self.db_path):
+            return None
+        if self.encrypted and not crypto_store.is_encrypted_file(self.db_path):
             return None
         # Уцелевшие копии прошлых прерванных прогонов — заметно в лог, не трогаем.
         self._warn_leftover_premigrate()
@@ -420,6 +463,8 @@ class DbSchemaMixin(DbBase):
         прерванных прогонов не трогаем (см. _warn_leftover_premigrate)."""
         if not path:
             return
+        if crypto_store.is_encrypted_file(path):
+            return    # шифртекст: затирать нечего, копия нужна для отката
         best_effort_wipe(path)
 
     def _migrate(self):
@@ -455,6 +500,7 @@ class DbSchemaMixin(DbBase):
                 sort_order INTEGER DEFAULT 0,
                 deleted_at TIMESTAMP,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                folder_id {LEAF_FOLDER_COLUMN_DDL},
                 FOREIGN KEY (service_id) REFERENCES services(id) ON DELETE CASCADE
             )
         """
@@ -510,6 +556,7 @@ class DbSchemaMixin(DbBase):
                 sort_order INTEGER DEFAULT 0,
                 deleted_at TIMESTAMP,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                folder_id {LEAF_FOLDER_COLUMN_DDL},
                 FOREIGN KEY (service_id) REFERENCES services(id) ON DELETE CASCADE
             )
         """
@@ -603,6 +650,7 @@ class DbSchemaMixin(DbBase):
                 sort_order INTEGER DEFAULT 0,
                 deleted_at TIMESTAMP,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                folder_id {LEAF_FOLDER_COLUMN_DDL},
                 FOREIGN KEY (service_id) REFERENCES services(id) ON DELETE CASCADE
             )
         """

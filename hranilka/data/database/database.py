@@ -28,8 +28,7 @@ from hranilka.data.database.concurrency import DbConcurrencyMixin
 from hranilka.data.database.fin_items import DbFinItemsMixin
 from hranilka.data.database.gallery_ops import DbGalleryOpsMixin
 from hranilka.data.database.persistence import DbPersistenceMixin
-from hranilka.data.database.schema import (SCHEMA_VERSION, _REQUIRED_TABLES,
-                                           DbSchemaMixin)
+from hranilka.data.database.schema import (SCHEMA_VERSION, DbSchemaMixin)
 from hranilka.data.database.servers import DbServersMixin
 from hranilka.data.database.tree_ops import DbTreeOpsMixin
 from hranilka.data.errors import (CorruptedPayloadError, FutureSchemaError,
@@ -57,7 +56,13 @@ class Database(DbConcurrencyMixin, DbPersistenceMixin, DbSchemaMixin,
         # Состояние шифрования. Когда encrypted=True, БД живёт в sqlite :memory:,
         # а на диске лежит зашифрованный контейнер (см. crypto_store).
         self.encrypted = False
-        self._dek: bytes | None = None       # ключ данных (расшифрованный), только в памяти
+        self._dek: bytearray | None = None   # ключ данных (расшифрованный), только в памяти; зануляется при lock()
+        # Короткий лок на снимок/зануление ключа: seal_and_write идёт в потоке
+        # писателя БЕЗ _lock, а lock() - в UI-потоке (B13/S8).
+        self._key_lock = threading.Lock()
+        # Отпечаток контейнера на диске (шифр. режим): гасит ложные конфликты
+        # от смены mtime антивирусом/облаком (см. _check_no_external_change).
+        self._disk_fingerprint: bytes | None = None
         self._header: dict | None = None     # заголовок контейнера (соли, обёрнутые DEK)
         # Отложенная запись на диск (только шифр. режим): мутаторы помечают БД
         # «грязной», а контроллер сбрасывает её один раз за оборот событийного

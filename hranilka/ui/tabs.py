@@ -1,10 +1,12 @@
-﻿from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
-                               QScrollArea)
+﻿from typing import Iterator
+
+from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
+                               QScrollArea, QFrame)
 from PySide6.QtCore import Qt
 from hranilka.ui.flowlayout import WrappingTabWidget
 from hranilka.ui.widgets import (CopyableField, CopyableDateField, CopyableTextEdit,
                      SecretQuestionsWidget, CodeListWidget, GalleryWidget,
-                     IntervalField, LinkedAccountsWidget, LinkedFinItemsWidget,
+                     IntervalField, KeyValueListWidget, LinkedAccountsWidget, LinkedFinItemsWidget,
                      LinkedServersWidget, MaskedTextEdit, heading_label)
 
 
@@ -41,6 +43,127 @@ def apply_scroll_areas_bg(scroll_areas, main_bg: str) -> None:
     for sa in scroll_areas:
         sa.setStyleSheet(style)
         sa.viewport().setStyleSheet(vp_style)
+
+
+class PayloadTabs(WrappingTabWidget):
+    """Общая основа карточек, чьи данные - плоский payload (fin/server): набор
+    скалярных полей (_widgets), повторяемых блоков (_list_widgets), связей с
+    аккаунтами, галереи. Подкласс задаёт _field_keys()/_list_keys() и при
+    необходимости переопределяет хуки _load_fields/_load_extra/_collect_extra/
+    _extra_editable_widgets."""
+
+    LINKS_HEADING = ""                  # заголовок секции связей
+    LINKS_SEPARATOR = False             # линия над секцией связей
+
+    def __init__(self, parent=None, config=None):
+        super().__init__(parent)
+        self.config = config
+        self._widgets: dict[str, QWidget] = {}      # key поля -> виджет
+        self._list_widgets: dict[str, KeyValueListWidget] = {}  # key блока
+        self._scroll_areas: list[QScrollArea] = []
+
+    def _add_scroll_tab(self, inner: QWidget, title: str) -> None:
+        sa = wrap_scrollable(inner, self)
+        self._scroll_areas.append(sa)
+        index = self.addTab(sa, title)
+        self.bind_empty_page(inner, index)
+
+    def apply_scroll_bg(self, main_bg: str) -> None:
+        apply_scroll_areas_bg(self._scroll_areas, main_bg)
+
+    def _add_links_section(self, page, layout):
+        """Секция связей с аккаунтами внизу первой вкладки."""
+        extra: tuple[QWidget, ...] = ()
+        if self.LINKS_SEPARATOR:
+            line = QFrame()
+            line.setFrameShape(QFrame.HLine)
+            line.setFrameShadow(QFrame.Sunken)
+            layout.addWidget(line)
+            extra = (line,)
+        self.f_linked_accounts = LinkedAccountsWidget()
+        label = heading_label(self.LINKS_HEADING)
+        layout.addWidget(label)
+        layout.addWidget(self.f_linked_accounts)
+        self.register_empty_section(
+            page, (*extra, label, self.f_linked_accounts),
+            lambda: bool(self.f_linked_accounts.get_data()))
+
+    def _build_gallery_tab(self):
+        """Вкладка «Галерея»: GalleryWidget аккаунта; загрузка/сохранение BLOB
+        подключаются извне (карточкой)."""
+        w = QWidget(self)
+        layout = QVBoxLayout(w)
+        layout.setSpacing(10)
+        layout.setContentsMargins(0, 8, 0, 0)
+        self.f_gallery_widget = GalleryWidget(config=self.config)
+        layout.addWidget(self.f_gallery_widget)
+        self.register_empty_section(
+            w, self.f_gallery_widget,
+            lambda: bool(self.f_gallery_widget.items))
+        return w
+
+    # ----- Контракт подкласса -----
+
+    def _field_keys(self) -> Iterator[str]:
+        raise NotImplementedError
+
+    def _list_keys(self) -> Iterator[str]:
+        raise NotImplementedError
+
+    def _extra_editable_widgets(self) -> list:
+        return []
+
+    def _load_extra(self, payload: dict) -> None:
+        """Хук: специальные поля сверх скаляров и ListSpec-блоков."""
+
+    def _collect_extra(self, payload: dict) -> None:
+        """Хук: дописать специальные поля в собираемый payload."""
+
+    # ----- Итерация / контракт карточки -----
+
+    def fields(self) -> Iterator[tuple[str, QWidget]]:
+        """(key, widget) для каждого скалярного поля payload."""
+        for key in self._field_keys():
+            yield key, self._widgets[key]
+
+    def list_fields(self) -> Iterator[tuple[str, KeyValueListWidget]]:
+        """(key, widget) для каждого повторяемого блока."""
+        for key in self._list_keys():
+            yield key, self._list_widgets[key]
+
+    def set_all_editable(self, editable: bool) -> None:
+        self.f_name.set_editable(editable)
+        for _key, widget in self.fields():
+            widget.set_editable(editable)
+        for _key, widget in self.list_fields():
+            widget.set_editable(editable)
+        for widget in self._extra_editable_widgets():
+            widget.set_editable(editable)
+        self.f_linked_accounts.set_editable(editable)
+        self.f_gallery_widget.set_editable(editable)
+        self.refresh_empty_visibility(editable)
+
+    def _load_fields(self, payload: dict) -> None:
+        for key, widget in self.fields():
+            widget.set_text(str(payload.get(key, "") or ""))
+
+    def _load_lists(self, payload: dict) -> None:
+        for key, list_widget in self.list_fields():
+            value = payload.get(key)
+            # Толерантное чтение: не-список (битые данные) - пустой блок.
+            list_widget.set_items(value if isinstance(value, list) else [])
+
+    def load_payload(self, payload: dict) -> None:
+        self._load_fields(payload)
+        self._load_lists(payload)
+        self._load_extra(payload)
+
+    def collect_payload(self) -> dict:
+        payload = {key: widget.get_text() for key, widget in self.fields()}
+        payload.update(
+            {key: widget.get_items() for key, widget in self.list_fields()})
+        self._collect_extra(payload)
+        return payload
 
 
 class AccountTabs(WrappingTabWidget):

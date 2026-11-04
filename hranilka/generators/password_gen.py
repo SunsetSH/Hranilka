@@ -7,9 +7,12 @@ CONFIG_KEY (словарь), читаются с защитной валидац
 """
 from __future__ import annotations
 
+import math
 import secrets
 from dataclasses import dataclass, field
 from typing import Any, Mapping
+
+from hranilka.generators.wordlist_data import WORDLIST
 
 CONFIG_KEY = "password_gen"
 
@@ -20,6 +23,7 @@ LENGTH_MIN, LENGTH_MAX = 5, 128
 WORDS_MIN, WORDS_MAX = 3, 12
 MIN_COUNT_MAX = 10
 SEPARATOR_MAX_LEN = 3
+_POLICY_RETRIES = 100
 
 _UPPER = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 _LOWER = "abcdefghijklmnopqrstuvwxyz"
@@ -28,77 +32,9 @@ _SYMBOLS = "!@#$%^&*"
 # Похожие/трудноразличимые символы (опция «исключать похожие»).
 _SIMILAR = set("0O1lI")
 
-# Словарь парольных фраз: короткие частотные английские слова (3–7 букв).
-# ~380 слов ≈ 8.5 бит/слово; 5 слов ≈ 43 бита + разделители/цифра.
-WORDLIST: tuple[str, ...] = (
-    "acid", "actor", "alarm", "album", "alien", "alley", "amber", "angle",
-    "ankle", "apple", "april", "arena", "argue", "armor", "arrow", "atlas",
-    "attic", "auto", "axis", "bacon", "badge", "baker", "bamboo", "banjo",
-    "barn", "basil", "beach", "beacon", "bean", "bear", "beard", "beetle",
-    "bell", "belt", "bench", "berry", "bird", "bison", "blade", "blanket",
-    "blast", "blaze", "block", "bloom", "blue", "board", "boat", "bolt",
-    "bonus", "book", "boot", "born", "bottle", "bounce", "brain", "brave",
-    "bread", "breeze", "brick", "bridge", "brook", "broom", "brush", "bubble",
-    "bucket", "buddy", "budget", "buffalo", "bugle", "bunny", "burst", "butter",
-    "cabin", "cable", "cactus", "cake", "camel", "camera", "candle", "candy",
-    "canoe", "canvas", "canyon", "carbon", "cargo", "carpet", "carrot", "castle",
-    "cattle", "cedar", "cellar", "cement", "chain", "chair", "chalk", "charm",
-    "cheese", "cherry", "chess", "chest", "chief", "chill", "choir", "circle",
-    "citrus", "city", "claw", "clay", "cliff", "climb", "clock", "cloud",
-    "clover", "coach", "coast", "cobalt", "cocoa", "coffee", "coin", "comet",
-    "compass", "coral", "corn", "cotton", "cougar", "county", "cover", "coyote",
-    "crab", "craft", "crane", "crater", "crayon", "creek", "cricket", "crown",
-    "cruise", "crystal", "cube", "curtain", "cycle", "daisy", "dance", "dawn",
-    "decade", "deer", "delta", "denim", "desert", "desk", "dial", "diamond",
-    "diesel", "dinner", "dolphin", "dome", "donkey", "door", "dragon", "drift",
-    "drum", "dune", "dust", "eagle", "earth", "echo", "eight", "elbow",
-    "elder", "elm", "ember", "emerald", "engine", "envoy", "estate", "fabric",
-    "falcon", "fancy", "farm", "feather", "fence", "fern", "ferry", "fiber",
-    "field", "finch", "flag", "flame", "flash", "fleet", "flint", "flood",
-    "floor", "flour", "flute", "fog", "forest", "fork", "fossil", "fountain",
-    "fox", "frame", "friend", "frost", "fruit", "galaxy", "garden", "garlic",
-    "gate", "gecko", "gentle", "giant", "ginger", "glacier", "glass", "globe",
-    "glove", "gold", "goose", "gorge", "grain", "granite", "grape", "grass",
-    "gravel", "green", "grill", "grove", "guitar", "gulf", "hammer", "harbor",
-    "harvest", "hawk", "hazel", "heart", "hedge", "helmet", "herb", "heron",
-    "hill", "hive", "hobby", "hockey", "honey", "hood", "hook", "horizon",
-    "horse", "hotel", "house", "hunter", "ice", "igloo", "index", "iron",
-    "island", "ivory", "jacket", "jade", "jaguar", "jelly", "jewel", "jungle",
-    "juice", "kayak", "kettle", "kiwi", "knight", "koala", "ladder", "lagoon",
-    "lake", "lamp", "lantern", "laser", "laurel", "lava", "leaf", "ledge",
-    "lemon", "lentil", "level", "lily", "lime", "linen", "lion", "lizard",
-    "lobby", "locket", "lodge", "lotus", "lumber", "lunar", "lynx", "magnet",
-    "mango", "mantle", "maple", "marble", "market", "mask", "meadow", "medal",
-    "melon", "mesa", "metal", "meteor", "mint", "mirror", "mole", "monitor",
-    "moon", "morning", "mosaic", "moss", "moth", "motor", "mountain", "mouse",
-    "mural", "music", "napkin", "nectar", "needle", "nickel", "night", "noble",
-    "north", "nova", "nugget", "nutmeg", "oak", "oasis", "ocean", "olive",
-    "onion", "opal", "orange", "orbit", "orchid", "otter", "owl", "oxygen",
-    "oyster", "paddle", "palace", "palm", "panda", "panel", "paper", "parade",
-    "parrot", "pasta", "patio", "peach", "pearl", "pebble", "pencil", "penguin",
-    "pepper", "petal", "photo", "piano", "pickle", "pigeon", "pillow", "pilot",
-    "pine", "pistol", "pixel", "pizza", "planet", "plank", "plaza", "plum",
-    "pocket", "polar", "pond", "poppy", "portal", "prairie", "prism", "pump",
-    "pumpkin", "puzzle", "pyramid", "quartz", "quill", "rabbit", "raccoon",
-    "radar", "radio", "raft", "rain", "ranch", "raven", "reef", "ribbon",
-    "rice", "ridge", "rifle", "river", "roast", "robin", "rocket", "roof",
-    "rope", "rose", "ruby", "rustic", "saddle", "sage", "salad", "salmon",
-    "salt", "sand", "sapphire", "satin", "sauce", "scale", "scarf", "school",
-    "scout", "sea", "seed", "shadow", "shark", "shelf", "shell", "shield",
-    "shore", "silk", "silver", "sketch", "skill", "sky", "slate", "sleigh",
-    "smile", "snow", "socket", "solar", "sonar", "spark", "sphere", "spice",
-    "spider", "spiral", "spring", "spruce", "square", "stable", "stadium",
-    "star", "steam", "steel", "stone", "storm", "stove", "straw", "stream",
-    "street", "sugar", "summit", "sun", "sunset", "swan", "sweet", "syrup",
-    "table", "talon", "tango", "tea", "temple", "tent", "thunder", "tiger",
-    "timber", "toast", "token", "tomato", "torch", "tower", "trail", "train",
-    "tree", "tribe", "trout", "trumpet", "tulip", "tunnel", "turtle", "urban",
-    "valley", "vanilla", "vapor", "velvet", "verse", "vessel", "vine", "violet",
-    "violin", "vista", "volcano", "wagon", "walnut", "walrus", "water", "wave",
-    "weather", "whale", "wheat", "wheel", "willow", "wind", "window", "winter",
-    "wolf", "wonder", "wood", "wool", "yarn", "yellow", "zebra", "zenith",
-)
-
+# Словарь парольных фраз — 2048 слов (11 бит/слово), см. wordlist_data.py.
+WORDS_DEFAULT = 6
+DIGIT_BITS = math.log2(10)
 
 @dataclass(frozen=True)
 class PasswordOptions:
@@ -116,7 +52,7 @@ class PasswordOptions:
 @dataclass(frozen=True)
 class PassphraseOptions:
     """Опции генерации парольной фразы из словарных слов."""
-    words: int = 5
+    words: int = WORDS_DEFAULT
     separator: str = "-"
     capitalize: bool = True
     add_digit: bool = True
@@ -144,8 +80,9 @@ def _secure_shuffle(items: list[str]) -> None:
 def generate_password(opts: PasswordOptions) -> str:
     """Криптостойкий пароль по опциям.
 
-    Минимумы цифр/спецсимволов гарантируются конструктивно (сначала кладём
-    обязательные символы, затем добор из общего пула, затем перемешивание).
+    Минимумы цифр/спецсимволов и по одному символу каждого включённого класса
+    гарантируются конструктивно (сначала обязательные символы, затем добор из
+    общего пула, затем перемешивание) + проверка политики с повтором.
     Минимумы, не влезающие в длину, срезаются; выключенный набор обнуляет
     свой минимум. Ни один набор не включён — ValueError (UI не допускает)."""
     length = _clamp(opts.length, LENGTH_MIN, LENGTH_MAX)
@@ -170,11 +107,50 @@ def generate_password(opts: PasswordOptions) -> str:
         min_symbols -= cut
         min_digits -= overflow - cut
 
-    chars = [secrets.choice(digits) for _ in range(min_digits)]
-    chars += [secrets.choice(symbols) for _ in range(min_symbols)]
-    chars += [secrets.choice(pool) for _ in range(length - len(chars))]
-    _secure_shuffle(chars)
+    classes = [c for c in (
+        filtered(_UPPER) if opts.use_upper else "",
+        filtered(_LOWER) if opts.use_lower else "",
+        digits, symbols) if c]
+    for _ in range(_POLICY_RETRIES):
+        chars = [secrets.choice(digits) for _ in range(min_digits)]
+        chars += [secrets.choice(symbols) for _ in range(min_symbols)]
+        # По одному символу каждого включённого класса (если влезает в длину).
+        for cls in classes:
+            if len(chars) >= length:
+                break
+            if not any(ch in cls for ch in chars):
+                chars.append(secrets.choice(cls))
+        chars += [secrets.choice(pool) for _ in range(length - len(chars))]
+        _secure_shuffle(chars)
+        if _policy_met(chars, classes, min_digits, min_symbols, digits, symbols):
+            break
     return "".join(chars)
+
+
+def _policy_met(chars: list[str], classes: list[str], min_digits: int,
+                min_symbols: int, digits: str, symbols: str) -> bool:
+    """Политика: минимумы цифр/спецсимволов и по символу каждого класса
+    (последнее — только пока классов не больше длины)."""
+    if sum(ch in digits for ch in chars) < min_digits:
+        return False
+    if sum(ch in symbols for ch in chars) < min_symbols:
+        return False
+    if len(classes) > len(chars):
+        return True
+    return all(any(ch in cls for ch in chars) for cls in classes)
+
+
+def passphrase_entropy_bits(opts: PassphraseOptions) -> float:
+    """Энтропия парольной фразы в битах по настройкам (с учётом clamp слов).
+
+    log2(N) на слово; цифра в конце одного из слов добавляет log2(слов) на
+    выбор слова и log2(10) на саму цифру. Заглавные и разделитель
+    детерминированы и энтропии не добавляют."""
+    count = _clamp(opts.words, WORDS_MIN, WORDS_MAX)
+    bits = count * math.log2(len(WORDLIST))
+    if opts.add_digit:
+        bits += math.log2(count) + DIGIT_BITS
+    return bits
 
 
 def generate_passphrase(opts: PassphraseOptions) -> str:
@@ -234,7 +210,7 @@ def settings_from_config(raw: Any) -> GeneratorSettings:
             exclude_similar=_get_bool(raw, "pw_exclude_similar", False),
         ),
         phrase=PassphraseOptions(
-            words=_get_int(raw, "ph_words", 5, WORDS_MIN, WORDS_MAX),
+            words=_get_int(raw, "ph_words", WORDS_DEFAULT, WORDS_MIN, WORDS_MAX),
             separator=separator[:SEPARATOR_MAX_LEN],
             capitalize=_get_bool(raw, "ph_capitalize", True),
             add_digit=_get_bool(raw, "ph_digit", True),

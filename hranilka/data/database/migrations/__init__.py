@@ -53,3 +53,9 @@ MIGRATIONS[11] = _m011
 from hranilka.data.database.migrations.m012_servers import migrate as _m012
 
 MIGRATIONS[12] = _m012
+
+# v12→v13: листья (аккаунт/карта/кошелёк/сервер) могут лежать прямо в папке —
+# колонка folder_id в accounts/fin_items/servers.
+from hranilka.data.database.migrations.m013_leaf_folder import migrate as _m013
+
+MIGRATIONS[13] = _m013

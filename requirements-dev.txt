@@ -4,6 +4,9 @@
 pytest==9.1.1
 pytest-asyncio==1.4.0
 mypy==2.1.0
+ruff==0.8.6
 # Сборка автономного .exe (см. README, раздел «Сборка»). Версия закреплена для
 # воспроизводимости сборки (L65-03).
 pyinstaller==6.21.0
+# Хэши (supply-chain): pip-compile --generate-hashes requirements.in -o requirements.txt
+# и pip install --require-hashes -r requirements.txt (см. README, «Релиз»).

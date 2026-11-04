@@ -58,7 +58,7 @@ def test_drop_plan_splits_the_whole_row_into_two_large_zones(qapp):
 
 def test_reorder_moves_multiple_rows_as_one_stable_block(qapp):
     tree = _visible_tree(qapp)
-    a = _item(tree, 1, "A")
+    _item(tree, 1, "A")
     b = _item(tree, 2, "B")
     c = _item(tree, 3, "C")
     d = _item(tree, 4, "D")

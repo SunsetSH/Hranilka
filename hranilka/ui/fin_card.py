@@ -18,11 +18,58 @@ from hranilka.core.nodetypes import FIN_LEAF_TYPES
 from hranilka.data.database import StaleSessionError
 from hranilka.data.models.fin_item import FinItemData
 from hranilka.ui.account_card import AccountCardMixin
+from hranilka.ui.card_base import CardFlowMixin, LeafCardSpec
 from hranilka.ui import theme
 from hranilka.core import util
 
 
-class FinCardMixin:
+def _fin_on_saved(win, storage):
+    """После успешного сохранения: плашка срока + пересинхронизация списков
+    из сохранённого payload (пустые строки уже отфильтрованы get_items)."""
+    win._update_fin_banner(storage.get("item_type"), storage.get("payload") or {})
+    win._resync_fin_lists(storage.get("payload") or {})
+
+
+async def _fin_orphan_links(win, key, storage, session):
+    """Связи для нового черновика осиротевшей загрузки. H-02: при сбое чтения
+    возвращаем None («не трогать при сохранении»), а НЕ [] — иначе
+    последующее сохранение стёрло бы реальные fin_links."""
+    try:
+        return await win.db.run_async(
+            win.db.get_item_links, key[1], _session=session)
+    except StaleSessionError:
+        raise
+    except Exception as e:                    # noqa: BLE001
+        logging.error("Не удалось подгрузить связи записи для "
+                      "осиротевшей загрузки: %s", e, exc_info=e)
+        return None
+
+
+_FIN_SPEC = LeafCardSpec(
+    tabs_attr="fin_tabs", key_attr="_current_fin",
+    edit_flag_attr="_fin_edit_on_load", edit_flag_value=lambda k: k,
+    data_attr="current_fin_data", data_cls=FinItemData,
+    entity_name="финансовой записи",
+    db_load="load_fin_item", db_link_accounts="get_item_link_accounts",
+    db_links="get_item_links", db_save="save_fin_item_with_links",
+    exclude_kw="exclude_fin_item_id",
+    apply="_apply_fin_storage", collect="_collect_fin_storage",
+    status="_update_fin_status",
+    marker=lambda w, k: w._refresh_fin_marker(*k),
+    on_saved=_fin_on_saved,
+    update_item_after_save=lambda w, k, st: w._update_fin_item_after_save(
+        k[0], k[1], st),
+    err_load="Не удалось загрузить запись",
+    err_save="Не удалось сохранить запись",
+    err_recover=("Не удалось восстановить связи черновика записи — открытие "
+                 "отменено, чтобы не потерять привязки"),
+    orphan_log_load="Не удалось подгрузить запись для осиротевшей загрузки",
+    orphan_deleted="Загрузка отменена: запись удалена",
+    orphan_links=_fin_orphan_links,
+)
+
+
+class FinCardMixin(CardFlowMixin):
     """Правая панель для финансовых записей: диспетчер выбора + просмотр/правка."""
 
     # ----- Диспетчер выбора узла -----
@@ -57,9 +104,7 @@ class FinCardMixin:
     def _open_fin_card(self, current, node):
         node_type, item_id = node["type"], node["id"]
         # Одноразовый флаг «открыть в правке» действует только для своей записи.
-        if (self._fin_edit_on_load is not None
-                and self._fin_edit_on_load != (node_type, item_id)):
-            self._fin_edit_on_load = None
+        self._drop_stale_edit_flag("_fin_edit_on_load", (node_type, item_id))
         # Новое поколение карточки: устаревшие async-результаты не тронут UI.
         self._card_gen += 1
         gen = self._card_gen
@@ -75,89 +120,8 @@ class FinCardMixin:
     # ----- Асинхронная загрузка -----
 
     async def _load_fin_into_ui(self, node_type, item_id, gen):
-        """Загрузить карточку записи (или восстановить из кеша правок). После
-        каждого await сверяем gen: устаревшая загрузка выходит, не трогая UI."""
-        session = self.db.current_session()
-        try:
-            if (node_type, item_id) in self._edit_cache:
-                cached = self._edit_cache[(node_type, item_id)]
-                link_ids = cached.get("links")
-                if link_ids is None:
-                    # H-02: связи неизвестны (черновик пережил сбой чтения
-                    # get_item_links при осиротевшей загрузке галереи). НЕ
-                    # подменяем молча пустым списком — обычное сохранение
-                    # синхронизировало бы fin_links с [] и стёрло бы реальные
-                    # привязки. load_fin_item не отдаёт связи в одном снимке
-                    # (в отличие от get_server), поэтому второе чтение здесь
-                    # неизбежно — пытаемся перечитать; вторая неудача —
-                    # открываем карточку fail-closed, черновик не трогаем.
-                    try:
-                        link_ids = await self.db.run_async(
-                            self.db.get_item_links, item_id, _session=session)
-                    except StaleSessionError:
-                        return
-                    except Exception as e:            # noqa: BLE001
-                        if gen == self._card_gen:
-                            self._current_fin = None
-                            self.is_editing = False
-                            self._show_placeholder()
-                            self._show_card_error(
-                                "Не удалось восстановить связи черновика "
-                                "записи — открытие отменено, чтобы не "
-                                "потерять привязки", e)
-                        return
-                    if gen != self._card_gen:
-                        return
-                    cached["links"] = link_ids        # связи стали известны
-                links = await self.db.run_async(
-                    self._resolve_link_names, link_ids, _session=session)
-                other_bytes = await self.db.run_async(
-                    self.db.gallery_total_bytes, exclude_fin_item_id=item_id,
-                    _session=session)
-                if gen != self._card_gen:
-                    return
-                self._apply_fin_storage(cached["storage"], links, other_bytes)
-                self.is_editing = True
-                self.fin_tabs.set_all_editable(True)
-                self.edit_btn.hide(); self.save_btn.show(); self.cancel_btn.show()
-            else:
-                storage = await self.db.run_async(
-                    self.db.load_fin_item, item_id, _session=session)
-                if gen != self._card_gen:
-                    return
-                if storage is None:
-                    # Запись исчезла между выбором и загрузкой — заглушка.
-                    self._current_fin = None
-                    self.is_editing = False
-                    self._show_placeholder()
-                    self._update_fin_status()
-                    return
-                links = await self.db.run_async(
-                    self.db.get_item_link_accounts, item_id, _session=session)
-                other_bytes = await self.db.run_async(
-                    self.db.gallery_total_bytes, exclude_fin_item_id=item_id,
-                    _session=session)
-                if gen != self._card_gen:
-                    return
-                self._apply_fin_storage(storage, links, other_bytes)
-                self.is_editing = False
-                self.fin_tabs.set_all_editable(False)
-                self.edit_btn.show(); self.save_btn.hide(); self.cancel_btn.hide()
-                if self._fin_edit_on_load == (node_type, item_id):
-                    # Только что созданная запись — сразу в режим правки.
-                    self._fin_edit_on_load = None
-                    self.is_editing = True
-                    self.fin_tabs.set_all_editable(True)
-                    self.edit_btn.hide(); self.save_btn.show(); self.cancel_btn.show()
-            self._update_fin_status()
-        except StaleSessionError:
-            return                               # БД сменена (lock/restore) — молча
-        except Exception as e:                       # noqa: BLE001
-            if gen == self._card_gen:
-                self._show_card_error("Не удалось загрузить запись", e)
-        finally:
-            if gen == self._card_gen:
-                self._set_card_busy(False)
+        """Загрузить карточку записи (или восстановить из кеша правок)."""
+        await self._leaf_load_async(_FIN_SPEC, (node_type, item_id), gen)
 
     def _apply_fin_storage(self, storage, links=None, other_bytes=None):
         """Заполнить FinItemTabs из storage (имя, поля, связи с аккаунтами,
@@ -251,139 +215,19 @@ class FinCardMixin:
             self.cancel_edit()
 
     def fin_toggle_edit(self):
-        if self._card_busy:
-            return
-        self.is_editing = True
-        self.fin_tabs.set_all_editable(True)
-        self.edit_btn.hide(); self.save_btn.show(); self.cancel_btn.show()
-        self._update_fin_status()
+        self._leaf_toggle_edit(_FIN_SPEC)
 
     def fin_save(self):
-        if self._card_busy:
-            return
-        if not self._validate_card_name(self.fin_tabs, "финансовой записи"):
-            return
-        self._set_card_busy(True)
-        util.fire(self._fin_save_async(self._card_gen))
+        self._leaf_save(_FIN_SPEC, self._fin_save_async)
 
     async def _fin_save_async(self, gen):
-        session = self.db.current_session()
-        fin = self._current_fin
-        if fin is None:
-            self._set_card_busy(False)
-            return
-        node_type, item_id = fin
-        # Блокируем поля на время записи (снимок согласован до await), H65-01.
-        active_tab = self.fin_tabs.currentIndex()
-        self.fin_tabs.set_all_editable(False)
-        # Дождаться незавершённых загрузок картинок галереи: иначе get_data()
-        # пропустит ещё не дочитанные BLOB и Save «потеряет» изображение (M6-01).
-        gallery = self.fin_tabs.f_gallery_widget
-        if gallery.has_pending_uploads():
-            self.statusBar().showMessage("Дождитесь загрузки изображений…", 2000)
-            await gallery.wait_pending_uploads()
-            if gen != self._card_gen or self._current_fin != fin:
-                return
-        storage = self._collect_fin_storage()
-        link_ids = self.fin_tabs.f_linked_accounts.get_data()
-        # Карточка и связи с аккаунтами — атомарно, одной транзакцией (§8).
-        try:
-            gallery_ids = await self.db.run_async(
-                self.db.save_fin_item_with_links, item_id, storage, link_ids,
-                _session=session)
-        except StaleSessionError:
-            # БД сменена во время записи (restore, вкл/выкл шифрования) — запись
-            # не выполнена. Если карточка всё ещё открыта (gen совпал), её НЕЛЬЗЯ
-            # оставлять busy/read-only: возвращаем черновик в кеш и разблокируем.
-            if gen == self._card_gen:
-                self._edit_cache[fin] = {"storage": storage, "links": link_ids}
-                self._dirty_ids.add(fin)
-                self._refresh_fin_marker(node_type, item_id)
-                self.fin_tabs.set_all_editable(True)
-                self.fin_tabs.setCurrentIndex(active_tab)
-                self._set_card_busy(False)
-                self.statusBar().showMessage(
-                    "База была переоткрыта — сохранение не выполнено, "
-                    "правки в черновике. Повторите сохранение.", 6000)
-            return
-        except Exception as e:                       # noqa: BLE001
-            if gen == self._card_gen:
-                # Снимок не теряем: возвращаем в кеш правок для повтора.
-                self._edit_cache[fin] = {"storage": storage, "links": link_ids}
-                self._dirty_ids.add(fin)
-                self._refresh_fin_marker(node_type, item_id)
-                self.fin_tabs.set_all_editable(True)
-                self.fin_tabs.setCurrentIndex(active_tab)
-                self._show_card_error("Не удалось сохранить запись", e)
-                self._set_card_busy(False)
-            return
-
-        self._any_db_changes = True
-        if gen == self._card_gen:
-            # Новые картинки получают id своих строк — повторное сохранение
-            # обновит их, а не пересоздаст (лишняя перезапись BLOB).
-            gallery.assign_saved_ids(gallery_ids)
-            self._edit_cache.pop(fin, None)
-            self._dirty_ids.discard(fin)
-            self.is_editing = False
-            self.fin_tabs.set_all_editable(False)
-            self.edit_btn.show(); self.save_btn.hide(); self.cancel_btn.hide()
-            self._update_fin_banner(storage.get("item_type"),
-                                    storage.get("payload") or {})
-            # Пересинхронизируем спископодобные виджеты из сохранённого payload
-            # (пустые строки уже отфильтрованы get_items) — тем же путём, что при
-            # загрузке (см. _apply_fin_storage/load_payload): пустые строки
-            # исчезают и из интерфейса.
-            self._resync_fin_lists(storage.get("payload") or {})
-            self._set_card_busy(False)
-        # Обновляем узел дерева точечно (last4/срок/маркер правок).
-        self._update_fin_item_after_save(node_type, item_id, storage)
-        self.statusBar().showMessage("СОХРАНЕНО!", 2000)
+        await self._leaf_save_async(_FIN_SPEC, gen)
 
     def fin_cancel(self):
-        if self._card_busy:
-            return
-        self._set_card_busy(True)
-        util.fire(self._fin_cancel_async(self._card_gen))
+        self._leaf_cancel(_FIN_SPEC, self._fin_cancel_async)
 
     async def _fin_cancel_async(self, gen):
-        session = self.db.current_session()
-        fin = self._current_fin
-        if fin is None:
-            self._set_card_busy(False)
-            return
-        node_type, item_id = fin
-        self._edit_cache.pop(fin, None)
-        self._dirty_ids.discard(fin)
-        self.is_editing = False
-        try:
-            storage = await self.db.run_async(
-                self.db.load_fin_item, item_id, _session=session)
-            if gen != self._card_gen:
-                return
-            if storage is None:
-                self._current_fin = None
-                self._show_placeholder()
-                self._update_fin_status()
-                self._reload_tree()
-                return
-            links = await self.db.run_async(
-                self.db.get_item_link_accounts, item_id, _session=session)
-            if gen != self._card_gen:
-                return
-            self._apply_fin_storage(storage, links)
-            self.fin_tabs.set_all_editable(False)
-            self.edit_btn.show(); self.save_btn.hide(); self.cancel_btn.hide()
-            self._update_fin_status()
-            self._refresh_fin_marker(node_type, item_id)
-        except StaleSessionError:
-            return
-        except Exception as e:                       # noqa: BLE001
-            if gen == self._card_gen:
-                self._show_card_error("Не удалось отменить правки", e)
-        finally:
-            if gen == self._card_gen:
-                self._set_card_busy(False)
+        await self._leaf_cancel_async(_FIN_SPEC, gen)
 
     # ----- Связи запись ↔ аккаунт (вкладка «Связи», §8) -----
 
@@ -417,86 +261,23 @@ class FinCardMixin:
     # ----- Осиротевшая загрузка галереи (§5, M7-05) -----
 
     def _on_fin_gallery_orphan_upload(self, fin_key, desc, data):
-        """Импорт картинки стартовал для записи fin_key, но к завершению карточку
-        сменили (виджет галереи общий на тип). Не теряем картинку — адресуем её
-        своей записи: живой виджет (вернулись в правку), черновик правок либо
-        новый черновик из БД (по образцу аккаунтной галереи)."""
-        if fin_key is None:
-            return
-        if fin_key == self._current_fin and self.is_editing:
-            self.fin_tabs.f_gallery_widget.add_item(data, desc)
-            self._mark_fin_orphan_dirty(fin_key)
-            return
-        if fin_key in self._edit_cache:
-            self._edit_cache[fin_key]["storage"].setdefault("gallery", []).append(
-                {"desc": desc, "data": data, "image_id": None, "blob_size": None})
-            self._mark_fin_orphan_dirty(fin_key)
-            return
-        util.fire(self._fin_orphan_into_new_draft(fin_key, desc, data))
+        """Импорт картинки стартовал для записи fin_key, но карточку сменили
+        (виджет галереи общий на тип) — адресуем картинку своей записи."""
+        self._leaf_orphan_upload(_FIN_SPEC, fin_key, desc, data,
+                                 self._fin_orphan_into_new_draft)
 
     async def _fin_orphan_into_new_draft(self, fin_key, desc, data):
-        """Создать черновик правок записи из состояния в БД и дописать в него
-        осиротевшую картинку. Если запись удалена — сообщаем и роняем."""
-        _node_type, item_id = fin_key
-        session = self.db.current_session()
-        try:
-            storage = await self.db.run_async(
-                self.db.load_fin_item, item_id, _session=session)
-        except StaleSessionError:
-            return
-        except Exception as e:                       # noqa: BLE001
-            logging.error("Не удалось подгрузить запись для осиротевшей "
-                          "загрузки: %s", e, exc_info=e)
-            return
-        if storage is None:
-            self.statusBar().showMessage("Загрузка отменена: запись удалена", 4000)
-            return
-        # За время await пользователь мог вернуться/занести черновик — не теряем.
-        if fin_key == self._current_fin and self.is_editing:
-            self.fin_tabs.f_gallery_widget.add_item(data, desc)
-        elif fin_key in self._edit_cache:
-            self._edit_cache[fin_key]["storage"].setdefault("gallery", []).append(
-                {"desc": desc, "data": data, "image_id": None, "blob_size": None})
-        else:
-            fin_data = FinItemData.from_storage(storage)
-            fin_data.gallery = list(fin_data.gallery) + [
-                {"desc": desc, "data": data, "image_id": None, "blob_size": None}]
-            try:
-                link_ids = await self.db.run_async(
-                    self.db.get_item_links, item_id, _session=session)
-            except StaleSessionError:
-                return
-            except Exception as e:                    # noqa: BLE001
-                # H-02 (симметрично server_card.py): НЕ подменяем неизвестные
-                # связи пустым списком — иначе последующее сохранение этого
-                # черновика стёрло бы реальные fin_links. None = «не трогать
-                # при сохранении» (save_fin_item_with_links/_save_unsaved_
-                # before_exit).
-                logging.error("Не удалось подгрузить связи записи для "
-                              "осиротевшей загрузки: %s", e, exc_info=e)
-                link_ids = None
-            self._edit_cache[fin_key] = {
-                "storage": fin_data.to_storage(), "links": link_ids}
-        self._mark_fin_orphan_dirty(fin_key)
+        await self._leaf_orphan_into_new_draft(_FIN_SPEC, fin_key, desc, data)
 
     def _mark_fin_orphan_dirty(self, fin_key):
-        """Пометить запись «грязной» и перерисовать её узел после осиротевшей
-        загрузки."""
-        self._dirty_ids.add(fin_key)
-        self._refresh_fin_marker(*fin_key)
+        """Пометить запись «грязной» и перерисовать её узел."""
+        self._leaf_mark_dirty(_FIN_SPEC, fin_key)
 
     # ----- Кеш несохранённых правок -----
 
     def _stash_current_fin_edits(self):
         """Сохраняет несохранённые правки записи в память (не в БД)."""
-        if self._current_fin is None:
-            return
-        storage = self._collect_fin_storage()
-        # links — id аккаунтов с вкладки «Связи» (формат общий с аккаунтом).
-        self._edit_cache[self._current_fin] = {
-            "storage": storage,
-            "links": self.fin_tabs.f_linked_accounts.get_data()}
-        self._dirty_ids.add(self._current_fin)
+        self._leaf_stash(_FIN_SPEC)
 
     # ----- Плашка/статус/дерево -----
 

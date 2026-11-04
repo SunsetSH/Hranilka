@@ -5,8 +5,10 @@
 разбор срока) — только вызовы hranilka.core.fin_domain; UI сам ничего не считает.
 """
 from PySide6.QtWidgets import (QWidget, QHBoxLayout, QLineEdit, QPushButton,
-                               QLabel, QApplication)
+                               QLabel)
 from PySide6.QtCore import Signal
+
+from hranilka.ui.widgets.common import copy_secret, make_copy_button, set_a11y
 
 from hranilka.core.fin_domain import (luhn_check, mask_card_number,
                                       parse_expiry, days_until_expiry,
@@ -31,8 +33,8 @@ class MaskedCardNumberField(QWidget):
 
     copy_signal = Signal()
 
-    _MASK_SHOW = "[*]"   # скрыто — нажать, чтобы показать
-    _MASK_HIDE = "[A]"   # видно — нажать, чтобы скрыть
+    _MASK_SHOW = "*"   # скрыто — нажать, чтобы показать
+    _MASK_HIDE = "A"   # видно — нажать, чтобы скрыть
     _MAX_DIGITS = 19     # максимум цифр в номере карты (ISO/IEC 7812)
 
     def __init__(self, parent=None):
@@ -53,6 +55,7 @@ class MaskedCardNumberField(QWidget):
         self.reveal_btn.setFixedWidth(45)
         self.reveal_btn.setCheckable(True)
         self.reveal_btn.setToolTip("Показать / скрыть номер")
+        set_a11y(self.reveal_btn, "Показать или скрыть номер карты")
         self.reveal_btn.clicked.connect(self._refresh_view)
         layout.addWidget(self.reveal_btn)
 
@@ -60,8 +63,7 @@ class MaskedCardNumberField(QWidget):
         self.luhn_label.setToolTip("Контрольная сумма Луна")
         layout.addWidget(self.luhn_label)
 
-        self.copy_btn = QPushButton("[КОП]")
-        self.copy_btn.setFixedWidth(60)
+        self.copy_btn = make_copy_button(name="Копировать номер карты")
         self.copy_btn.clicked.connect(self.do_copy)
         layout.addWidget(self.copy_btn)
 
@@ -96,7 +98,7 @@ class MaskedCardNumberField(QWidget):
 
     def do_copy(self):
         if self._digits:
-            QApplication.clipboard().setText(self._digits)   # без пробелов
+            copy_secret(self._digits)   # без пробелов
             self.copy_signal.emit()
 
     # ----- Внутреннее -----
@@ -162,8 +164,7 @@ class ExpiryField(QWidget):
         # полем срока действия с обычным межэлементным отступом.
         self.warn_label.hide()
 
-        self.copy_btn = QPushButton("[КОП]")
-        self.copy_btn.setFixedWidth(60)
+        self.copy_btn = make_copy_button(name="Копировать срок действия")
         self.copy_btn.clicked.connect(self.do_copy)
         layout.addWidget(self.copy_btn)
 
@@ -191,7 +192,7 @@ class ExpiryField(QWidget):
     def do_copy(self):
         text = self.get_text()
         if text:
-            QApplication.clipboard().setText(text)
+            copy_secret(text)
             self.copy_signal.emit()
 
     # ----- Внутреннее -----

@@ -1,8 +1,10 @@
 """Общие помощники виджетов: темизированные предупреждение/подтверждение,
 заголовок поля, ограниченное чтение файла (вынесены из widgets.py, этап 5)."""
 import os
+from contextlib import contextmanager
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import (QLabel, QMessageBox, QComboBox)
+from PySide6.QtWidgets import (QLabel, QMessageBox, QComboBox, QPushButton,
+                               QLineEdit, QApplication)
 from hranilka.ui.theme import themed_info, themed_confirm
 
 
@@ -87,3 +89,126 @@ def _read_file(path, max_bytes):
         raise FileTooLargeError(path)
     return data
 
+
+
+# ─── Общие помощники (аудит 2026-11, раздел 8 / P9 / доступность) ────────────
+
+def set_a11y(widget, name, description=""):
+    """Задать accessibleName/Description (кнопки без текстовой подписи:
+    [X], [КОП], [*] — скринридер иначе читает «крестик в скобках»)."""
+    widget.setAccessibleName(name)
+    if description:
+        widget.setAccessibleDescription(description)
+    return widget
+
+
+def make_copy_button(parent=None, name="Копировать"):
+    """Кнопка [КОП] фиксированной ширины с доступным именем."""
+    btn = QPushButton("[КОП]", parent) if parent is not None else QPushButton("[КОП]")
+    btn.setFixedWidth(60)
+    set_a11y(btn, name)
+    return btn
+
+
+def make_delete_button(parent, name="Удалить"):
+    """Кнопка [X] фиксированной ширины (родитель задаётся сразу — иначе
+    setVisible() на виджете без родителя открывает отдельное окно)."""
+    btn = QPushButton("[X]", parent)
+    btn.setFixedWidth(40)
+    set_a11y(btn, name)
+    return btn
+
+
+@contextmanager
+def updates_suspended(widget):
+    """Отключить перерисовку виджета на время массовой пересборки (P9):
+    без мерцания; перерисовка гарантированно возвращается (finally)."""
+    was_enabled = widget.updatesEnabled()
+    widget.setUpdatesEnabled(False)
+    try:
+        yield
+    finally:
+        widget.setUpdatesEnabled(was_enabled)
+
+
+def copy_secret(text):
+    """Скопировать секрет через канал программы с автоочисткой буфера
+    (ui.chrome.copy_secret_to_clipboard). Импорт ленивый — избегаем цикла
+    chrome <-> widgets; если функции ещё нет, откат на обычный буфер."""
+    try:
+        from hranilka.ui.chrome import copy_secret_to_clipboard
+    except ImportError:
+        QApplication.clipboard().setText(text)
+        return
+    copy_secret_to_clipboard(text)
+
+
+class RevealableRowsMixin:
+    """Общий каркас списков со скрываемым секретом (коды 2FA, секретные
+    вопросы): пустая метка, маска echo, кнопка «показать», отсев пустых строк.
+
+    Хост задаёт: self.rows, self.layout, self._editable, self._revealed,
+    self.reveal_btn, self.empty_label; REVEAL_SHOW/REVEAL_HIDE; и хуки
+    _secret_edits(), _row_widget(row), _row_is_empty(row)."""
+
+    REVEAL_SHOW = "ПОКАЗАТЬ"
+    REVEAL_HIDE = "СКРЫТЬ"
+
+    def _secret_edits(self):
+        raise NotImplementedError
+
+    @staticmethod
+    def _row_widget(row):
+        return row[-1]
+
+    @staticmethod
+    def _row_is_empty(row):
+        raise NotImplementedError
+
+    def _update_empty(self):
+        self.empty_label.setVisible(not self.rows)
+        # Кнопка показа осмысленна только в просмотре и при наличии строк.
+        self.reveal_btn.setVisible(bool(self.rows) and not self._editable)
+
+    def _secrets_hidden(self) -> bool:
+        return not (self._editable or self._revealed)
+
+    def _apply_echo(self):
+        mode = QLineEdit.Password if self._secrets_hidden() else QLineEdit.Normal
+        for edit in self._secret_edits():
+            edit.setEchoMode(mode)
+
+    def _on_reveal_toggled(self, checked: bool):
+        self._revealed = checked
+        self.reveal_btn.setText(self.REVEAL_HIDE if checked else self.REVEAL_SHOW)
+        self._apply_echo()
+
+    def _remove_row_widget(self, row_widget):
+        self.layout.removeWidget(row_widget)
+        row_widget.deleteLater()
+
+    def _prune_empty_rows(self):
+        """Пустые строки не сохраняются в БД (см. get_data) — после выхода из
+        правки убираем их и из интерфейса, не дожидаясь перезагрузки."""
+        drop = [r for r in self.rows if self._row_is_empty(r)]
+        if not drop:
+            return
+        self.rows = [r for r in self.rows if not self._row_is_empty(r)]
+        for r in drop:
+            self._remove_row_widget(self._row_widget(r))
+        self._update_empty()
+
+    def _finish_set_editable(self, editable):
+        """Хвост set_editable: выход из правки чистит пустое и маскирует секрет,
+        вход — показывает для ввода."""
+        if not editable:
+            self._prune_empty_rows()
+        self._revealed = False
+        self.reveal_btn.setChecked(False)
+        self._apply_echo()
+        self._update_empty()
+
+    def _clear_rows(self):
+        for r in self.rows:
+            self._remove_row_widget(self._row_widget(r))
+        self.rows.clear()

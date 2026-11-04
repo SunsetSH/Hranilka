@@ -2,12 +2,16 @@
 учитывают настройки (шрифт, размер, цвета, фон) — в отличие от стандартных
 QMessageBox/QInputDialog."""
 import logging
+from dataclasses import dataclass
 
 from PySide6.QtWidgets import (QDialog, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                                QLineEdit, QPushButton, QComboBox, QListWidget,
                                QListWidgetItem, QLayout)
 from PySide6.QtGui import QColor
 from PySide6.QtCore import Qt, QTimer
+
+from hranilka.ui import sounds
+from hranilka.ui.msg_icons import msg_icon
 
 
 def apply_screenshot_protect(widget, enabled: bool = True) -> bool:
@@ -48,6 +52,76 @@ def mix(c1, c2, t):
     return QColor(r, g, bl).name()
 
 
+def _lum(c) -> float:
+    q = QColor(c)
+
+    def f(v):
+        v /= 255.0
+        return v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4
+    return 0.2126 * f(q.red()) + 0.7152 * f(q.green()) + 0.0722 * f(q.blue())
+
+
+def contrast(c1, c2) -> float:
+    """Контраст двух цветов по WCAG (1.0 … 21.0)."""
+    hi, lo = sorted((_lum(c1), _lum(c2)), reverse=True)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def ensure_contrast(preferred, bgs, candidates, min_ratio):
+    """Классический цвет оставляем как есть, пока он различим на всех фонах
+    bgs; иначе берём первого подходящего кандидата (или самого контрастного).
+    Так тема по умолчанию остаётся пиксель-в-пиксель прежней, а на нестандартных
+    фонах границы/disabled не пропадают."""
+    def score(c):
+        return min(contrast(c, bg) for bg in bgs)
+    if score(preferred) >= min_ratio:
+        return QColor(preferred).name().upper()
+    best = preferred
+    for c in candidates:
+        if score(c) >= min_ratio:
+            return QColor(c).name().upper()
+        if score(c) > score(best):
+            best = c
+    return QColor(best).name().upper()
+
+
+def hover_color(tree_bg, main_bg, text) -> str:
+    """Цвет подсветки строки/ветки дерева. main_bg, если он заметно отличается
+    от tree_bg; иначе (одинаковые фоны) — оттенок к цвету текста, чтобы ховер
+    не был невидимым."""
+    if contrast(tree_bg, main_bg) >= 1.15:
+        return QColor(main_bg).name()
+    return mix(tree_bg, text, 0.15)
+
+
+@dataclass(frozen=True)
+class Palette:
+    border: str
+    border_hover: str
+    disabled_fg: str
+    disabled_border: str
+    disabled_bg: str
+    danger: str
+
+
+def palette(config) -> Palette:
+    """Служебные цвета (границы, disabled, «опасность»), выведенные из фона темы.
+    На теме по умолчанию совпадают с прежними константами."""
+    _, _, text, tree_bg, main_bg = _colors(config)
+    bgs = (tree_bg, main_bg)
+    towards = lambda t: mix(tree_bg, text, t)           # noqa: E731
+    border = ensure_contrast('#808080', bgs, [towards(0.5), towards(0.7), towards(0.9)], 1.8)
+    border_hover = ensure_contrast('#A0A0A0', (tree_bg,), [towards(0.7), towards(0.9)], 2.5)
+    disabled_fg = ensure_contrast('#808080', (main_bg,), [towards(0.5), towards(0.7)], 2.0)
+    disabled_bg = ensure_contrast('#3A3A3A', (tree_bg,), [towards(0.15), towards(0.25)], 1.1)
+    disabled_border = ensure_contrast('#585858', (disabled_bg,), [towards(0.35), towards(0.5)], 1.3)
+    danger = ensure_contrast('#C0392B', (main_bg,),
+                             [QColor('#C0392B').lighter(150).name(),
+                              QColor('#C0392B').darker(160).name()], 1.5)
+    return Palette(border, border_hover, disabled_fg, disabled_border, disabled_bg, danger)
+
+
+
 def _colors(config):
     return (
         config.get("font", "Courier New"),
@@ -58,64 +132,102 @@ def _colors(config):
     )
 
 
+def _bevel_mode(config) -> bool:
+    """True, если рамки кнопок/полей рисует RetroStyle (chrome_style != flat):
+    тогда в QSS у этих виджетов нет border (иначе QSS рисует рамку сам)."""
+    return config.get("chrome_style", "flat") not in ("flat", None, "")
+
+
+def _field_css(bevel, text_color, tree_bg, main_bg, font_name, font_size, p) -> str:
+    base = (f"background-color: {tree_bg}; color: {text_color}; "
+            f"font-family: '{font_name}'; font-size: {font_size}px;")
+    dis = (f"color: {mix(text_color, tree_bg, 0.6)}; "
+           f"background-color: {mix(tree_bg, main_bg, 0.6)};")
+    dis_border = f" border: 2px inset {mix(p.border, tree_bg, 0.45)};"
+    if not bevel:
+        return f"""QLineEdit, QTextEdit, QListWidget, QDateTimeEdit, QDateEdit, QSpinBox, QComboBox {{
+            {base} border: 2px inset {p.border}; padding: 5px; }}
+        QLineEdit:disabled, QTextEdit:disabled, QSpinBox:disabled, QComboBox:disabled {{
+            {dis}{dis_border} }}"""
+    # Рамку QLineEdit/QTextEdit/QListWidget рисует RetroStyle (padding +2 px под фаску).
+    return f"""QLineEdit, QTextEdit, QListWidget {{ {base} padding: 7px; }}
+        QDateTimeEdit, QDateEdit, QSpinBox, QComboBox {{
+            {base} border: 2px inset {p.border}; padding: 5px; }}
+        QLineEdit:disabled, QTextEdit:disabled {{ {dis} }}
+        QSpinBox:disabled, QComboBox:disabled {{ {dis}{dis_border} }}"""
+
+
+def _button_css(bevel, text_color, tree_bg, main_bg, font_name, font_size, p) -> str:
+    dis = (f"color: {mix(text_color, tree_bg, 0.6)}; "
+           f"background-color: {mix(tree_bg, main_bg, 0.6)};")
+    face = (f"background-color: {tree_bg}; color: {text_color}; "
+            f"font-family: '{font_name}'; font-size: {font_size}px; font-weight: bold;")
+    if not bevel:
+        return f"""QPushButton {{ {face} border: 2px outset {p.border}; padding: 5px 15px; }}
+        QPushButton:hover {{ border: 2px inset {p.border}; background-color: {main_bg}; }}
+        QPushButton:disabled {{ {dis}
+            border: 2px outset {mix(p.border, tree_bg, 0.45)}; }}
+        QPushButton:disabled:hover {{ border: 2px outset {mix(p.border, tree_bg, 0.45)};
+            background-color: {mix(tree_bg, main_bg, 0.6)}; }}"""
+    return f"""QPushButton {{ {face} padding: 7px 17px; }}
+        QPushButton:hover {{ background-color: {main_bg}; }}
+        QPushButton:disabled, QPushButton:disabled:hover {{ {dis} }}"""
+
+
 def widget_styles(config):
     """Общие правила для элементов управления (без корневого фона)."""
     font_name, font_size, text_color, tree_bg, main_bg = _colors(config)
+    p = palette(config)
+    bevel = _bevel_mode(config)
     return f"""
         QLabel {{ color: {text_color}; background: transparent;
             font-family: '{font_name}'; font-size: {font_size}px; }}
         QLabel[heading="true"] {{ font-size: {font_size + 2}px; font-weight: bold; }}
         QLabel:disabled {{ color: {mix(text_color, main_bg, 0.6)}; }}
-        QLineEdit, QTextEdit, QListWidget, QDateTimeEdit, QDateEdit, QSpinBox, QComboBox {{
-            background-color: {tree_bg}; color: {text_color}; border: 2px inset #808080;
-            padding: 5px; font-family: '{font_name}'; font-size: {font_size}px;
-        }}
-        QLineEdit:disabled, QTextEdit:disabled, QSpinBox:disabled, QComboBox:disabled {{
-            color: {mix(text_color, tree_bg, 0.6)};
-            background-color: {mix(tree_bg, main_bg, 0.6)};
-            border: 2px inset {mix('#808080', tree_bg, 0.45)}; }}
+        {_field_css(bevel, text_color, tree_bg, main_bg, font_name, font_size, p)}
         QComboBox QAbstractItemView {{
             background-color: {tree_bg}; color: {text_color};
             selection-background-color: {main_bg}; selection-color: {text_color};
-            border: 1px solid #808080;
+            border: 1px solid {p.border};
         }}
-        QGroupBox {{ border: 1px solid #808080; margin-top: 10px; padding: 8px; }}
+        QGroupBox {{ border: 1px solid {p.border}; margin-top: 10px; padding: 8px; }}
         QGroupBox::title {{ subcontrol-origin: margin; left: 10px; padding: 0 6px;
             color: {text_color}; background-color: {main_bg};
             font-family: '{font_name}'; font-size: {font_size - 2}px; }}
-        QPushButton {{ background-color: {tree_bg}; color: {text_color}; border: 2px outset #808080;
-            padding: 5px 15px; font-family: '{font_name}'; font-size: {font_size}px; font-weight: bold; }}
-        QPushButton:hover {{ border: 2px inset #808080; background-color: {main_bg}; }}
-        QPushButton:disabled {{ color: {mix(text_color, tree_bg, 0.6)};
-            border: 2px outset {mix('#808080', tree_bg, 0.45)};
-            background-color: {mix(tree_bg, main_bg, 0.6)}; }}
-        QPushButton:disabled:hover {{ border: 2px outset {mix('#808080', tree_bg, 0.45)};
-            background-color: {mix(tree_bg, main_bg, 0.6)}; }}
-        QPushButton[tabButton="true"]:checked {{ background-color: {main_bg}; border: 2px inset #808080; }}
+        {_button_css(bevel, text_color, tree_bg, main_bg, font_name, font_size, p)}
+        QPushButton[tabButton="true"]:checked {{ background-color: {main_bg};{"" if bevel else f" border: 2px inset {p.border};"} }}
         QCheckBox, QRadioButton {{ color: {text_color}; font-family: '{font_name}'; font-size: {font_size}px;
             spacing: 8px; background: transparent; }}
         QCheckBox::indicator, QRadioButton::indicator {{ width: 14px; height: 14px;
-            border: 2px inset #808080; background-color: {tree_bg}; }}
+            border: 2px inset {p.border}; background-color: {tree_bg}; }}
         QCheckBox::indicator:checked, QRadioButton::indicator:checked {{ background-color: {text_color}; }}
-        QCheckBox::indicator:unchecked:hover, QRadioButton::indicator:unchecked:hover {{ border: 2px inset #A0A0A0; }}
-        QCheckBox:disabled, QRadioButton:disabled {{ color: #808080; }}
+        QCheckBox::indicator:unchecked:hover, QRadioButton::indicator:unchecked:hover {{ border: 2px inset {p.border_hover}; }}
+        QCheckBox:disabled, QRadioButton:disabled {{ color: {p.disabled_fg}; }}
         QCheckBox::indicator:disabled, QRadioButton::indicator:disabled {{
-            border: 2px inset #585858; background-color: #3A3A3A; }}
-        QMenu {{ background-color: {tree_bg}; color: {text_color}; border: 2px outset #808080; }}
+            border: 2px inset {p.disabled_border}; background-color: {p.disabled_bg}; }}
+        QMenu {{ background-color: {tree_bg}; color: {text_color}; border: 2px outset {p.border}; }}
         QMenu::item:selected {{ background-color: {main_bg}; }}
-        QMenuBar {{ background-color: {tree_bg}; color: {text_color}; border: 1px solid #808080; }}
-        QStatusBar {{ background-color: {tree_bg}; color: {text_color}; border: 1px solid #808080;
+        QMenuBar {{ background-color: {tree_bg}; color: {text_color}; border: 1px solid {p.border}; }}
+        QProgressBar {{ background-color: {tree_bg}; color: {text_color};
+            border: 2px inset {p.border}; text-align: center; min-height: 16px;
+            font-family: '{font_name}'; font-size: {font_size}px; }}
+        QProgressBar::chunk {{ background-color: {text_color}; width: 10px; margin: 1px; }}
+        QStatusBar {{ background-color: {tree_bg}; color: {text_color}; border: 1px solid {p.border};
             font-family: '{font_name}'; font-size: {font_size}px; }}
         QStatusBar QLabel {{ font-family: '{font_name}'; font-size: {font_size}px; }}
+        QStatusBar::item {{ border: none; }}
+        QStatusBar QLabel[statusPanel="true"] {{ border: 1px inset {p.border};
+            padding: 1px 8px; }}
+        QStatusBar QLabel[statusPanel="true"]:disabled {{ color: {p.disabled_fg}; }}
         QScrollBar:vertical {{ background-color: {main_bg}; width: 16px; margin: 0;
-            border: 1px solid #808080; }}
+            border: 1px solid {p.border}; }}
         QScrollBar:horizontal {{ background-color: {main_bg}; height: 16px; margin: 0;
-            border: 1px solid #808080; }}
-        QScrollBar::handle:vertical {{ background-color: {tree_bg}; border: 2px outset #808080;
+            border: 1px solid {p.border}; }}
+        QScrollBar::handle:vertical {{ background-color: {tree_bg}; border: 2px outset {p.border};
             min-height: 24px; }}
-        QScrollBar::handle:horizontal {{ background-color: {tree_bg}; border: 2px outset #808080;
+        QScrollBar::handle:horizontal {{ background-color: {tree_bg}; border: 2px outset {p.border};
             min-width: 24px; }}
-        QScrollBar::handle:hover {{ border: 2px inset #808080; }}
+        QScrollBar::handle:hover {{ border: 2px inset {p.border}; }}
         QScrollBar::add-line, QScrollBar::sub-line {{ width: 0; height: 0; border: none;
             background: none; }}
         QScrollBar::add-page, QScrollBar::sub-page {{ background-color: {main_bg}; }}
@@ -125,18 +237,24 @@ def widget_styles(config):
 def header_styles(config):
     """Стили кастомного заголовка окна (хедер в цвет фона, название — темой)."""
     font_name, font_size, text_color, tree_bg, main_bg = _colors(config)
+    p = palette(config)
+    if _bevel_mode(config):     # рамку рисует RetroStyle
+        title_btn = (f"#titleSettings {{ background-color: {tree_bg}; color: {text_color}; "
+                     f"padding: 5px 14px; font-weight: bold; }}")
+    else:
+        title_btn = (f"#titleSettings {{ background-color: {tree_bg}; color: {text_color}; "
+                     f"border: 2px outset {p.border}; padding: 3px 12px; font-weight: bold; }} "
+                     f"#titleSettings:hover {{ border: 2px inset {p.border}; }}")
     return f"""
-        #titleBar {{ background-color: {main_bg}; border-bottom: 1px solid #808080; }}
+        #titleBar {{ background-color: {main_bg}; border-bottom: 1px solid {p.border}; }}
         #appTitle {{ color: {text_color}; background: transparent;
             font-family: '{font_name}'; font-size: {font_size + 5}px; font-weight: bold;
             letter-spacing: 2px; }}
-        #titleSettings {{ background-color: {tree_bg}; color: {text_color};
-            border: 2px outset #808080; padding: 3px 12px; font-weight: bold; }}
-        #titleSettings:hover {{ border: 2px inset #808080; }}
+        {title_btn}
         #winBtn, #winCloseBtn {{ background-color: {tree_bg}; color: {text_color};
-            border: 1px solid #808080; font-weight: bold; }}
+            border: 1px solid {p.border}; font-weight: bold; }}
         #winBtn:hover {{ background-color: {main_bg}; }}
-        #winCloseBtn:hover {{ background-color: #C0392B; color: #FFFFFF; }}
+        #winCloseBtn:hover {{ background-color: {p.danger}; color: #FFFFFF; }}
     """
 
 
@@ -149,9 +267,10 @@ def main_stylesheet(config):
 
 def dialog_stylesheet(config):
     font_name, font_size, text_color, tree_bg, main_bg = _colors(config)
+    p = palette(config)
     return (f"QDialog {{ background-color: {main_bg}; color: {text_color}; "
             f"font-family: '{font_name}'; font-size: {font_size}px; }}"
-            f"#dialogFrame {{ border: 2px solid #808080; background-color: {main_bg}; }}"
+            f"#dialogFrame {{ border: 2px solid {p.border}; background-color: {main_bg}; }}"
             + widget_styles(config) + header_styles(config))
 
 
@@ -176,6 +295,8 @@ class _DialogHeader(QWidget):
         self.close_btn.setObjectName("winCloseBtn")
         self.close_btn.setFixedSize(42, 26)
         self.close_btn.setCursor(Qt.PointingHandCursor)
+        self.close_btn.setToolTip("Закрыть")
+        self.close_btn.setAccessibleName("Закрыть")
         self.close_btn.clicked.connect(dialog.reject)
         lay.addWidget(self.close_btn)
 
@@ -283,31 +404,50 @@ def _buttons_row(layout, dialog, ok_text="OK", cancel_text=None):
     layout.addLayout(row)
 
 
-def themed_info(config, parent, title, text):
-    d = ThemedDialog(config, parent)
-    d.setWindowTitle(title)
-    lay = d.body
-    lbl = QLabel(text)
+_ERROR_HINTS = ("ошибк", "не удалось", "сбой", "отклонен", "отмен")
+
+
+def _guess_icon(title: str) -> str:
+    low = title.lower()
+    return "error" if any(h in low for h in _ERROR_HINTS) else "info"
+
+
+def _message_row(lay, kind, label, max_width):
+    """Строка «иконка Win98 + текст» для themed_*-диалогов сообщений."""
+    row = QHBoxLayout()
+    row.setSpacing(14)
+    icon = QLabel()
+    icon.setPixmap(msg_icon(kind))
+    icon.setAlignment(Qt.AlignTop | Qt.AlignHCenter)
+    icon.setFixedWidth(msg_icon(kind).width() + 4)
     # Длинные сообщения (пути, тексты ошибок) переносим по словам и ограничиваем
     # ширину — иначе окно растягивалось за пределы экрана (M-14).
-    lbl.setWordWrap(True)
-    lbl.setMaximumWidth(560)
-    lay.addWidget(lbl)
-    _buttons_row(lay, d, "OK")
+    label.setWordWrap(True)
+    label.setMaximumWidth(max_width)
+    row.addWidget(icon)
+    row.addWidget(label, 1)
+    lay.addLayout(row)
+
+
+def themed_info(config, parent, title, text, icon=None):
+    """Информационное сообщение. icon — "info"/"warning"/"error"/"question";
+    None — по заголовку («Ошибка…» -> error). Для error/warning звучит
+    событие «ошибка» (если включено в настройках)."""
+    kind = icon or _guess_icon(title)
+    d = ThemedDialog(config, parent)
+    d.setWindowTitle(title)
+    _message_row(d.body, kind, QLabel(text), 560)
+    _buttons_row(d.body, d, "OK")
+    if kind in ("error", "warning"):
+        sounds.play(config, "error")
     d.exec()
 
 
-def themed_confirm(config, parent, title, text):
+def themed_confirm(config, parent, title, text, icon="question"):
     d = ThemedDialog(config, parent)
     d.setWindowTitle(title)
-    lay = d.body
-    label = QLabel(text)
-    # Длинные подтверждения не должны растягивать диалог до ширины всей
-    # строки: ограничиваем текстовую область и даём QLabel перенести текст.
-    label.setWordWrap(True)
-    label.setMaximumWidth(720)
-    lay.addWidget(label)
-    _buttons_row(lay, d, "Да", "Нет")
+    _message_row(d.body, icon, QLabel(text), 720)
+    _buttons_row(d.body, d, "Да", "Нет")
     return d.exec() == QDialog.Accepted
 
 
@@ -348,10 +488,7 @@ def themed_choice(config, parent, title, text, buttons, default_index=-1):
     d = ThemedDialog(config, parent)
     d.setWindowTitle(title)
     lay = d.body
-    lbl = QLabel(text)
-    lbl.setWordWrap(True)
-    lbl.setMaximumWidth(560)
-    lay.addWidget(lbl)
+    _message_row(lay, "question", QLabel(text), 560)
     result = {"index": None}
 
     def choose(i):

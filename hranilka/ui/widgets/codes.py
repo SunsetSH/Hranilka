@@ -1,14 +1,19 @@
 """Виджет резервных кодов 2FA с импортом из текстового файла
 (вынесен из widgets.py, этап 5)."""
 import logging
-from PySide6.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QLineEdit, QPushButton, QLabel, QFileDialog, QApplication)
+from PySide6.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QLineEdit, QPushButton, QLabel, QFileDialog)
 from PySide6.QtCore import Signal
-from hranilka.ui.widgets.common import (FileTooLargeError, _confirm,
-                                        _read_file, _warn)
+from hranilka.ui.widgets.common import (FileTooLargeError, RevealableRowsMixin,
+                                        _confirm, _read_file, _warn, copy_secret,
+                                        make_copy_button, make_delete_button,
+                                        set_a11y, updates_suspended)
 
 
-class CodeListWidget(QWidget):
+class CodeListWidget(RevealableRowsMixin, QWidget):
     copy_signal = Signal()
+
+    REVEAL_SHOW = "ПОКАЗАТЬ КОДЫ"
+    REVEAL_HIDE = "СКРЫТЬ КОДЫ"
 
     # Лимиты импорта из файла: список кодов заведомо мал, всё сверх — защита
     # от случайно выбранного «не того» файла (OOM / тысячи виджетов).
@@ -36,6 +41,7 @@ class CodeListWidget(QWidget):
         self.reveal_btn = QPushButton("ПОКАЗАТЬ КОДЫ")
         self.reveal_btn.setCheckable(True)
         self.reveal_btn.setToolTip("Показать / скрыть все коды")
+        set_a11y(self.reveal_btn, "Показать или скрыть коды")
         self.reveal_btn.toggled.connect(self._on_reveal_toggled)
         btn_layout.addWidget(self.reveal_btn)
         self.layout.addLayout(btn_layout)
@@ -51,23 +57,15 @@ class CodeListWidget(QWidget):
         self.layout.addStretch()
         self._update_empty()
 
-    def _update_empty(self):
-        self.empty_label.setVisible(not self.rows)
-        # Кнопка показа осмысленна только в просмотре и при наличии строк.
-        self.reveal_btn.setVisible(bool(self.rows) and not self._editable)
+    def _secret_edits(self):
+        return [edit for edit, _btn, _w in self.rows]
+
+    @staticmethod
+    def _row_is_empty(row):
+        return not row[0].text().strip()
 
     def _codes_hidden(self) -> bool:
-        return not (self._editable or self._revealed)
-
-    def _apply_echo(self):
-        mode = QLineEdit.Password if self._codes_hidden() else QLineEdit.Normal
-        for code_edit, _btn, _w in self.rows:
-            code_edit.setEchoMode(mode)
-
-    def _on_reveal_toggled(self, checked: bool):
-        self._revealed = checked
-        self.reveal_btn.setText("СКРЫТЬ КОДЫ" if checked else "ПОКАЗАТЬ КОДЫ")
-        self._apply_echo()
+        return self._secrets_hidden()
 
     def add_code(self, code_text=""):
         row_widget = QWidget(self)
@@ -82,13 +80,11 @@ class CodeListWidget(QWidget):
             code_edit.setEchoMode(QLineEdit.Password)
         h_layout.addWidget(code_edit)
         
-        copy_btn = QPushButton("[КОП]", row_widget)  # родитель сразу — см. add_item
-        copy_btn.setFixedWidth(60)
+        copy_btn = make_copy_button(row_widget, "Копировать код")
         copy_btn.clicked.connect(lambda: self.copy_code(code_edit.text()))
         h_layout.addWidget(copy_btn)
 
-        del_btn = QPushButton("[X]", row_widget)     # родитель сразу — см. add_item
-        del_btn.setFixedWidth(40)
+        del_btn = make_delete_button(row_widget, "Удалить код")
         del_btn.clicked.connect(lambda: self.remove_code(row_widget))
         h_layout.addWidget(del_btn)
         
@@ -136,7 +132,7 @@ class CodeListWidget(QWidget):
 
     def copy_code(self, text):
         if text:
-            QApplication.clipboard().setText(text)
+            copy_secret(text)
             self.copy_signal.emit()
 
     def remove_code(self, row_widget):
@@ -147,8 +143,7 @@ class CodeListWidget(QWidget):
             if widget == row_widget:
                 self.rows.pop(i)
                 break
-        self.layout.removeWidget(row_widget)
-        row_widget.deleteLater()
+        self._remove_row_widget(row_widget)
         self._update_empty()
 
     def get_data(self):
@@ -156,24 +151,11 @@ class CodeListWidget(QWidget):
         return [edit.text() for edit, _btn, _w in self.rows if edit.text().strip()]
 
     def set_data(self, data):
-        for _edit, _btn, widget in self.rows:
-            self.layout.removeWidget(widget)
-            widget.deleteLater()
-        self.rows.clear()
-        for code in data: self.add_code(code)
-        self._update_empty()
-
-    def _prune_empty_rows(self):
-        """Пустые коды не сохраняются в БД (см. get_data) — после выхода из
-        правки убираем их и из интерфейса, не дожидаясь перезагрузки карточки."""
-        drop = [row for row in self.rows if not row[0].text().strip()]
-        if not drop:
-            return
-        self.rows = [row for row in self.rows if row[0].text().strip()]
-        for _edit, _btn, widget in drop:
-            self.layout.removeWidget(widget)
-            widget.deleteLater()
-        self._update_empty()
+        with updates_suspended(self):
+            self._clear_rows()
+            for code in data:
+                self.add_code(code)
+            self._update_empty()
 
     def set_editable(self, editable):
         self._editable = editable
@@ -183,10 +165,4 @@ class CodeListWidget(QWidget):
         for code_edit, del_btn, _w in self.rows:
             code_edit.setReadOnly(not editable)
             del_btn.setVisible(editable)
-        if not editable:
-            self._prune_empty_rows()
-        # Выход из правки снова маскирует коды; вход — показывает для ввода.
-        self._revealed = False
-        self.reveal_btn.setChecked(False)
-        self._apply_echo()
-        self._update_empty()
+        self._finish_set_editable(editable)

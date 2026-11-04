@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
 from PySide6.QtCore import Signal, QTimer
 
 from hranilka.core.bip39_words import BIP39_WORDS
+from hranilka.ui.widgets.common import copy_secret
 
 # Допустимые размеры фразы (BIP-39), колонок в сетке и таймаут автоскрытия.
 WORD_COUNTS = (12, 15, 18, 21, 24)
@@ -118,7 +119,7 @@ class SeedPhraseWidget(QWidget):
         """Скопировать фразу одной строкой (канал с автоочисткой буфера)."""
         text = self.get_text()
         if text:
-            QApplication.clipboard().setText(text)
+            copy_secret(text)
             self.copy_signal.emit()
 
     def paste_phrase(self) -> None:

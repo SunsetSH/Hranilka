@@ -161,9 +161,9 @@ def test_formula_injection_neutralized_csv_xlsx(db, tmp_path):
     xlsx_path = tmp_path / "inj.xlsx"
     export.export_xlsx(tree, opts, str(xlsx_path))
     wb = openpyxl.load_workbook(xlsx_path)
-    cells = [c.value for ws in wb.worksheets
-             for row in ws.iter_rows() for c in row if c.value is not None]
-    assert "'=cmd()" in cells
+    hits = [c for ws in wb.worksheets
+            for row in ws.iter_rows() for c in row if c.value == "=cmd()"]
+    assert hits and all(c.data_type == "s" for c in hits)   # текст, не формула
     assert server_id is not None
 
 

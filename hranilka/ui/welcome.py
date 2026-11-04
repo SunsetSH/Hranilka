@@ -26,32 +26,44 @@ class WelcomeDialog(ThemedDialog):
     """Слайдовое обучение: заголовок + короткий текст + живой мини-виджет."""
 
     def __init__(self, config, parent=None, on_fin_instruments_changed=None,
-                 on_recycle_bin_changed=None, on_servers_changed=None):
+                 on_recycle_bin_changed=None, on_servers_changed=None,
+                 on_updates_changed=None):
         super().__init__(config, parent)
         self.setWindowTitle("Обучение")
-        self.setFixedSize(660, 580)
+        self.setFixedSize(840, 580)
         # Изменение применяем только при завершении обучения. В главном окне
         # callback дополнительно проверяет безопасное отключение записей.
         self._on_fin_instruments_changed = on_fin_instruments_changed
         self._on_recycle_bin_changed = on_recycle_bin_changed
         self._on_servers_changed = on_servers_changed
+        self._on_updates_changed = on_updates_changed
         self._initial_fin_instruments = config.get("show_fin_instruments", False)
         self._initial_recycle_bin = config.get("recycle_bin_enabled", False)
         self._initial_servers = config.get("show_servers", False)
+        self._initial_updates = config.get("check_updates", False)
 
         self._stack = QStackedWidget()
         for build in (self._slide_welcome, self._slide_tree, self._slide_card,
                       self._slide_fin_instruments, self._slide_servers,
-                      self._slide_security, self._slide_tools, self._slide_final):
+                      self._slide_security, self._slide_tools,
+                      self._slide_updates, self._slide_final):
             self._stack.addWidget(build())
-        self.body.addWidget(self._stack, 1)
 
-        self._dots = QLabel()
-        self._dots.setAlignment(Qt.AlignCenter)
-        self.body.addWidget(self._dots)
+        # «Мастер установки»: слева список шагов (текущий выделен), справа
+        # слайд и ряд кнопок «Отмена / Назад / Далее».
+        main = QHBoxLayout()
+        main.setSpacing(12)
+        main.addWidget(self._build_steps_panel())
+        main.addWidget(self._stack, 1)
+        self.body.addLayout(main, 1)
+
+        line = QFrame()
+        line.setFrameShape(QFrame.HLine)
+        line.setFrameShadow(QFrame.Sunken)
+        self.body.addWidget(line)
 
         nav = QHBoxLayout()
-        self._skip_btn = QPushButton("Пропустить")
+        self._skip_btn = QPushButton("Отмена")
         self._skip_btn.clicked.connect(self.reject)
         nav.addWidget(self._skip_btn)
         nav.addStretch()
@@ -75,38 +87,35 @@ class WelcomeDialog(ThemedDialog):
 
     def _on_next(self):
         if self._stack.currentIndex() == self._stack.count() - 1:
-            fin_selected = self.fin_instruments_check.isChecked()
-            if fin_selected != self._initial_fin_instruments:
-                if self._on_fin_instruments_changed is not None:
-                    if not self._on_fin_instruments_changed(fin_selected):
-                        self.fin_instruments_check.setChecked(
-                            self._initial_fin_instruments)
-                        return
-                else:
-                    self.config.set("show_fin_instruments", fin_selected)
-                    self.config.save()
-            recycle_selected = self.recycle_bin_check.isChecked()
-            if recycle_selected != self._initial_recycle_bin:
-                if self._on_recycle_bin_changed is not None:
-                    if not self._on_recycle_bin_changed(recycle_selected):
-                        self.recycle_bin_check.setChecked(
-                            self._initial_recycle_bin)
-                        return
-                else:
-                    self.config.set("recycle_bin_enabled", recycle_selected)
-                    self.config.save()
-            servers_selected = self.servers_check.isChecked()
-            if servers_selected != self._initial_servers:
-                if self._on_servers_changed is not None:
-                    if not self._on_servers_changed(servers_selected):
-                        self.servers_check.setChecked(self._initial_servers)
-                        return
-                else:
-                    self.config.set("show_servers", servers_selected)
-                    self.config.save()
-            self.accept()
+            choices = (
+                (self.fin_instruments_check, self._initial_fin_instruments,
+                 self._on_fin_instruments_changed, "show_fin_instruments"),
+                (self.recycle_bin_check, self._initial_recycle_bin,
+                 self._on_recycle_bin_changed, "recycle_bin_enabled"),
+                (self.servers_check, self._initial_servers,
+                 self._on_servers_changed, "show_servers"),
+                (self.check_updates_box, self._initial_updates,
+                 self._on_updates_changed, "check_updates"),
+            )
+            if all(self._commit_choice(*choice) for choice in choices):
+                self.accept()
         else:
             self._go(+1)
+
+    def _commit_choice(self, checkbox, initial, callback, config_key) -> bool:
+        """Применить выбор чекбокса. False — callback отказал, слайд остаётся
+        открытым, а чекбокс возвращается к исходному значению."""
+        selected = checkbox.isChecked()
+        if selected == initial:
+            return True
+        if callback is None:
+            self.config.set(config_key, selected)
+            self.config.save()
+            return True
+        if callback(selected):
+            return True
+        checkbox.setChecked(initial)
+        return False
 
     def _sync_nav(self):
         index, count = self._stack.currentIndex(), self._stack.count()
@@ -114,7 +123,59 @@ class WelcomeDialog(ThemedDialog):
         self._back_btn.setEnabled(index > 0)
         self._next_btn.setText("Начать работу" if last else "Далее >")
         self._skip_btn.setVisible(not last)
-        self._dots.setText(" ".join("●" if i == index else "○" for i in range(count)))
+        self._sync_steps(index)
+
+    # ----- Панель шагов -----
+
+    STEP_TITLES = ("Добро пожаловать", "Дерево", "Карточка", "Фин. инструменты",
+                   "VPS-серверы", "Безопасность", "Инструменты", "Обновления",
+                   "Завершение")
+
+    def _build_steps_panel(self) -> QFrame:
+        _, _, text_color, tree_bg, _ = self._theme_colors()
+        panel = QFrame()
+        panel.setObjectName("stepsPanel")
+        panel.setFixedWidth(190)
+        panel.setStyleSheet(
+            f"QFrame#stepsPanel {{ border: 2px inset #808080; "
+            f"background-color: {tree_bg}; }}"
+            f"QFrame#stepsPanel QLabel {{ border: none; color: {text_color}; "
+            f"padding: 3px 6px; }}")
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(6, 8, 6, 8)
+        lay.setSpacing(2)
+        head = QLabel("Установка Хранилки")
+        head.setWordWrap(True)
+        head_font = head.font()
+        head_font.setBold(True)
+        head.setFont(head_font)
+        lay.addWidget(head)
+        self._step_labels: list[QLabel] = []
+        count = self._stack.count()
+        for i in range(count):
+            title = self.STEP_TITLES[i] if i < len(self.STEP_TITLES) else f"Шаг {i + 1}"
+            lbl = QLabel(title)
+            lbl.setWordWrap(True)
+            self._step_labels.append(lbl)
+            lay.addWidget(lbl)
+        lay.addStretch()
+        return panel
+
+    def _sync_steps(self, index: int) -> None:
+        """Текущий шаг — жирным с маркером и инверсией; пройденные — с галочкой."""
+        _, _, text_color, tree_bg, _ = self._theme_colors()
+        for i, lbl in enumerate(self._step_labels):
+            title = self.STEP_TITLES[i] if i < len(self.STEP_TITLES) else f"Шаг {i + 1}"
+            font = lbl.font()
+            font.setBold(i == index)
+            lbl.setFont(font)
+            if i == index:
+                lbl.setText(f"> {title}")
+                lbl.setStyleSheet(f"background-color: {text_color}; "
+                                  f"color: {tree_bg};")
+            else:
+                lbl.setText(f"{'v' if i < index else ' '} {title}")
+                lbl.setStyleSheet("")
 
     def keyPressEvent(self, e):
         if e.key() == Qt.Key_Right:
@@ -221,8 +282,8 @@ class WelcomeDialog(ThemedDialog):
         page, lay = self._slide(
             "Добро пожаловать в Хранилку",
             "Хранилка — оффлайн-хаб учётных записей. Все данные лежат в одном "
-            "файле на вашем компьютере — никаких облаков и интернета.\n\n"
-            "Это короткое обучение можно открыть в любой момент:"
+            "файле на вашем компьютере — никаких облаков.\n\n"
+            "Это короткое обучение можно открыть в любой момент: "
             "Настройки → Поведение.",
         )
         lay.addStretch()
@@ -309,7 +370,7 @@ class WelcomeDialog(ThemedDialog):
         field.setReadOnly(True)
         field.setEchoMode(QLineEdit.Password)
         pass_lay.addWidget(field)
-        reveal = QPushButton("[*]")
+        reveal = QPushButton("*")
         reveal.setFixedWidth(46)
         reveal.setToolTip("Показать/скрыть")
         reveal.clicked.connect(lambda: field.setEchoMode(
@@ -517,6 +578,29 @@ class WelcomeDialog(ThemedDialog):
         location = QLabel("Изменить позже: Настройки → Опции.")
         location.setWordWrap(True)
         lay.addWidget(location)
+        lay.addStretch()
+        return page
+
+    def _slide_updates(self):
+        page, lay = self._slide(
+            "Проверять обновления?",
+            "Хранилка не выходит в интернет без вашего согласия. Если включить "
+            "проверку, при каждом запуске программа будет спрашивать у GitHub, "
+            "вышла ли новая версия, и покажет окно со списком изменений.",
+        )
+        choice, self.check_updates_box, self._updates_choice_status = (
+            self._choice_panel(
+                "Проверять наличие новых версий?",
+                "Да, проверять обновления при запуске",
+                self._initial_updates,
+                "ПРОВЕРЯТЬ — о новой версии появится сообщение.",
+                "НЕ ПРОВЕРЯТЬ — программа не будет выходить в интернет."))
+        lay.addWidget(choice)
+        hint = QLabel(
+            "Данные хранилища никуда не передаются. Изменить позже и проверить "
+            "вручную: Настройки → Опции.")
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
         lay.addStretch()
         return page
 

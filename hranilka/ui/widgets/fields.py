@@ -3,15 +3,17 @@
 import datetime as dt
 
 from PySide6.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QLineEdit, QPushButton, QTextEdit, QApplication, QSpinBox)
-from PySide6.QtCore import Signal, Qt
+from PySide6.QtCore import Signal
+
+from hranilka.ui.widgets.common import copy_secret, make_copy_button, set_a11y
 
 
 class CopyableField(QWidget):
     copy_signal = Signal()
 
     # Ретро-маркеры кнопки показа пароля (без emoji)
-    _MASK_SHOW = "[*]"   # сейчас скрыто (звёздочки) — нажать, чтобы показать
-    _MASK_HIDE = "[A]"   # сейчас видно (буквы) — нажать, чтобы скрыть
+    _MASK_SHOW = "*"   # сейчас скрыто (звёздочки) — нажать, чтобы показать
+    _MASK_HIDE = "A"   # сейчас видно (буквы) — нажать, чтобы скрыть
 
     def __init__(self, text="", is_password=False, parent=None):
         super().__init__(parent)
@@ -32,11 +34,11 @@ class CopyableField(QWidget):
             self.reveal_btn.setFixedWidth(45)
             self.reveal_btn.setCheckable(True)
             self.reveal_btn.setToolTip("Показать / скрыть пароль")
+            set_a11y(self.reveal_btn, "Показать или скрыть пароль")
             self.reveal_btn.clicked.connect(self._toggle_reveal)
             layout.addWidget(self.reveal_btn)
 
-        self.copy_btn = QPushButton("[КОП]")
-        self.copy_btn.setFixedWidth(60)
+        self.copy_btn = make_copy_button(name="Копировать значение")
         self.copy_btn.clicked.connect(self.do_copy)
         layout.addWidget(self.copy_btn)
 
@@ -48,7 +50,7 @@ class CopyableField(QWidget):
     def do_copy(self):
         text = self.input.text()
         if text:
-            QApplication.clipboard().setText(text)
+            copy_secret(text)
             self.copy_signal.emit()
 
     def set_text(self, text): self.input.setText(text)
@@ -101,8 +103,7 @@ class CopyableDateField(QWidget):
         self.date_widget.setReadOnly(True)
         layout.addWidget(self.date_widget)
 
-        self.copy_btn = QPushButton("[КОП]")
-        self.copy_btn.setFixedWidth(60)
+        self.copy_btn = make_copy_button(name="Копировать дату")
         self.copy_btn.clicked.connect(self.do_copy)
         layout.addWidget(self.copy_btn)
 
@@ -154,6 +155,59 @@ class CopyableDateField(QWidget):
         self.date_widget.setReadOnly(not editable)
         self.copy_btn.setVisible(not editable)
         
+class CopyableIsoDateField(QWidget):
+    """Адаптер CopyableDateField к строковому контракту поля
+    (set_text/get_text/set_placeholder/set_editable/copy_signal): значение
+    хранится строкой «ГГГГ-ММ-ДД». Заменяет дубли fin_tabs._DateField и
+    server_tabs._PaidUntilField.
+
+    Нераспознанная (не ISO) строка не теряется: поле показывает пустое, но
+    get_text() возвращает её нетронутой, пока пользователь сам не правил поле
+    (textEdited - только пользовательский ввод)."""
+
+    copy_signal = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self._inner = CopyableDateField(is_datetime=False)
+        self._inner.copy_signal.connect(self.copy_signal.emit)
+        layout.addWidget(self._inner)
+        self._unrecognized_raw = ""
+        self._inner.date_widget.textEdited.connect(self._on_user_edit)
+
+    def _on_user_edit(self, _text):
+        self._unrecognized_raw = ""
+
+    @staticmethod
+    def parse_iso(text):
+        """«ГГГГ-ММ-ДД» -> datetime.date или None."""
+        try:
+            return dt.date.fromisoformat((text or "").strip()[:10])
+        except ValueError:
+            return None
+
+    def set_text(self, text):
+        self._unrecognized_raw = ""
+        value = self.parse_iso(text)
+        if value is None and (text or "").strip():
+            self._unrecognized_raw = text
+        self._inner.set_date(value)
+
+    def get_text(self):
+        value = self._inner.get_date()
+        if value is not None:
+            return value.date().isoformat()
+        return self._unrecognized_raw
+
+    def set_placeholder(self, text):
+        pass                                    # у поля даты своя маска-подсказка
+
+    def set_editable(self, editable):
+        self._inner.set_editable(editable)
+
+
 class CopyableTextEdit(QWidget):
     copy_signal = Signal()
     
@@ -169,8 +223,7 @@ class CopyableTextEdit(QWidget):
         
         self.btn_layout = QHBoxLayout()
         self.btn_layout.addStretch()
-        self.copy_btn = QPushButton("[КОП]")
-        self.copy_btn.setFixedWidth(60)
+        self.copy_btn = make_copy_button(name="Копировать текст")
         self.copy_btn.clicked.connect(self.do_copy)
         self.btn_layout.addWidget(self.copy_btn)
         layout.addLayout(self.btn_layout)
@@ -178,7 +231,7 @@ class CopyableTextEdit(QWidget):
     def do_copy(self):
         text = self.get_text()
         if text:
-            QApplication.clipboard().setText(text)
+            copy_secret(text)
             self.copy_signal.emit()
 
     def set_text(self, text): self.text_edit.setPlainText(text)
@@ -206,6 +259,7 @@ class MaskedTextEdit(CopyableTextEdit):
         self.reveal_btn.setFixedWidth(45)
         self.reveal_btn.setCheckable(True)
         self.reveal_btn.setToolTip("Показать / скрыть")
+        set_a11y(self.reveal_btn, "Показать или скрыть текст")
         self.reveal_btn.clicked.connect(self._toggle_reveal)
         # Перед [КОП] (после stretch).
         self.btn_layout.insertWidget(1, self.reveal_btn)

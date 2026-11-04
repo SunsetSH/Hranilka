@@ -11,9 +11,8 @@ payload — осознанное исключение из правила «да
 """
 from typing import Any, Optional
 
-# Текущая версия структуры payload. Повышается только при несовместимой
-# перестройке; конвертация — здесь (from_storage), а не в БД-миграции.
-PAYLOAD_VERSION = 1
+from hranilka.data.models.common import (
+    PAYLOAD_VERSION, gallery_from_storage, gallery_to_storage)  # noqa: F401
 
 
 class FinItemData:
@@ -36,9 +35,7 @@ class FinItemData:
             "payload": payload,
             # image_id/blob_size переносятся сквозь кеш несохранённых правок
             # (stash), см. AccountData.to_storage — контракт H-6/M7-03.
-            "gallery": [{"data": g.get("data"), "desc": g.get("desc", ""),
-                         "image_id": g.get("image_id"),
-                         "blob_size": g.get("blob_size")} for g in self.gallery],
+            "gallery": gallery_to_storage(self.gallery),
         }
 
     @classmethod
@@ -50,5 +47,5 @@ class FinItemData:
         d.name = storage.get("name") or ""
         d.payload = dict(storage.get("payload") or {})
         d.payload.setdefault("v", PAYLOAD_VERSION)
-        d.gallery = list(storage.get("gallery") or [])
+        d.gallery = gallery_from_storage(storage.get("gallery"))
         return d

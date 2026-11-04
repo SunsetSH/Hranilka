@@ -24,16 +24,28 @@ class DbTreeOpsMixin(DbBase):
             (name, folder_id))
         return int(self.cursor.lastrowid)
 
+    @staticmethod
+    def _check_single_parent(service_id: int | None,
+                             folder_id: int | None) -> None:
+        """Инвариант v13: у листа задан максимум один родитель - сервис ИЛИ
+        папка (оба None - корень). Нарушение - ошибка вызывающего кода."""
+        if service_id is not None and folder_id is not None:
+            raise ValueError(
+                "Лист не может одновременно лежать в сервисе и в папке")
+
     def _add_account_rows(self, service_id: int | None, account_name: str,
                           login: str | None = None,
-                          password: str | None = None) -> int:
+                          password: str | None = None,
+                          folder_id: int | None = None) -> int:
         """Тело add_account без транзакции/dirty (для составных методов).
         created_at пишем строкой в формате SQLite CURRENT_TIMESTAMP
         (yyyy-MM-dd HH:mm:ss): datetime как SQL-параметр даёт DeprecationWarning
         на 3.12+ и тот же формат ожидают парсеры (models._DT_FORMAT) (L-1)."""
+        self._check_single_parent(service_id, folder_id)
         self.cursor.execute(
-            "INSERT INTO accounts (service_id, account_name, login, password, created_at) VALUES (?, ?, ?, ?, ?)",
-            (service_id, account_name, login, password,
+            "INSERT INTO accounts (service_id, folder_id, account_name, login, "
+            "password, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (service_id, folder_id, account_name, login, password,
              datetime.now().isoformat(" ", "seconds")))
         return int(self.cursor.lastrowid)
 
@@ -52,11 +64,12 @@ class DbTreeOpsMixin(DbBase):
         return new_id
 
     def add_account(self, service_id: int | None, account_name: str,
-                    login: str | None = None, password: str | None = None) -> int:
-        """Добавление аккаунта"""
+                    login: str | None = None, password: str | None = None,
+                    folder_id: int | None = None) -> int:
+        """Добавление аккаунта (в сервис, прямо в папку либо в корень)."""
         with self.conn:
             new_id = self._add_account_rows(service_id, account_name,
-                                            login, password)
+                                            login, password, folder_id)
         self._mark_dirty()
         return new_id
     
@@ -128,7 +141,7 @@ class DbTreeOpsMixin(DbBase):
 
     # Колонки fin_items, нужные дереву (без тяжёлого data JSON).
     _TREE_FIN_COLUMNS = (
-        "id", "item_type", "name", "is_favorite", "service_id",
+        "id", "item_type", "name", "is_favorite", "service_id", "folder_id",
         "card_last4", "expires_on",
     )
 
@@ -137,7 +150,8 @@ class DbTreeOpsMixin(DbBase):
     # своя таблица servers, свой узел, свой предикат is_server_node.
 
     # Колонки servers, нужные дереву (без тяжёлого data JSON).
-    _TREE_SERVER_COLUMNS = ("id", "name", "is_favorite", "service_id", "paid_until")
+    _TREE_SERVER_COLUMNS = ("id", "name", "is_favorite", "service_id", "folder_id",
+                           "paid_until")
 
     @staticmethod
     def _build_server_node(row) -> dict:
@@ -166,7 +180,7 @@ class DbTreeOpsMixin(DbBase):
     # входят — выбираем только используемые в _build_account_node/_sorted_accounts
     # и группировке (service_id). created_at нужен для сортировки "created".
     _TREE_ACCOUNT_COLUMNS = (
-        "id", "account_name", "login", "is_favorite", "service_id",
+        "id", "account_name", "login", "is_favorite", "service_id", "folder_id",
         "password_changed_date", "password_change_interval_days",
     )
 
@@ -254,39 +268,50 @@ class DbTreeOpsMixin(DbBase):
         # Группируем в памяти, сохраняя порядок выборки (важно для режима
         # "created" и базового sort_order, поверх которых _sorted_accounts
         # доводит сортировку по имени/просрочке и поднимает избранные).
-        accounts_by_service: dict[Any, list] = {}
+        # Ключ родителя листа: ("s", id) - сервис, ("f", id) - папка, None -
+        # корень (инвариант v13: задан максимум один из service_id/folder_id).
+        def parent_key(row):
+            if row["service_id"] is not None:
+                return ("s", row["service_id"])
+            if row["folder_id"] is not None:
+                return ("f", row["folder_id"])
+            return None
+
+        accounts_by_parent: dict[Any, list] = {}
         for a in accounts:
-            accounts_by_service.setdefault(a["service_id"], []).append(a)
-        fin_by_service: dict[Any, list] = {}
+            accounts_by_parent.setdefault(parent_key(a), []).append(a)
+        fin_by_parent: dict[Any, list] = {}
         for it in fin_items:
-            fin_by_service.setdefault(it["service_id"], []).append(it)
-        servers_by_service: dict[Any, list] = {}
+            fin_by_parent.setdefault(parent_key(it), []).append(it)
+        servers_by_parent: dict[Any, list] = {}
         for s in servers:
-            servers_by_service.setdefault(s["service_id"], []).append(s)
+            servers_by_parent.setdefault(parent_key(s), []).append(s)
         services_by_folder: dict[Any, list] = {}
         for s in services:
             services_by_folder.setdefault(s["folder_id"], []).append(s)
 
-        def leaf_nodes(service_id):
+        def leaf_nodes(key):
             # Аккаунты, затем финансовые записи, затем серверы (братья внутри
             # одного контейнера).
             return (self._sorted_accounts(
-                        accounts_by_service.get(service_id, []), sort_mode, descending)
+                        accounts_by_parent.get(key, []), sort_mode, descending)
                     + self._sorted_fin_items(
-                        fin_by_service.get(service_id, []), sort_mode, descending)
+                        fin_by_parent.get(key, []), sort_mode, descending)
                     + self._sorted_servers(
-                        servers_by_service.get(service_id, []), sort_mode, descending))
+                        servers_by_parent.get(key, []), sort_mode, descending))
 
         def service_node(s):
             return {'type': 'service', 'id': s['id'], 'name': s['name'],
-                    'children': leaf_nodes(s['id'])}
+                    'children': leaf_nodes(("s", s['id']))}
 
         result = []
         for folder in folders:
+            # В папке: сначала сервисы, затем листья, лежащие прямо в папке.
             result.append({
                 'type': 'folder', 'id': folder['id'], 'name': folder['name'],
-                'children': [service_node(s)
-                             for s in services_by_folder.get(folder['id'], [])],
+                'children': ([service_node(s)
+                              for s in services_by_folder.get(folder['id'], [])]
+                             + leaf_nodes(("f", folder['id']))),
             })
         for s in services_by_folder.get(None, []):     # сервисы вне папок
             result.append(service_node(s))
@@ -311,6 +336,11 @@ class DbTreeOpsMixin(DbBase):
         self.cursor.execute("SELECT id FROM services WHERE folder_id = ?", (folder_id,))
         for row in self.cursor.fetchall():
             self.cursor.execute("DELETE FROM services WHERE id = ?", (row["id"],))
+        # Листья прямо в папке (v13): leaf.folder_id - ON DELETE SET NULL, без
+        # явного удаления они бы «всплыли» в корень вместо удаления.
+        for table in ("accounts", "fin_items", "servers"):
+            self.cursor.execute(
+                f"DELETE FROM {table} WHERE folder_id = ?", (folder_id,))
         self.cursor.execute("DELETE FROM folders WHERE id = ?", (folder_id,))
 
     def _delete_service_rows(self, service_id):
@@ -451,6 +481,11 @@ class DbTreeOpsMixin(DbBase):
         self.cursor.execute(
             "UPDATE services SET folder_id = NULL WHERE folder_id = ?", (folder_id,)
         )
+        # Листья прямо в папке (v13) уходят в корень.
+        for table in ("accounts", "fin_items", "servers"):
+            self.cursor.execute(
+                f"UPDATE {table} SET folder_id = NULL WHERE folder_id = ?",
+                (folder_id,))
         self.cursor.execute("DELETE FROM folders WHERE id = ?", (folder_id,))
 
     def _delete_service_keep_content_rows(self, service_id):
@@ -500,17 +535,21 @@ class DbTreeOpsMixin(DbBase):
                 "SELECT id FROM servers WHERE service_id = ?", (node_id,))
             server_ids = [r["id"] for r in self.cursor.fetchall()]
         elif node_type == "folder":
+            # Листья сервисов папки И листья прямо в папке (v13).
             self.cursor.execute(
-                "SELECT id FROM accounts WHERE service_id IN "
-                "(SELECT id FROM services WHERE folder_id = ?)", (node_id,))
+                "SELECT id FROM accounts WHERE folder_id = ? OR service_id IN "
+                "(SELECT id FROM services WHERE folder_id = ?)",
+                (node_id, node_id))
             account_ids = [r["id"] for r in self.cursor.fetchall()]
             self.cursor.execute(
-                "SELECT id, item_type FROM fin_items WHERE service_id IN "
-                "(SELECT id FROM services WHERE folder_id = ?)", (node_id,))
+                "SELECT id, item_type FROM fin_items WHERE folder_id = ? OR "
+                "service_id IN (SELECT id FROM services WHERE folder_id = ?)",
+                (node_id, node_id))
             fin_rows = self.cursor.fetchall()
             self.cursor.execute(
-                "SELECT id FROM servers WHERE service_id IN "
-                "(SELECT id FROM services WHERE folder_id = ?)", (node_id,))
+                "SELECT id FROM servers WHERE folder_id = ? OR service_id IN "
+                "(SELECT id FROM services WHERE folder_id = ?)",
+                (node_id, node_id))
             server_ids = [r["id"] for r in self.cursor.fetchall()]
         else:
             return []
@@ -609,13 +648,23 @@ class DbTreeOpsMixin(DbBase):
             (folder_id, order, service_id),
         )
 
-    def _move_account_rows(self, account_id, service_id):
-        """Тело move_account без транзакции/dirty (для составных методов)."""
-        order = self._next_sort_order("accounts", "service_id", service_id)
+    def _move_leaf_rows(self, table, leaf_id, service_id, folder_id):
+        """Общее тело переноса листа (accounts/fin_items/servers) в сервис,
+        папку или корень (оба None) - в конец списка контейнера. Родитель
+        меняется ОДНИМ UPDATE (service_id и folder_id вместе), поэтому
+        CHECK-инвариант v13 не нарушается в промежуточном состоянии."""
+        self._check_single_parent(service_id, folder_id)
+        if folder_id is not None:
+            order = self._next_sort_order(table, "folder_id", folder_id)
+        else:
+            order = self._next_sort_order(table, "service_id", service_id)
         self.cursor.execute(
-            "UPDATE accounts SET service_id = ?, sort_order = ? WHERE id = ?",
-            (service_id, order, account_id),
-        )
+            f"UPDATE {table} SET service_id = ?, folder_id = ?, sort_order = ? "
+            f"WHERE id = ?", (service_id, folder_id, order, leaf_id))
+
+    def _move_account_rows(self, account_id, service_id, folder_id=None):
+        """Тело move_account без транзакции/dirty (для составных методов)."""
+        self._move_leaf_rows("accounts", account_id, service_id, folder_id)
 
     def _set_favorite_rows(self, account_id, value):
         """Тело set_favorite без транзакции/dirty (для составных методов)."""
@@ -629,10 +678,11 @@ class DbTreeOpsMixin(DbBase):
             self._move_service_rows(service_id, folder_id)
         self._mark_dirty()
 
-    def move_account(self, account_id, service_id):
-        """Переносит аккаунт в сервис (service_id=None — сделать свободным), в конец списка."""
+    def move_account(self, account_id, service_id, folder_id=None):
+        """Переносит аккаунт в сервис либо папку (оба None - сделать свободным,
+        в корень), в конец списка."""
         with self.conn:
-            self._move_account_rows(account_id, service_id)
+            self._move_account_rows(account_id, service_id, folder_id)
         self._mark_dirty()
 
     def set_favorite(self, account_id, value):
@@ -649,11 +699,30 @@ class DbTreeOpsMixin(DbBase):
                 self._move_service_rows(sid, folder_id)
         self._mark_dirty()
 
-    def move_accounts(self, account_ids, service_id):
-        """Пакетно переносит аккаунты в сервис в ОДНОЙ транзакции (M7-04)."""
+    def move_accounts(self, account_ids, service_id, folder_id=None):
+        """Пакетно переносит аккаунты в сервис либо папку в ОДНОЙ транзакции
+        (M7-04)."""
         with self.conn:
             for aid in account_ids:
-                self._move_account_rows(aid, service_id)
+                self._move_account_rows(aid, service_id, folder_id)
+        self._mark_dirty()
+
+    def move_leaves(self, items, service_id=None, folder_id=None):
+        """Пакетно переносит листья РАЗНЫХ типов (account/card/wallet/server) в
+        сервис, папку либо корень (оба None) в ОДНОЙ транзакции. items - список
+        (node_type, id); неизвестный тип - ValueError (откат всей операции)."""
+        self._check_single_parent(service_id, folder_id)
+        with self.conn:
+            for node_type, node_id in items:
+                if node_type == ACCOUNT:
+                    table = "accounts"
+                elif node_type in FIN_LEAF_TYPES:
+                    table = "fin_items"
+                elif node_type == SERVER:
+                    table = "servers"
+                else:
+                    raise ValueError(f"Не лист дерева: {node_type!r}")
+                self._move_leaf_rows(table, node_id, service_id, folder_id)
         self._mark_dirty()
 
     def set_favorites(self, account_ids, value):
@@ -725,8 +794,9 @@ class DbTreeOpsMixin(DbBase):
             self.cursor.execute("SELECT id FROM accounts WHERE service_id = ?", (node_id,))
         elif node_type == "folder":
             self.cursor.execute(
-                "SELECT id FROM accounts WHERE service_id IN "
-                "(SELECT id FROM services WHERE folder_id = ?)", (node_id,))
+                "SELECT id FROM accounts WHERE folder_id = ? OR service_id IN "
+                "(SELECT id FROM services WHERE folder_id = ?)",
+                (node_id, node_id))
         else:
             return []
         return [r["id"] for r in self.cursor.fetchall()]
@@ -736,12 +806,19 @@ class DbTreeOpsMixin(DbBase):
     def get_account_path(self, account_id):
         """Человекочитаемый путь к аккаунту: 'Папка / Сервис / Аккаунт'."""
         self.cursor.execute(
-            "SELECT account_name, service_id FROM accounts WHERE id = ?", (account_id,)
+            "SELECT account_name, service_id, folder_id FROM accounts WHERE id = ?",
+            (account_id,)
         )
         a = self.cursor.fetchone()
         if not a:
             return ""
         parts = []
+        if a["folder_id"]:                 # лист прямо в папке: «Папка / Лист»
+            self.cursor.execute(
+                "SELECT name FROM folders WHERE id = ?", (a["folder_id"],))
+            f = self.cursor.fetchone()
+            if f:
+                parts.append(f["name"])
         if a["service_id"]:
             self.cursor.execute(
                 "SELECT name, folder_id FROM services WHERE id = ?", (a["service_id"],)
@@ -767,7 +844,7 @@ class DbTreeOpsMixin(DbBase):
         вызовом get_account_path() на каждый аккаунт (было N+1: до 1+3N запросов)."""
         acc, svc, fld = self._name_maps()
         rows = [{"id": aid, "name": self._path_from_maps(aid, acc, svc, fld)}
-                for aid, (_name, _service_id, deleted) in acc.items() if not deleted]
+                for aid, (_name, _service_id, deleted, _folder_id) in acc.items() if not deleted]
         rows.sort(key=lambda r: r["name"].lower())
         return rows
 

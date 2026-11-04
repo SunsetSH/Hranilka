@@ -151,13 +151,15 @@ class DbAccountCardMixin(DbBase):
         self._mark_dirty()
         return gallery_ids
 
-    def add_account_with_card(self, service_id, name, storage) -> int:
+    def add_account_with_card(self, service_id, name, storage,
+                              folder_id=None) -> int:
         """Создаёт аккаунт и сразу пишет его карточку в ОДНОЙ транзакции (M7-04).
         Раньше add_account и save_account были двумя транзакциями: сбой второй
         оставлял полупустой аккаунт. Теперь либо обе, либо ни одна.
         Возвращает id созданного аккаунта (галерея у нового аккаунта пуста)."""
         with self.conn:
-            account_id = self._add_account_rows(service_id, name)
+            account_id = self._add_account_rows(service_id, name,
+                                                folder_id=folder_id)
             # rowcount-гард в _save_account_rows проверяет UPDATE по только что
             # вставленной строке — она есть, поэтому проходит (L-6).
             self._save_account_rows(account_id, storage)
@@ -205,16 +207,27 @@ class DbAccountCardMixin(DbBase):
         if self.cursor.rowcount != 1:
             raise ValueError("Аккаунт не найден")
 
+        # Однострочные таблицы (UNIQUE по account_id): UPDATE на месте, INSERT
+        # только если строки ещё нет (P7) - id не сменяется, autoincrement не
+        # растёт при каждом сохранении. Списки (вопросы/коды) упорядочены по id
+        # и остаются «удалить + вставить».
         p = data["personal"]
-        self.cursor.execute("DELETE FROM personal_data WHERE account_id = ?", (account_id,))
         self.cursor.execute(
-            """INSERT INTO personal_data
-               (account_id, mobile_phone, first_name, last_name, middle_name,
-                birth_date, address)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (account_id, p.get("mobile_phone"), p["first_name"], p["last_name"],
-             p["middle_name"], p["birth_date"], p["address"]),
+            """UPDATE personal_data SET mobile_phone = ?, first_name = ?,
+                   last_name = ?, middle_name = ?, birth_date = ?, address = ?
+               WHERE account_id = ?""",
+            (p.get("mobile_phone"), p["first_name"], p["last_name"],
+             p["middle_name"], p["birth_date"], p["address"], account_id),
         )
+        if self.cursor.rowcount == 0:
+            self.cursor.execute(
+                """INSERT INTO personal_data
+                   (account_id, mobile_phone, first_name, last_name, middle_name,
+                    birth_date, address)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (account_id, p.get("mobile_phone"), p["first_name"], p["last_name"],
+                 p["middle_name"], p["birth_date"], p["address"]),
+            )
 
         self.cursor.execute("DELETE FROM secret_questions WHERE account_id = ?", (account_id,))
         for q in data["questions"]:
@@ -224,11 +237,16 @@ class DbAccountCardMixin(DbBase):
             )
 
         r = data["recovery"]
-        self.cursor.execute("DELETE FROM recovery_phrases WHERE account_id = ?", (account_id,))
         self.cursor.execute(
-            "INSERT INTO recovery_phrases (account_id, phrase, device_id) VALUES (?, ?, ?)",
-            (account_id, r["phrase"], r["device_id"]),
+            "UPDATE recovery_phrases SET phrase = ?, device_id = ? WHERE account_id = ?",
+            (r["phrase"], r["device_id"], account_id),
         )
+        if self.cursor.rowcount == 0:
+            self.cursor.execute(
+                "INSERT INTO recovery_phrases (account_id, phrase, device_id) "
+                "VALUES (?, ?, ?)",
+                (account_id, r["phrase"], r["device_id"]),
+            )
 
         self.cursor.execute("DELETE FROM recovery_codes WHERE account_id = ?", (account_id,))
         for code in data["codes"]:

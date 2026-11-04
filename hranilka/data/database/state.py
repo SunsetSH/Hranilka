@@ -15,7 +15,9 @@ class DbBase:
     conn: Optional[sqlite3.Connection]
     cursor: Optional[sqlite3.Cursor]
     encrypted: bool
-    _dek: Optional[bytes]
+    _dek: Optional[bytearray]
+    _key_lock: Any                   # threading.Lock: защита _dek/_header (B13)
+    _disk_fingerprint: Optional[bytes]
     _header: Optional[dict]
     _dirty: bool
     _on_dirty: Optional[Callable[[], None]]
@@ -79,7 +81,18 @@ class DbBase:
 
     def _add_account_rows(self, service_id: Optional[int],    # tree_ops
                           account_name: str, login: Optional[str] = None,
-                          password: Optional[str] = None) -> int:
+                          password: Optional[str] = None,
+                          folder_id: Optional[int] = None) -> int:
+        raise NotImplementedError
+
+    @staticmethod
+    def _check_single_parent(service_id: Optional[int],       # tree_ops (static)
+                             folder_id: Optional[int]) -> None:
+        raise NotImplementedError
+
+    def _move_leaf_rows(self, table: str, leaf_id: int,       # tree_ops
+                        service_id: Optional[int],
+                        folder_id: Optional[int]) -> None:
         raise NotImplementedError
 
     def _name_maps(self) -> tuple[dict, dict, dict]:          # bulk

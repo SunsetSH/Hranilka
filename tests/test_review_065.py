@@ -8,9 +8,7 @@
   * L65-02 — ограниченное чтение файла.
 """
 import glob
-import os
 import sqlite3
-from pathlib import Path
 
 import pytest
 

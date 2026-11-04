@@ -10,82 +10,16 @@ FIN_TYPES/ItemTypeSpec/FinItemTabs не используются и не изм�
 
 Все вкладки — через прокрутку (_add_scroll_tab, как у AccountTabs/FinItemTabs).
 """
-import datetime as dt
-
-from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QScrollArea,
-                               QDialog)
-from PySide6.QtCore import Signal
+from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QDialog)
 
 from hranilka.core.fin_types import FieldSpec
 from hranilka.data.models.server_data import OS_USER_KEYS, SSH_KEY_KEYS, PANEL_KEYS
 from hranilka.generators import password_gen
-from hranilka.ui.flowlayout import WrappingTabWidget
 from hranilka.ui.generator_dialog import GeneratorSettingsDialog
-from hranilka.ui.tabs import wrap_scrollable, apply_scroll_areas_bg
-from hranilka.ui.widgets import (CopyableField, CopyableDateField,
-                                 CopyableTextEdit, GalleryWidget,
-                                 KeyValueListWidget, LinkedAccountsWidget,
-                                 heading_label)
-
-
-def _parse_iso_date(text):
-    """«ГГГГ-ММ-ДД» → datetime.date или None (пустая/битая строка)."""
-    if not text:
-        return None
-    try:
-        return dt.datetime.strptime(str(text)[:10], "%Y-%m-%d").date()
-    except (ValueError, TypeError):
-        return None
-
-
-class _PaidUntilField(QWidget):
-    """Поле «Оплачен до»: адаптер CopyableDateField к строковому контракту
-    set_text/get_text. payload хранит дату строкой «ГГГГ-ММ-ДД» (та же форма,
-    что дублируется в экстракт-колонку servers.paid_until, см.
-    server_data.extract_paid_until) — независимый аналог fin_tabs._DateField.
-
-    M-03: старое/нераспознанное значение paid_until (не ISO-дата) молча не
-    теряется. CopyableDateField умеет показывать только валидную дату —
-    нераспознанная строка отображается пустой, но запоминается в
-    _unrecognized_raw и возвращается из get_text() НЕТРОНУТОЙ, пока
-    пользователь явно не отредактирует поле руками (textEdited — только от
-    пользовательского ввода, в отличие от программного set_date). Иначе
-    первое же сохранение карточки заменило бы старое значение на "" —
-    тихая потеря данных при обычном сохранении, не связанном с этим полем."""
-
-    copy_signal = Signal()
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        self._inner = CopyableDateField(is_datetime=False)
-        self._inner.copy_signal.connect(self.copy_signal.emit)
-        layout.addWidget(self._inner)
-        self._unrecognized_raw = ""
-        self._inner.date_widget.textEdited.connect(self._on_user_edit)
-
-    def _on_user_edit(self, _text):
-        # Пользователь сам правит поле — далее доверяем только виджету.
-        self._unrecognized_raw = ""
-
-    def set_text(self, text):
-        parsed = _parse_iso_date(text)
-        self._inner.set_date(parsed)
-        raw = str(text or "")
-        self._unrecognized_raw = raw if (raw and parsed is None) else ""
-
-    def get_text(self):
-        value = self._inner.get_date()
-        if value:
-            return value.date().isoformat()
-        return self._unrecognized_raw
-
-    def set_placeholder(self, text):
-        pass
-
-    def set_editable(self, editable):
-        self._inner.set_editable(editable)
+from hranilka.ui.tabs import PayloadTabs
+from hranilka.ui.widgets.fields import CopyableIsoDateField
+from hranilka.ui.widgets import (CopyableField,
+                                 CopyableTextEdit, KeyValueListWidget, heading_label)
 
 
 # Списковые секции карточки: ключи item_fields ДОЛЖНЫ совпадать с ключами
@@ -172,23 +106,15 @@ _SCALAR_KEYS = ("hosting", "host", "ssh_port", "price", "os_name",
                 "location", "paid_until", "notes")
 
 
-class ServerTabs(WrappingTabWidget):
+class ServerTabs(PayloadTabs):
+    LINKS_HEADING = "ПРИВЯЗАН К АККАУНТАМ:"
+
     """Карточка VPS-сервера: База / Пользователи / SSH-ключи / Панели /
     Заметки / Галерея."""
 
     def __init__(self, parent=None, config=None):
-        super().__init__(parent)
-        self.config = config
-        self._widgets: dict[str, QWidget] = {}
-        self._list_widgets: dict[str, KeyValueListWidget] = {}
-        self._scroll_areas: list[QScrollArea] = []
+        super().__init__(parent, config)
         self.build_tabs()
-
-    def _add_scroll_tab(self, inner: QWidget, title: str) -> None:
-        sa = wrap_scrollable(inner, self)
-        self._scroll_areas.append(sa)
-        index = self.addTab(sa, title)
-        self.bind_empty_page(inner, index)
 
     def build_tabs(self):
         self._add_scroll_tab(self._build_base_tab(), "База")
@@ -202,9 +128,6 @@ class ServerTabs(WrappingTabWidget):
             gen_settings=True), "Панели")
         self._add_scroll_tab(self._build_notes_tab(), "Заметки")
         self._add_scroll_tab(self._build_gallery_tab(), "Галерея")
-
-    def apply_scroll_bg(self, main_bg: str) -> None:
-        apply_scroll_areas_bg(self._scroll_areas, main_bg)
 
     # ----- Вкладка «База» -----
 
@@ -255,7 +178,7 @@ class ServerTabs(WrappingTabWidget):
             lambda: bool(hosting.get_text().strip()))
 
         layout.addLayout(self._row(w,
-            "paid_until", "Оплачен до", _PaidUntilField(),
+            "paid_until", "Оплачен до", CopyableIsoDateField(),
             "price", "Стоимость", CopyableField()))
 
         layout.addLayout(self._row(w,
@@ -278,15 +201,6 @@ class ServerTabs(WrappingTabWidget):
         self._add_links_section(w, layout)
         layout.addStretch()
         return w
-
-    def _add_links_section(self, page, layout):
-        self.f_linked_accounts = LinkedAccountsWidget()
-        label = heading_label("ПРИВЯЗАН К АККАУНТАМ:")
-        layout.addWidget(label)
-        layout.addWidget(self.f_linked_accounts)
-        self.register_empty_section(
-            page, (label, self.f_linked_accounts),
-            lambda: bool(self.f_linked_accounts.get_data()))
 
     # ----- Списковые вкладки (пользователи/ключи/панели) -----
 
@@ -355,65 +269,28 @@ class ServerTabs(WrappingTabWidget):
             w, (label, notes), lambda: bool(notes.get_text().strip()))
         return w
 
-    def _build_gallery_tab(self):
-        w = QWidget(self)
-        layout = QVBoxLayout(w)
-        layout.setSpacing(10)
-        layout.setContentsMargins(0, 8, 0, 0)
-        self.f_gallery_widget = GalleryWidget(config=self.config)
-        layout.addWidget(self.f_gallery_widget)
-        self.register_empty_section(
-            w, self.f_gallery_widget,
-            lambda: bool(self.f_gallery_widget.items))
-        return w
-
     # ----- Контракт (по образцу FinItemTabs) -----
 
-    def fields(self):
-        """(key, widget) для каждого скалярного поля payload, в порядке
-        _SCALAR_KEYS."""
-        for key in _SCALAR_KEYS:
-            yield key, self._widgets[key]
+    def _field_keys(self):
+        return iter(_SCALAR_KEYS)
 
-    def list_fields(self):
-        """(key, widget) для каждого спискового блока (os_users/ssh_keys/panels)."""
-        for key in ("os_users", "ssh_keys", "panels"):
-            yield key, self._list_widgets[key]
+    def _list_keys(self):
+        return iter(("os_users", "ssh_keys", "panels"))
 
-    def set_all_editable(self, editable: bool) -> None:
-        self.f_name.set_editable(editable)
-        for _key, widget in self.fields():
-            widget.set_editable(editable)
-        for _key, widget in self.list_fields():
-            widget.set_editable(editable)
-        self._extra_ips_widget.set_editable(editable)
-        self.f_linked_accounts.set_editable(editable)
-        self.f_gallery_widget.set_editable(editable)
-        self.refresh_empty_visibility(editable)
+    def _extra_editable_widgets(self):
+        return [self._extra_ips_widget]
 
-    def load_payload(self, payload: dict) -> None:
-        for key, widget in self.fields():
-            widget.set_text(str(payload.get(key, "") or ""))
-        for key, list_widget in self.list_fields():
-            value = payload.get(key)
-            list_widget.set_items(value if isinstance(value, list) else [])
+    def _load_extra(self, payload: dict) -> None:
         self._extra_ips_widget.set_items(
             _extra_ips_to_items(payload.get("extra_ips")))
 
-    def collect_payload(self) -> dict:
-        payload = {key: widget.get_text() for key, widget in self.fields()}
-        payload.update(
-            {key: widget.get_items() for key, widget in self.list_fields()})
+    def _collect_extra(self, payload: dict) -> None:
         payload["extra_ips"] = _extra_ips_from_items(
             self._extra_ips_widget.get_items())
-        return payload
 
     def resync_lists(self, payload: dict) -> None:
         """Пересобрать спископодобные виджеты (пользователи/ключи/панели/
         Доп. IP) из payload после сохранения — как load_payload при загрузке
         (пустые строки исчезают и из интерфейса, не дожидаясь перезагрузки)."""
-        for key, list_widget in self.list_fields():
-            value = payload.get(key)
-            list_widget.set_items(value if isinstance(value, list) else [])
-        self._extra_ips_widget.set_items(
-            _extra_ips_to_items(payload.get("extra_ips")))
+        self._load_lists(payload)
+        self._load_extra(payload)

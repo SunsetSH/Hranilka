@@ -2,8 +2,10 @@
 повторный показ обучения.
 Часть SettingsDialog (dialog.py) — методы вынесены дословно (backlog-разрез по страницам)."""
 from PySide6.QtWidgets import (QVBoxLayout, QHBoxLayout, QGroupBox, QFormLayout, QComboBox, QPushButton, QLabel, QCheckBox, QLineEdit, QSizePolicy, QWidget)
+from PySide6.QtCore import Qt
 from PySide6.QtGui import QIntValidator
-from hranilka.ui.theme import themed_info
+from PySide6.QtWidgets import QSlider
+from hranilka.ui import sounds
 from hranilka.ui.welcome import WelcomeDialog
 
 # Минимальная ширина числовых полей настроек (пикс.): чтобы на стилях без
@@ -19,12 +21,17 @@ class SettingsBehaviorMixin:
         # Флаг welcome_shown здесь не трогаем: он касается только первого запуска.
         WelcomeDialog(
             self.config, self, self._apply_welcome_fin_instruments,
-            self._apply_welcome_recycle_bin).exec()
+            self._apply_welcome_recycle_bin, self._apply_welcome_servers,
+            self._apply_welcome_updates).exec()
+
+    def _main_window_handler(self, name: str):
+        """Обработчик главного окна. Не self.window(): диалог сам верхнего
+        уровня, window() вернул бы его же и вызов ушёл бы в рекурсию."""
+        return getattr(self.parent(), name, None)
 
     def _apply_welcome_fin_instruments(self, show: bool) -> bool:
         """Передать выбор учебного слайда главному окну и синхронизировать UI."""
-        main_window = self.window()
-        apply_choice = getattr(main_window, "_apply_welcome_fin_instruments", None)
+        apply_choice = self._main_window_handler("_apply_welcome_fin_instruments")
         if apply_choice is None or not apply_choice(show):
             return False
         self.show_fin_check.setChecked(show)
@@ -32,11 +39,25 @@ class SettingsBehaviorMixin:
 
     def _apply_welcome_recycle_bin(self, enabled: bool) -> bool:
         """Передать выбор корзины главному окну и синхронизировать вкладку."""
-        main_window = self.window()
-        apply_choice = getattr(main_window, "_apply_welcome_recycle_bin", None)
+        apply_choice = self._main_window_handler("_apply_welcome_recycle_bin")
         if apply_choice is None or not apply_choice(enabled):
             return False
         self.recycle_bin_check.setChecked(enabled)
+        return True
+
+    def _apply_welcome_servers(self, show: bool) -> bool:
+        """Передать выбор VPS-серверов главному окну и синхронизировать вкладку."""
+        apply_choice = self._main_window_handler("_apply_welcome_servers")
+        if apply_choice is None or not apply_choice(show):
+            return False
+        self.show_servers_check.setChecked(show)
+        return True
+
+    def _apply_welcome_updates(self, enabled: bool) -> bool:
+        """Сохранить выбор проверки обновлений и синхронизировать вкладку."""
+        self.config.set("check_updates", enabled)
+        self.config.save()
+        self.check_updates_check.setChecked(enabled)
         return True
 
     def _page_behavior(self):
@@ -50,7 +71,14 @@ class SettingsBehaviorMixin:
         self.warn_exit_check = QCheckBox("Предупреждать о несохранённых данных при выходе")
         self.warn_exit_check.setChecked(self.config.get("warn_on_exit_unsaved", True))
         bl.addWidget(self.warn_exit_check)
+        self.lock_on_session_lock_check = QCheckBox(
+            "Блокировать при блокировке Windows (Win+L)")
+        self.lock_on_session_lock_check.setChecked(
+            self.config.get("lock_on_session_lock", False))
+        bl.addWidget(self.lock_on_session_lock_check)
         lay.addWidget(beh_group)
+
+        lay.addWidget(self._build_sounds_group())
 
         clip_group = QGroupBox("Буфер обмена")
         cf = QFormLayout(clip_group)
@@ -122,6 +150,65 @@ class SettingsBehaviorMixin:
 
         lay.addStretch()
         return w
+
+    # (событие, подпись) — ключи config: sound_on_<событие>
+    _SOUND_EVENTS = [
+        ("error", "Ошибка / предупреждение"),
+        ("unlock", "Разблокировка"),
+        ("lock", "Блокировка"),
+        ("copy", "Копирование в буфер"),
+        ("save", "Успешное сохранение"),
+    ]
+
+    def _build_sounds_group(self):
+        group = QGroupBox("Звуки")
+        gl = QVBoxLayout(group)
+        self.sounds_enabled_check = QCheckBox("Включить звуки")
+        self.sounds_enabled_check.setChecked(self.config.get("sounds_enabled", True))
+        gl.addWidget(self.sounds_enabled_check)
+
+        vol_row = QHBoxLayout()
+        vol_row.addWidget(QLabel("Громкость:"))
+        self.sound_volume_slider = QSlider(Qt.Horizontal)
+        self.sound_volume_slider.setRange(0, 100)
+        self.sound_volume_slider.setValue(int(self.config.get("sound_volume", 40)))
+        vol_row.addWidget(self.sound_volume_slider, 1)
+        self.sound_volume_value = QLabel(str(self.sound_volume_slider.value()))
+        self.sound_volume_value.setMinimumWidth(36)
+        vol_row.addWidget(self.sound_volume_value)
+        self.sound_volume_slider.valueChanged.connect(
+            lambda v: self.sound_volume_value.setText(str(v)))
+        gl.addLayout(vol_row)
+
+        self.sound_event_checks = {}
+        for event, caption in self._SOUND_EVENTS:
+            row = QHBoxLayout()
+            box = QCheckBox(caption)
+            box.setChecked(bool(self.config.get(sounds.config_key(event),
+                                                event == "error")))
+            self.sound_event_checks[event] = box
+            row.addWidget(box, 1)
+            test = QPushButton("Проверить")
+            test.clicked.connect(
+                lambda _=False, ev=event: sounds.play(
+                    self.config, ev, force=True,
+                    volume=self.sound_volume_slider.value()))
+            row.addWidget(test)
+            gl.addLayout(row)
+
+        def _sync(on: bool) -> None:
+            self.sound_volume_slider.setEnabled(on)
+            for b in self.sound_event_checks.values():
+                b.setEnabled(on)
+        self.sounds_enabled_check.toggled.connect(_sync)
+        _sync(self.sounds_enabled_check.isChecked())
+        return group
+
+    def _apply_sound_settings(self) -> None:
+        self.config.set("sounds_enabled", self.sounds_enabled_check.isChecked())
+        self.config.set("sound_volume", self.sound_volume_slider.value())
+        for event, box in self.sound_event_checks.items():
+            self.config.set(sounds.config_key(event), box.isChecked())
 
     def _thumb_preload_index(self, value: str) -> int:
         for i, (key, _) in enumerate(self._THUMB_PRELOAD_OPTIONS):

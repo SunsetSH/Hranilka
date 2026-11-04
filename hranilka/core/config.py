@@ -23,12 +23,15 @@ _INT_RANGES = {
     "clipboard_clear_secs": (0, 86400),     # 0..24 ч
     "idle_lock_mins": (0, 10080),           # 0..7 сут
     "backup_keep_count": (0, 10000),
+    "sound_volume": (0, 100),
 }
 # key -> допустимое множество значений
 _ENUMS = {
     "argon2_preset": {"fast", "balanced", "paranoid"},
     "sort_mode": {"manual", "name", "created", "pwd_due"},
     "gallery_thumb_preload": {"startup", "on_click"},
+    "chrome_style": {"flat", "win95", "win98", "xp", "os9"},
+    "tree_icons": {"text", "pixel"},
 }
 
 
@@ -45,6 +48,9 @@ def _coerce_bool(value: Any, default: bool) -> bool:
         if v in ("false", "0", "no", "off", ""):
             return False
     return default
+
+# Применяются, только если config.json ещё не существует (первый запуск).
+_NEW_CONFIG_DEFAULTS = {"clipboard_clear_secs": 30, "idle_lock_mins": 10}
 
 RETRO_THEMES = {
     "MS-DOS": {"text": "#00FF00", "tree_bg": "#000000", "main_bg": "#000000"},
@@ -83,6 +89,8 @@ class Config:
             "show_servers": False,
             "screenshot_protect": False,
             "idle_lock_mins": 0,
+            # Блокировать хранилище при блокировке сессии Windows/сне (читает UI).
+            "lock_on_session_lock": False,
             "backup_folder": "",
             "backup_auto_on_close": False,
             "backup_keep_count": 5,
@@ -96,20 +104,41 @@ class Config:
             # нажатого изображения (ленивее по памяти).
             "gallery_thumb_preload": "startup",
             "shortcuts": {},
+            # Оформление окна (7.2): flat — как раньше (QSS-рамки), остальные —
+            # фаски RetroStyle и градиентный заголовок. CRT — оверлей-«лучи».
+            "chrome_style": "flat",
+            "crt_mode": False,
+            # Иконки дерева (7.5): text — префиксы [+] [o] (i); pixel — 16x16.
+            "tree_icons": "text",
             # Настройки генерации пароля/парольной фразы; поля словаря
             # валидирует password_gen.settings_from_config (мусор → дефолты).
             "password_gen": {},
             # Ранее «потреблялись», но отсутствовали в defaults и потому
             # проходили БЕЗ валидации (M3-04). Теперь известны и проверяются.
             "font_filter_mono": True,
+            # Звуки (7.6): общий переключатель, громкость 0..100 и события.
+            # По умолчанию звучит только ошибка.
+            "sounds_enabled": True,
+            "sound_volume": 40,
+            "sound_on_error": True,
+            "sound_on_unlock": False,
+            "sound_on_lock": False,
+            "sound_on_copy": False,
+            "sound_on_save": False,
             "sort_mode": "manual",
             "sort_desc": False,
+            # Проверять новый релиз на GitHub при запуске. Выключено: сеть —
+            # только с явного согласия (обучение или вкладка «Опции»).
+            "check_updates": False,
             "_window_geometry": "",        # hex-строка QByteArray (или пусто)
         }
         self.load()
     
     def load(self) -> None:
         if not CONFIG_FILE.exists():
+            # S4: безопасные умолчания только для НОВОГО конфига. Существующий
+            # config.json без этих ключей остаётся с прежним поведением (0).
+            self.config.update(_NEW_CONFIG_DEFAULTS)
             return
         try:
             with open(CONFIG_FILE, 'r', encoding='utf-8') as f:

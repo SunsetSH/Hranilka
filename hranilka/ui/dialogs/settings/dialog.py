@@ -14,7 +14,6 @@ from hranilka.ui.theme import ThemedDialog
 from hranilka.ui.flowlayout import WrappingTabWidget
 from hranilka.services import backup as bk
 from hranilka.core import shortcuts
-from hranilka.ui.theme import ThemedDialog
 
 from hranilka.ui.dialogs.settings.appearance import SettingsAppearanceMixin
 from hranilka.ui.dialogs.settings.backup_page import SettingsBackupPageMixin
@@ -49,6 +48,7 @@ class SettingsDialog(SettingsAppearanceMixin, SettingsSecurityMixin,
         self._restore_handler = self._default_restore_handler
         self._delete_all_confirmed = False
         self._restore_done = False
+        self._update_checker = None       # внедряет главное окно
         # Снимок цветов/шрифта для восстановления при отмене / откате
         # живого предпросмотра.
         self._orig_colors = {
@@ -58,6 +58,9 @@ class SettingsDialog(SettingsAppearanceMixin, SettingsSecurityMixin,
         }
         self._orig_font = config.get("font", "Cascadia Code")
         self._orig_font_size = config.get("font_size", 14)
+        self._orig_chrome = (config.get("chrome_style", "flat"),
+                             config.get("crt_mode", False))
+        self._orig_tree_icons = config.get("tree_icons", "text")
         self._setup_ui()
 
     def set_db_path(self, path: str):
@@ -115,6 +118,10 @@ class SettingsDialog(SettingsAppearanceMixin, SettingsSecurityMixin,
         на Windows os.replace падает с WinError 5 в plaintext-режиме), поэтому
         всю последовательность ведёт MainWindow. handler(path) -> (ok, err)."""
         self._restore_handler = handler
+
+    def set_update_checker(self, checker):
+        """Внедрить ручную проверку обновлений. checker(parent, on_done)."""
+        self._update_checker = checker
 
     @staticmethod
     def _default_restore_handler(path):
@@ -189,6 +196,9 @@ class SettingsDialog(SettingsAppearanceMixin, SettingsSecurityMixin,
                 f"background-color: {c}; "
                 f"color: {'#000000' if light else '#FFFFFF'}; font-weight: bold;"
             )
+        if hasattr(self, "_reset_color_btns"):
+            self._refresh_reset_btns()
+            self._schedule_preview()
 
     @staticmethod
     def _is_light(hex_color: str) -> bool:
@@ -206,18 +216,28 @@ class SettingsDialog(SettingsAppearanceMixin, SettingsSecurityMixin,
             "hide_empty_card_fields":
                 self.hide_empty_card_fields_check.isChecked(),
             "remember_geometry": self.remember_geo_check.isChecked(),
+            "chrome_style": self._chrome_style_value(),
+            "crt_mode": self.crt_mode_check.isChecked(),
+            "tree_icons": self._tree_icons_value(),
             "screenshot_protect": self.ss_protect_check.isChecked(),
             "idle_lock_mins": int(self.idle_mins.text() or "0"),
             "backup_folder": self.backup_folder_edit.text().strip(),
             "backup_auto_on_close": self.backup_auto_check.isChecked(),
             "backup_keep_count": self.backup_keep_spin.value(),
             "warn_on_exit_unsaved": self.warn_exit_check.isChecked(),
+            "lock_on_session_lock": self.lock_on_session_lock_check.isChecked(),
             "clipboard_clear_secs": int(self.clip_clear_secs.text() or "0"),
             "clipboard_clear_on_exit": self.clip_clear_exit_check.isChecked(),
             "recycle_bin_enabled": self.recycle_bin_check.isChecked(),
             "show_fin_instruments": self.show_fin_check.isChecked(),
             "show_servers": self.show_servers_check.isChecked(),
+            "check_updates": self.check_updates_check.isChecked(),
+            "image_downscale": self.image_downscale_check.isChecked(),
             "gallery_thumb_preload": self._thumb_preload_value(),
+            "sounds_enabled": self.sounds_enabled_check.isChecked(),
+            "sound_volume": self.sound_volume_slider.value(),
+            "sound_events": {event: box.isChecked()
+                             for event, box in self.sound_event_checks.items()},
             "text_color": self.config.get("text_color"),
             "tree_bg_color": self.config.get("tree_bg_color"),
             "main_bg_color": self.config.get("main_bg_color"),
@@ -269,6 +289,9 @@ class SettingsDialog(SettingsAppearanceMixin, SettingsSecurityMixin,
             self.config.set(key, val)
         self.config.set("font", self._orig_font)
         self.config.set("font_size", self._orig_font_size)
+        self.config.set("chrome_style", self._orig_chrome[0])
+        self.config.set("crt_mode", self._orig_chrome[1])
+        self.config.set("tree_icons", self._orig_tree_icons)
         self.setStyleSheet(dialog_stylesheet(self.config))
         self._restyle_shortcuts()
         self.appearance_changed.emit()
@@ -293,6 +316,7 @@ class SettingsDialog(SettingsAppearanceMixin, SettingsSecurityMixin,
         self._apply_group_fonts()
         self.setStyleSheet(dialog_stylesheet(self.config))
         self._restyle_shortcuts()
+        self._schedule_preview()
         self.appearance_changed.emit()
 
     def _choose_color(self, key: str):
@@ -302,6 +326,8 @@ class SettingsDialog(SettingsAppearanceMixin, SettingsSecurityMixin,
             self.config.set(key, color.name())
             self._refresh_color_btns()
             self._restyle_shortcuts()
+            self.setStyleSheet(dialog_stylesheet(self.config))
+            self.appearance_changed.emit()
 
     def _browse_backup_folder(self):
         folder = QFileDialog.getExistingDirectory(
@@ -422,19 +448,25 @@ class SettingsDialog(SettingsAppearanceMixin, SettingsSecurityMixin,
         self.config.set("hide_empty_card_fields",
                         self.hide_empty_card_fields_check.isChecked())
         self.config.set("remember_geometry", self.remember_geo_check.isChecked())
+        self.config.set("chrome_style",      self._chrome_style_value())
+        self.config.set("crt_mode",          self.crt_mode_check.isChecked())
+        self.config.set("tree_icons",        self._tree_icons_value())
         self.config.set("screenshot_protect",  self.ss_protect_check.isChecked())
         self.config.set("idle_lock_mins",      int(self.idle_mins.text() or "0"))
         self.config.set("backup_folder",         self.backup_folder_edit.text().strip())
         self.config.set("backup_auto_on_close",  self.backup_auto_check.isChecked())
         self.config.set("backup_keep_count",     self.backup_keep_spin.value())
         self.config.set("warn_on_exit_unsaved",  self.warn_exit_check.isChecked())
-        self.config.set("clipboard_clear_secs",    int(self.clip_clear_secs.text() or "0"))
+        self.config.set("lock_on_session_lock",  self.lock_on_session_lock_check.isChecked())
+        self._apply_sound_settings()
+        self.config.set("clipboard_clear_secs",   int(self.clip_clear_secs.text() or "0"))
         self.config.set("clipboard_clear_on_exit", self.clip_clear_exit_check.isChecked())
         self.config.set("recycle_bin_enabled",     self.recycle_bin_check.isChecked())
         # show_fin_instruments / show_servers — с предупреждением при переходе
         # True→False с существующими записями (до записи нового значения).
         self.config.set("show_fin_instruments",    self._resolve_show_fin())
         self.config.set("show_servers",             self._resolve_show_servers())
+        self.config.set("check_updates",           self.check_updates_check.isChecked())
         self.config.set("image_downscale",         self.image_downscale_check.isChecked())
         self.config.set("gallery_thumb_preload",   self._thumb_preload_value())
         # Шорткаты: в конфиг кладём только отличия от дефолтов (компактно и

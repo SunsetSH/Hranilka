@@ -11,61 +11,18 @@ expiry→ExpiryField. Поля с общим FieldSpec.row_group рендеря�
 имя записи (f_name); связи с аккаунтами (концепт §8) — внизу первой вкладки;
 последней добавляется общая вкладка «Галерея».
 """
-import datetime as dt
-from typing import Iterator
-
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout,
-                               QPushButton, QApplication, QFrame, QScrollArea)
+                               QPushButton, QApplication)
 from PySide6.QtCore import Signal
 
 from hranilka.core.fin_domain import detect_payment_system
 from hranilka.core.fin_types import ItemTypeSpec
-from hranilka.ui.flowlayout import WrappingTabWidget
-from hranilka.ui.tabs import wrap_scrollable, apply_scroll_areas_bg
-from hranilka.ui.widgets import (CopyableField, CopyableDateField,
-                                 CopyableTextEdit, GalleryWidget,
-                                 MaskedCardNumberField, ExpiryField,
-                                 KeyValueListWidget, LinkedAccountsWidget,
-                                 ReadOnlyAwareComboBox, SeedPhraseWidget,
+from hranilka.ui.tabs import PayloadTabs
+from hranilka.ui.widgets.fields import CopyableIsoDateField
+from hranilka.ui.widgets import (CopyableField,
+                                 CopyableTextEdit, MaskedCardNumberField, ExpiryField,
+                                 KeyValueListWidget, ReadOnlyAwareComboBox, SeedPhraseWidget,
                                  heading_label)
-
-
-def _parse_iso_date(text):
-    """«ГГГГ-ММ-ДД» → datetime.date или None (пустая/битая строка)."""
-    if not text:
-        return None
-    try:
-        return dt.datetime.strptime(str(text)[:10], "%Y-%m-%d").date()
-    except (ValueError, TypeError):
-        return None
-
-
-class _DateField(QWidget):
-    """Адаптер CopyableDateField к строковому контракту set_text/get_text.
-    payload хранит дату строкой «ГГГГ-ММ-ДД» (как AccountData)."""
-
-    copy_signal = Signal()
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        self._inner = CopyableDateField(is_datetime=False)
-        self._inner.copy_signal.connect(self.copy_signal.emit)
-        layout.addWidget(self._inner)
-
-    def set_text(self, text):
-        self._inner.set_date(_parse_iso_date(text))
-
-    def get_text(self):
-        value = self._inner.get_date()          # datetime или None
-        return value.date().isoformat() if value else ""
-
-    def set_placeholder(self, text):
-        pass                                    # у поля даты своя маска-подсказка
-
-    def set_editable(self, editable):
-        self._inner.set_editable(editable)
 
 
 class _EnumField(QWidget):
@@ -113,29 +70,22 @@ class _EnumField(QWidget):
             self.copy_signal.emit()
 
 
-class FinItemTabs(WrappingTabWidget):
+class FinItemTabs(PayloadTabs):
+    LINKS_HEADING = "ИСПОЛЬЗУЕТСЯ В АККАУНТАХ:"
+    LINKS_SEPARATOR = True
+
     """Карточка финансовой записи, собранная из ItemTypeSpec."""
 
     def __init__(self, spec: ItemTypeSpec, parent=None, config=None):
-        super().__init__(parent)
+        super().__init__(parent, config)
         self.spec = spec
-        self.config = config
-        self._widgets: dict[str, QWidget] = {}      # key поля → виджет
-        self._list_widgets: dict[str, KeyValueListWidget] = {}  # key ListSpec
         # Автодетект платёжной системы по BIN. Флаги: override — пользователь
         # задал систему вручную (не перетираем); suppress — идёт программная
         # массовая установка (load_payload/сам автодетект), сигналы игнорируем.
         self._payment_system_overridden = False
         self._suppress_ps_signal = False
-        self._scroll_areas: list[QScrollArea] = []
         self.build_tabs()
         self._wire_bin_autodetect()
-
-    def _add_scroll_tab(self, inner: QWidget, title: str) -> None:
-        sa = wrap_scrollable(inner, self)
-        self._scroll_areas.append(sa)
-        index = self.addTab(sa, title)
-        self.bind_empty_page(inner, index)
 
     def build_tabs(self):
         for tab_name in self.spec.tabs:
@@ -143,11 +93,6 @@ class FinItemTabs(WrappingTabWidget):
         # Вкладка «Галерея» — последняя, общая для всех типов (концепт §5).
         # Отдельной вкладки «Связи» нет: связи показаны внизу первой вкладки.
         self._add_scroll_tab(self._build_gallery_tab(), "Галерея")
-
-    def apply_scroll_bg(self, main_bg: str) -> None:
-        """Обновить фон прокручиваемых областей вкладок под цвет из настроек
-        (как AccountTabs.apply_scroll_bg — общий хелпер, ui/tabs.py)."""
-        apply_scroll_areas_bg(self._scroll_areas, main_bg)
 
     def _build_tab(self, tab_name):
         w = QWidget(self)
@@ -232,36 +177,6 @@ class FinItemTabs(WrappingTabWidget):
                     r.setStretch(i, 1 if shown else 0))
         return row
 
-    def _add_links_section(self, page, layout):
-        """Секция «ИСПОЛЬЗУЕТСЯ В АККАУНТАХ» внизу первой вкладки (у всех типов,
-        концепт §8): отделяется горизонтальной линией. Отдельной вкладки нет."""
-        line = QFrame()
-        line.setFrameShape(QFrame.HLine)
-        line.setFrameShadow(QFrame.Sunken)
-        layout.addWidget(line)
-        self.f_linked_accounts = LinkedAccountsWidget()
-        label = heading_label("ИСПОЛЬЗУЕТСЯ В АККАУНТАХ:")
-        layout.addWidget(label)
-        layout.addWidget(self.f_linked_accounts)
-        self.register_empty_section(
-            page, (line, label, self.f_linked_accounts),
-            lambda: bool(self.f_linked_accounts.get_data()))
-
-    def _build_gallery_tab(self):
-        """Вкладка «Галерея»: переиспользованный GalleryWidget аккаунта (§5).
-        Загрузка/сохранение BLOB и ленивый предпросмотр подключаются извне
-        (FinCardMixin), контракт H-6/M7-03 сохраняется без правок gallery.py."""
-        w = QWidget(self)
-        layout = QVBoxLayout(w)
-        layout.setSpacing(10)
-        layout.setContentsMargins(0, 8, 0, 0)
-        self.f_gallery_widget = GalleryWidget(config=self.config)
-        layout.addWidget(self.f_gallery_widget)
-        self.register_empty_section(
-            w, self.f_gallery_widget,
-            lambda: bool(self.f_gallery_widget.items))
-        return w
-
     def _make_widget(self, field):
         """kind/ключ → конкретный виджет (единая точка фабрики)."""
         if field.key == "card_number":
@@ -276,7 +191,7 @@ class FinItemTabs(WrappingTabWidget):
         if field.kind == "multiline":
             return CopyableTextEdit()
         if field.kind == "date":
-            return _DateField()
+            return CopyableIsoDateField()
         if field.kind == "enum":
             widget = _EnumField(field.options)
             if field.placeholder:
@@ -288,47 +203,25 @@ class FinItemTabs(WrappingTabWidget):
             widget.set_placeholder(field.placeholder)
         return widget
 
-    # ----- Итерация по дескриптору -----
+    # ----- Итерация по дескриптору (fields/list_fields - в PayloadTabs) -----
 
-    def fields(self) -> Iterator[tuple[str, QWidget]]:
-        """(key, widget) для каждого поля типа в порядке дескриптора."""
-        for field in self.spec.fields:
-            yield field.key, self._widgets[field.key]
+    def _field_keys(self):
+        return (f.key for f in self.spec.fields)
 
-    def list_fields(self) -> Iterator[tuple[str, KeyValueListWidget]]:
-        """(key, widget) для каждого повторяемого блока (ListSpec)."""
-        for ls in self.spec.lists:
-            yield ls.key, self._list_widgets[ls.key]
+    def _list_keys(self):
+        return (ls.key for ls in self.spec.lists)
 
-    def set_all_editable(self, editable: bool) -> None:
-        self.f_name.set_editable(editable)
-        for _key, widget in self.fields():
-            widget.set_editable(editable)
-        for _key, widget in self.list_fields():
-            widget.set_editable(editable)
-        self.f_linked_accounts.set_editable(editable)
-        self.f_gallery_widget.set_editable(editable)
-        self.refresh_empty_visibility(editable)
-
-    def load_payload(self, payload: dict) -> None:
-        """Заполнить поля из payload. Программная установка — не триггерит
-        автодетект/override платёжной системы."""
+    def _load_fields(self, payload: dict) -> None:
+        """Программная установка - не триггерит автодетект/override системы."""
         self._suppress_ps_signal = True
-        for key, widget in self.fields():
-            widget.set_text(str(payload.get(key, "") or ""))
-        self._suppress_ps_signal = False
-        for key, list_widget in self.list_fields():
-            value = payload.get(key)
-            # Толерантное чтение: не-список (битые данные) — пустой блок.
-            list_widget.set_items(value if isinstance(value, list) else [])
-        # Уже сохранённую систему считаем ручной — автодетект её не перетирает.
-        self._payment_system_overridden = bool(payload.get("payment_system"))
+        try:
+            super()._load_fields(payload)
+        finally:
+            self._suppress_ps_signal = False
 
-    def collect_payload(self) -> dict:
-        payload = {key: widget.get_text() for key, widget in self.fields()}
-        payload.update(
-            {key: widget.get_items() for key, widget in self.list_fields()})
-        return payload
+    def _load_extra(self, payload: dict) -> None:
+        # Уже сохранённую систему считаем ручной - автодетект её не перетирает.
+        self._payment_system_overridden = bool(payload.get("payment_system"))
 
     # ----- Автодетект платёжной системы по BIN -----
 

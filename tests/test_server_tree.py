@@ -80,7 +80,7 @@ def test_servers_sorted_by_name(db):
 
 def test_favorite_server_on_top(db):
     sid = db.add_service("S")
-    a = db.add_server(sid, "A")
+    db.add_server(sid, "A")
     b = db.add_server(sid, "B")
     db.set_server_favorite(b, True)
     tree = db.get_tree_structure(include_servers=True)

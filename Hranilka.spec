@@ -45,18 +45,16 @@ _VERSION_INFO = VSVersionInfo(
     ],
 )
 
-# Модули, не используемые приложением (оффлайн, без сети):
+# Модули, не используемые приложением. ssl нужен: проверка обновлений идёт по
+# HTTPS через urllib (services/updater.py).
 #  - PIL: тянется опциональным импортом openpyxl (нужен только для картинок
 #    в xlsx, которые экспорт не делает);
-#  - PySide6.QtNetwork: сеть в коде не импортируется;
-#  - ssl/_ssl/_hashlib: стандартный OpenSSL-стек; asyncio и hashlib работают
-#    без них (импорты под guard), шифрование БД — на cryptography/argon2
-#    со своими встроенными библиотеками.
+#  - PySide6.QtNetwork: сеть идёт через urllib, не через Qt;
+#  - _hashlib: hashlib работает без него (импорт под guard), шифрование БД — на
+#    cryptography/argon2 со своими встроенными библиотеками.
 _EXCLUDES = [
     "PIL",
     "PySide6.QtNetwork",
-    "ssl",
-    "_ssl",
     "_hashlib",
 ]
 
@@ -119,7 +117,7 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     runtime_tmpdir=None,
     console=False,

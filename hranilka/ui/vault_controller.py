@@ -16,7 +16,7 @@ import time
 
 from PySide6.QtCore import (Qt, QMetaObject, QObject, QThread, QEventLoop,
                             QTimer, Signal, Slot)
-from PySide6.QtWidgets import QLabel, QProgressBar, QWidget
+from PySide6.QtWidgets import QLabel, QProgressBar, QPushButton, QWidget
 
 from hranilka.ui import theme
 from hranilka.data.database import VaultConflictError
@@ -27,17 +27,42 @@ class _BusyDialog(theme.ThemedDialog):
     пользователь закрыть НЕ может (Esc/заголовок игнорируются) — диалог
     закрывает только завершение фоновой операции."""
 
-    def __init__(self, config, parent, message: str):
+    SOFT_LIMIT_SECS = 120      # после этого предлагаем «Не ждать»
+
+    def __init__(self, config, parent, message: str, soft_limit=None):
         super().__init__(config, parent)
         self.setWindowTitle("Подождите")
         self.setModal(True)
         self.setMinimumWidth(380)
+        self.gave_up = False
+        self._soft_limit = self.SOFT_LIMIT_SECS if soft_limit is None else soft_limit
+        self._started = time.monotonic()
         lbl = QLabel(message)
         lbl.setWordWrap(True)
         bar = QProgressBar()
         bar.setRange(0, 0)               # indeterminate: KDF не даёт прогресса
+        bar.setTextVisible(False)
+        self._elapsed = QLabel("Прошло: 0 с")
+        self._give_up_btn = QPushButton("Не ждать")
+        self._give_up_btn.setVisible(False)
+        self._give_up_btn.clicked.connect(self._give_up)
         self.body.addWidget(lbl)
         self.body.addWidget(bar)
+        self.body.addWidget(self._elapsed)
+        self.body.addWidget(self._give_up_btn)
+        self._tick_timer = QTimer(self)
+        self._tick_timer.timeout.connect(self._tick)
+        self._tick_timer.start(1000)
+
+    def _tick(self):
+        secs = int(time.monotonic() - self._started)
+        self._elapsed.setText(f"Прошло: {secs} с")
+        if secs >= self._soft_limit:
+            self._give_up_btn.setVisible(True)
+
+    def _give_up(self):
+        self.gave_up = True
+        self.done(0)
 
     def reject(self):
         pass
@@ -315,31 +340,64 @@ class VaultController(QObject):
         parent = self._window if isinstance(self._window, QWidget) else None
         dlg = _BusyDialog(self.config, parent, message)
         out = {}
+        done = threading.Event()
 
         def work():
             try:
                 out["res"] = (True, fn())
             except Exception as e:                   # noqa: BLE001 — отдаём наверх
                 out["res"] = (False, str(e))
+            done.set()
             # Закрыть диалог из GUI-потока; если exec ещё не начался, queued-событие
             # будет обработано первым же оборотом его event-loop.
-            QMetaObject.invokeMethod(dlg, "accept", Qt.ConnectionType.QueuedConnection)
+            if not dlg.gave_up:
+                QMetaObject.invokeMethod(dlg, "accept",
+                                         Qt.ConnectionType.QueuedConnection)
 
         thread = threading.Thread(target=work, daemon=True, name="vault-exclusive")
+        keep_locked = False
         try:
             thread.start()
             dlg.exec()                               # ждём accept от work()
-            thread.join()                            # к этому моменту work() завершён
+            if dlg.gave_up and not done.is_set():
+                # Пользователь отказался ждать: операция продолжается в фоне, а
+                # монополия на файл снимается только по её завершению (иначе
+                # фоновая запись пересеклась бы с ней).
+                keep_locked = True
+                self._release_when_done(done)
+            else:
+                thread.join(5)                       # work() уже завершён
         finally:
-            self._vault_locked = False
+            if not keep_locked:
+                self._vault_locked = False
+            dlg._tick_timer.stop()
             dlg.deleteLater()
             # Долгая операция (KDF на большой базе) не должна засчитываться как
             # простой: без сброса первый тик idle-таймера заблокировал бы vault
             # поверх диалога с одноразовым recovery-кодом.
             self._note_window_activity()
+        if keep_locked:
+            return False, ("Операция всё ещё выполняется в фоне. Дождитесь её "
+                           "завершения и проверьте состояние базы.")
         if self._write_pending or self.db._dirty:
             self.schedule_flush()
         return out["res"]
+
+    def _release_when_done(self, done: threading.Event):
+        """Снять _vault_locked, когда зависшая операция наконец завершится."""
+        poll = QTimer(self)
+        poll.setInterval(500)
+
+        def check():
+            if done.is_set():
+                poll.stop()
+                poll.deleteLater()
+                self._vault_locked = False
+                if self._write_pending or self.db._dirty:
+                    self.schedule_flush()
+
+        poll.timeout.connect(check)
+        poll.start()
 
     def shutdown(self):
         """Корректно остановить поток фоновой записи (идемпотентно).

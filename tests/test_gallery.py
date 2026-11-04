@@ -9,7 +9,6 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication
 from PySide6.QtGui import QImage, QImageReader
 from PySide6.QtCore import QBuffer, QByteArray, QIODevice
 

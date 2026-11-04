@@ -29,16 +29,19 @@ GeneratorSettingsDialog (их передаёт ServerTabs, см. ui/server_tabs.
 from typing import Callable
 
 from PySide6.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QLineEdit,
-                               QComboBox, QPushButton, QLabel, QApplication)
+                               QComboBox, QPushButton, QLabel)
 from PySide6.QtCore import Signal
 
 from hranilka.core.fin_types import FieldSpec
-from hranilka.ui.widgets.common import _confirm, ReadOnlyAwareComboBox, heading_label
+from hranilka.ui.widgets.common import (_confirm, ReadOnlyAwareComboBox, heading_label,
+                                        copy_secret, make_copy_button,
+                                        make_delete_button, set_a11y,
+                                        updates_suspended)
 from hranilka.ui.widgets.fields import CopyableTextEdit, MaskedTextEdit
 
 # Ретро-маркеры reveal-кнопки секретного поля (как у CopyableField).
-_MASK_SHOW = "[*]"
-_MASK_HIDE = "[A]"
+_MASK_SHOW = "*"
+_MASK_HIDE = "A"
 
 # Доп. нижний отступ многорядной строки списка (несколько row_group-рядов
 # и/или multiline-блок) поверх обычного layout.setSpacing(5) — визуально
@@ -151,13 +154,14 @@ class KeyValueListWidget(QWidget):
         return items
 
     def set_items(self, items: list[dict]) -> None:
-        for row in self.rows:
-            self.layout.removeWidget(row.widget)
-            row.widget.deleteLater()
-        self.rows.clear()
-        for item in items:
-            self.add_row(item)
-        self._update_empty()
+        with updates_suspended(self):           # P9: без мерцания при пересборке
+            for row in self.rows:
+                self.layout.removeWidget(row.widget)
+                row.widget.deleteLater()
+            self.rows.clear()
+            for item in items:
+                self.add_row(item)
+            self._update_empty()
 
     def set_editable(self, editable: bool) -> None:
         self._editable = editable
@@ -217,11 +221,9 @@ class KeyValueListWidget(QWidget):
                     field_copy_btns[spec.key] = self._add_field_copy_btn(row, w)
             if is_first_row:
                 if not suppress_general_copy:
-                    copy_btn = QPushButton("[КОП]", row_widget)
-                    copy_btn.setFixedWidth(60)
+                    copy_btn = make_copy_button(row_widget, "Копировать значение строки")
                     row.addWidget(copy_btn)
-                del_btn = QPushButton("[X]", row_widget)
-                del_btn.setFixedWidth(40)
+                del_btn = make_delete_button(row_widget, "Удалить строку")
                 del_btn.clicked.connect(lambda: self.remove_row(row_widget))
                 row.addWidget(del_btn)
             outer.addLayout(row)
@@ -349,6 +351,7 @@ class KeyValueListWidget(QWidget):
         btn.setFixedWidth(45)
         btn.setCheckable(True)
         btn.setToolTip("Показать / скрыть значение")
+        set_a11y(btn, "Показать или скрыть значение")
         btn.clicked.connect(lambda checked, e=edit, b=btn:
                             self._toggle_reveal(e, b))
         layout.addWidget(btn)
@@ -365,8 +368,7 @@ class KeyValueListWidget(QWidget):
         """[КОП] отдельного поля (FieldSpec.copy_btn) — независимо от общей
         [КОП] строки (та копирует _copy_key и может быть в другом row_group-
         ряду). Тот же канал автоочистки буфера (copy_signal)."""
-        btn = QPushButton("[КОП]")
-        btn.setFixedWidth(60)
+        btn = make_copy_button(name="Копировать значение поля")
         btn.setToolTip("Скопировать значение поля")
         btn.clicked.connect(lambda checked=False, w=widget: self._copy_field(w))
         layout.addWidget(btn)
@@ -375,7 +377,7 @@ class KeyValueListWidget(QWidget):
     def _copy_field(self, widget: QWidget) -> None:
         text = self._value(widget)
         if text:
-            QApplication.clipboard().setText(text)
+            copy_secret(text)
             self.copy_signal.emit()
 
     def _add_gen_button_row(
@@ -443,7 +445,7 @@ class KeyValueListWidget(QWidget):
         """Скопировать «значение» строки (адрес/ключ) через общий канал."""
         text = self._value(row.fields[self._copy_key])
         if text:
-            QApplication.clipboard().setText(text)
+            copy_secret(text)
             self.copy_signal.emit()
 
     def _apply_row_mode(self, row: _Row) -> None:

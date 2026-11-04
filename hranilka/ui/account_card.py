@@ -12,16 +12,17 @@ from PySide6.QtWidgets import QDialog
 from hranilka.core.nodetypes import ACCOUNT, SERVER
 from hranilka.data.database import StaleSessionError
 from hranilka.data.models import AccountData
+from hranilka.ui.card_base import CardFlowMixin, orphan_gallery_entry
 from hranilka.ui.generator_dialog import GeneratorSettingsDialog
 from hranilka.ui.widgets import fin_item_display, server_item_display
 from hranilka.generators import password_gen
 from hranilka.generators import pd_generator
 from hranilka.core import util
 from hranilka.core import domain
-from hranilka.ui import theme
+from hranilka.ui import sounds, theme
 
 
-class AccountCardMixin:
+class AccountCardMixin(CardFlowMixin):
     """Правая панель: просмотр/редактирование карточки, связи, генерация, статус."""
 
     def _fin_enabled(self):
@@ -104,7 +105,7 @@ class AccountCardMixin:
         # кладём в черновик правок, чтобы она не потерялась вне режима правки.
         if (ACCOUNT, account_id) in self._edit_cache:
             self._edit_cache[(ACCOUNT, account_id)]["storage"]["gallery"].append(
-                {"desc": desc, "data": data, "image_id": None, "blob_size": None})
+                orphan_gallery_entry(desc, data))
             self._dirty_ids.add((ACCOUNT, account_id))
             self._refresh_dirty_markers(account_id)
             return
@@ -139,14 +140,14 @@ class AccountCardMixin:
             return
         if (ACCOUNT, account_id) in self._edit_cache:
             self._edit_cache[(ACCOUNT, account_id)]["storage"]["gallery"].append(
-                {"desc": desc, "data": data, "image_id": None, "blob_size": None})
+                orphan_gallery_entry(desc, data))
         else:
             # Формат черновика идентичен _stash_current_edits: storage из
             # AccountData + links (id связанных аккаунтов).
             acc = AccountData.from_storage(storage)
             acc.gallery = list(acc.gallery)
             acc.gallery.append(
-                {"desc": desc, "data": data, "image_id": None, "blob_size": None})
+                orphan_gallery_entry(desc, data))
             # В черновике links — список id (формат _stash_current_edits, который
             # берёт f_linked.get_data()); db.get_links отдаёт dict'ы — берём id.
             try:
@@ -250,8 +251,7 @@ class AccountCardMixin:
         # Одноразовый флаг «открыть в правке» действует только для своего
         # аккаунта: ушли на другой узел — гасим, чтобы правка не включилась
         # позже на чужой карточке.
-        if self._edit_on_load_id is not None and self._edit_on_load_id != new_id:
-            self._edit_on_load_id = None
+        self._drop_stale_edit_flag("_edit_on_load_id", new_id)
 
         # Уходим с аккаунта, который сейчас редактируется → стэшим правки (не теряем их)
         if (self.is_editing and self._current_account_id is not None
@@ -340,7 +340,7 @@ class AccountCardMixin:
                                      fin_links=fin_links, server_links=server_links)
                 self.is_editing = True
                 self.tabs.set_all_editable(True)
-                self.edit_btn.hide(); self.save_btn.show(); self.cancel_btn.show()
+                self._set_edit_mode_ui(True)
             else:
                 storage = await self.db.run_async(
                     self.db.load_account, new_id, _session=session)
@@ -375,7 +375,7 @@ class AccountCardMixin:
                 self.load_data_to_ui(links=links, other_bytes=other_bytes,
                                      fin_links=fin_links, server_links=server_links)
                 self.tabs.set_all_editable(False)
-                self.edit_btn.show(); self.save_btn.hide(); self.cancel_btn.hide()
+                self._set_edit_mode_ui(False)
                 if self._edit_on_load_id == new_id:
                     # Только что созданный аккаунт — сразу в режим правки.
                     # Карточка уже в БД; это UI-переключение ПОСЛЕ полной
@@ -383,7 +383,7 @@ class AccountCardMixin:
                     self._edit_on_load_id = None
                     self.is_editing = True
                     self.tabs.set_all_editable(True)
-                    self.edit_btn.hide(); self.save_btn.show(); self.cancel_btn.show()
+                    self._set_edit_mode_ui(True)
 
             self._update_status_info()
             self._warn_password_due(new_id)
@@ -596,9 +596,7 @@ class AccountCardMixin:
         self.is_editing = True
         self.tabs.set_all_editable(True)
         # Переключаем кнопки
-        self.edit_btn.hide()
-        self.save_btn.show()
-        self.cancel_btn.show()
+        self._set_edit_mode_ui(True)
         self._update_status_info()
 
     def cancel_edit(self):
@@ -643,9 +641,7 @@ class AccountCardMixin:
             self.load_data_to_ui(links=links, other_bytes=other_bytes,
                                  fin_links=fin_links, server_links=server_links)
             self.tabs.set_all_editable(False)
-            self.edit_btn.show()
-            self.save_btn.hide()
-            self.cancel_btn.hide()
+            self._set_edit_mode_ui(False)
             self._update_status_info()
             # Убрать метку несохранённых правок — точечно, только у этого
             # аккаунта; имя/порядок в дереве отмена не меняет.
@@ -749,15 +745,14 @@ class AccountCardMixin:
             self._dirty_ids.discard((ACCOUNT, aid))
             self.is_editing = False
             self.tabs.set_all_editable(False)
-            self.edit_btn.show()
-            self.save_btn.hide()
-            self.cancel_btn.hide()
+            self._set_edit_mode_ui(False)
             self._set_card_busy(False)
         # Обновляем узел дерева точечно (имя, метка срока пароля, снятие
         # маркера правок); полная перестройка — только если сохранение могло
         # изменить порядок сортировки (внутри метода).
         self._update_account_item_after_save(aid, storage["fields"])
         self.statusBar().showMessage("СОХРАНЕНО!", 2000)
+        sounds.play(getattr(self, "config", None), "save")
 
     def generate_password(self):
         self.tabs.f_password.set_text(

@@ -164,6 +164,7 @@ def test_create_backup_wipes_partial_tmp_on_copy_failure(tmp_path, monkeypatch):
 
     monkeypatch.setattr(backup, "best_effort_wipe", spy_wipe)
     monkeypatch.setattr(backup, "_copy_durable", boom_copy)
+    monkeypatch.setattr(backup, "_snapshot_plain", boom_copy)  # plaintext-путь (B7)
 
     with pytest.raises(OSError):
         backup.create_backup(str(dbp), str(folder))

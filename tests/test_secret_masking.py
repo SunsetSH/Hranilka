@@ -4,7 +4,6 @@
 
 Виджеты строятся offscreen (qapp из conftest), без MainWindow.
 """
-import pytest
 
 from PySide6.QtWidgets import QApplication, QLineEdit
 

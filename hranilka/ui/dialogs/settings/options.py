@@ -1,7 +1,9 @@
-"""Вкладка «Опции»: корзина и показ финансовых инструментов.
+"""Вкладка «Опции»: корзина, показ финансовых инструментов, обновления.
 Часть SettingsDialog (dialog.py) — страница-миксин (по модулю на вкладку)."""
-from PySide6.QtWidgets import (QVBoxLayout, QGroupBox, QLabel, QCheckBox,
-                               QWidget)
+from PySide6.QtWidgets import (QVBoxLayout, QHBoxLayout, QGroupBox, QLabel,
+                               QCheckBox, QPushButton, QWidget)
+
+from hranilka import __version__
 
 
 class SettingsOptionsMixin:
@@ -56,5 +58,35 @@ class SettingsOptionsMixin:
         sl.addWidget(srv_note)
         lay.addWidget(srv_group)
 
+        lay.addWidget(self._build_updates_group())
+
         lay.addStretch()
         return w
+
+    def _build_updates_group(self):
+        group = QGroupBox("Обновления")
+        gl = QVBoxLayout(group)
+        self.check_updates_check = QCheckBox("Проверять обновления при запуске")
+        self.check_updates_check.setChecked(self.config.get("check_updates", False))
+        gl.addWidget(self.check_updates_check)
+        note = QLabel(
+            "При запуске программа запрашивает у GitHub номер последнего релиза "
+            "и показывает окно, если вышла новая версия. Данные хранилища никуда "
+            "не передаются.")
+        note.setWordWrap(True)
+        gl.addWidget(note)
+        row = QHBoxLayout()
+        row.addWidget(QLabel(f"Текущая версия: {__version__}"))
+        row.addStretch()
+        self.check_updates_btn = QPushButton("Проверить сейчас")
+        self.check_updates_btn.clicked.connect(self._check_updates_now)
+        row.addWidget(self.check_updates_btn)
+        gl.addLayout(row)
+        return group
+
+    def _check_updates_now(self):
+        if self._update_checker is None:
+            return
+        self.check_updates_btn.setEnabled(False)
+        self._update_checker(
+            self, lambda: self.check_updates_btn.setEnabled(True))
